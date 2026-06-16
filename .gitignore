@@ -149,6 +149,7 @@ exports/
 results/
 tmp/
 temp/
+output/
 
 # =========================
 # Large local data / models

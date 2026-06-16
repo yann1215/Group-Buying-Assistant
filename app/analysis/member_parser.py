@@ -1,0 +1,275 @@
+# app/analysis/member_parser.py
+from __future__ import annotations
+
+import csv
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+
+# 让直接运行 python app/analysis/member_parser.py 时，也能正常导入项目根目录下的 integrations / app
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from integrations.wechatmsg_lite_client import get_wechat_group_members
+from app.analysis.order_parser import parse_order_file
+
+
+def parse_group_member_orders(
+    group_name: str,
+    order_input: str | Path | dict[str, Any],
+    order_output_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """
+    比对微信群成员昵称开头序号与订单表第一列单号。
+
+    返回：
+    {
+        "ok": True,
+        "message": "...",
+        "群聊名称": "...",
+        "chatroom_wxid": "...",
+        "member_count": 123,
+
+        "member_serials": [
+            {"群昵称": "12张三", "序号": "12"},
+            {"群昵称": "李四", "序号": ""},
+        ],
+
+        "members_without_serial": [...],
+
+        "parsed_order_file": "...",
+        "order_serials": [...],
+
+        "serials_in_group_not_in_orders": [...],
+        "serials_in_orders_not_in_group": [...],
+    }
+    """
+
+    # 1. 获取群成员
+    member_result = get_wechat_group_members(group_name=group_name)
+
+    if not member_result.get("ok"):
+        return {
+            "ok": False,
+            "message": f"获取群成员失败：{member_result.get('message')}",
+            "群聊名称": member_result.get("群聊名称"),
+            "chatroom_wxid": member_result.get("chatroom_wxid"),
+            "member_count": 0,
+            "member_serials": [],
+            "members_without_serial": [],
+            "duplicate_member_serials": [],
+            "parsed_order_file": None,
+            "order_serials": [],
+            "serials_in_group_not_in_orders": [],
+            "serials_in_orders_not_in_group": [],
+        }
+
+    members = member_result.get("members", [])
+
+    # 2. 提取 {"群昵称", "序号"}
+    member_serials = []
+    members_without_serial = []
+
+    # 记录每个序号对应哪些成员，用于检查重复编号
+    member_serial_index: dict[str, list[dict[str, str]]] = {}
+
+    for member in members:
+        group_nickname = str(member.get("群昵称", "") or "").strip()
+        serial_raw = extract_leading_number(group_nickname)
+        serial_normalized = normalize_serial(serial_raw)
+
+        item = {
+            "群昵称": group_nickname,
+            "序号": serial_raw,
+        }
+
+        member_serials.append(item)
+
+        member_info = {
+            "wxid": str(member.get("wxid", "") or ""),
+            "备注": str(member.get("备注", "") or ""),
+            "群昵称": group_nickname,
+            "昵称": str(member.get("昵称", "") or ""),
+        }
+
+        if serial_raw == "":
+            members_without_serial.append(member_info)
+        else:
+            member_serial_index.setdefault(serial_normalized, []).append(member_info)
+
+    # 3. 群昵称中的数字序号集合
+    group_serials = {
+        normalize_serial(item["序号"])
+        for item in member_serials
+        if item["序号"] != ""
+    }
+
+    group_serials.discard("")
+
+    duplicate_member_serials = [
+        {
+            "序号": serial,
+            "members": member_list,
+        }
+        for serial, member_list in sorted(
+            member_serial_index.items(),
+            key=lambda x: int(x[0]),
+        )
+        if len(member_list) > 1
+    ]
+
+    # 4. 调用 order_parser.py 简化订单表
+    parsed_order_file = parse_order_file(
+        order_input=order_input,
+        output_dir=order_output_dir,
+    )
+
+    # 5. 读取简化后 CSV 第一列订单号
+    order_serials = read_first_column_serials(parsed_order_file)
+
+    order_serial_set = set(order_serials)
+
+    serials_in_group_not_in_orders = sorted_serials(group_serials - order_serial_set)
+    serials_in_orders_not_in_group = sorted_serials(order_serial_set - group_serials)
+
+    return {
+        "ok": True,
+        "message": "群成员序号与订单单号比对完成",
+
+        "群聊名称": member_result.get("群聊名称"),
+        "chatroom_wxid": member_result.get("chatroom_wxid"),
+        "member_count": member_result.get("member_count", len(members)),
+
+        "member_serials": member_serials,
+        "members_without_serial": members_without_serial,
+        "duplicate_member_serials": duplicate_member_serials,
+
+        "parsed_order_file": parsed_order_file,
+        "order_serials": sorted_serials(order_serial_set),
+
+        "serials_in_group_not_in_orders": serials_in_group_not_in_orders,
+        "serials_in_orders_not_in_group": serials_in_orders_not_in_group,
+    }
+
+
+def extract_leading_number(text: str) -> str:
+    """
+    提取字符串开头连续数字。
+    例：
+    "12张三" -> "12"
+    "12 张三" -> "12"
+    "001张三" -> "001"
+    "张三12" -> ""
+    """
+
+    text = str(text or "").strip()
+    match = re.match(r"^(\d+)", text)
+    if not match:
+        return ""
+
+    return match.group(1)
+
+
+def normalize_serial(value: Any) -> str:
+    """
+    将序号规范化为字符串数字，用于比对。
+
+    例：
+    "001" -> "1"
+    1 -> "1"
+    " 12 " -> "12"
+    "" -> ""
+    """
+
+    if value is None:
+        return ""
+
+    s = str(value).strip()
+    if not re.fullmatch(r"\d+", s):
+        return ""
+
+    return str(int(s))
+
+
+def read_first_column_serials(csv_path: str | Path) -> list[str]:
+    """
+    读取 CSV 第一列的所有订单号。
+    默认 parse_order_file 输出的第一列是“单号”。
+    """
+
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"订单 CSV 文件不存在：{csv_path}")
+
+    serials: list[str] = []
+
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+
+        # 跳过表头
+        header = next(reader, None)
+        if not header:
+            return serials
+
+        for row_idx, row in enumerate(reader, start=2):
+            if not row:
+                continue
+
+            value = row[0]
+            serial = normalize_serial(value)
+
+            if serial == "":
+                raise ValueError(
+                    f"订单 CSV 第 {row_idx} 行第一列不是有效正整数单号：{value!r}"
+                )
+
+            serials.append(serial)
+
+    return sorted_serials(set(serials))
+
+
+def sorted_serials(serials: set[str] | list[str]) -> list[str]:
+    """
+    按数字大小排序，但返回字符串。
+    """
+
+    return sorted(
+        {normalize_serial(x) for x in serials if normalize_serial(x) != ""},
+        key=lambda x: int(x),
+    )
+
+
+if __name__ == "__main__":
+    result = parse_group_member_orders(
+        group_name="临时喵喵",
+        order_input=r"D:\2_PycharmTestData\test\miao2.xlsx",
+        order_output_dir=r"D:\2_PycharmTestData\test2",
+    )
+
+    print("ok:", result["ok"])
+    print("message:", result["message"])
+    print("群聊名称:", result["群聊名称"])
+    print("chatroom_wxid:", result["chatroom_wxid"])
+    print("群成员数量:", result["member_count"])
+
+    print("\n群昵称前没有数字的成员：")
+    for member in result["members_without_serial"]:
+        print(member)
+
+    print("\n群昵称中重复标注的序号：")
+    for item in result["duplicate_member_serials"]:
+        print(f"序号 {item['序号']}：")
+        for member in item["members"]:
+            print("  ", member)
+
+    print("\n群昵称有、但是订单没有的序号：")
+    print(result["serials_in_group_not_in_orders"])
+
+    print("\n订单里有、但是群昵称没有的序号：")
+    print(result["serials_in_orders_not_in_group"])
+
+    print("\n简化后的订单文件：")
+    print(result["parsed_order_file"])
