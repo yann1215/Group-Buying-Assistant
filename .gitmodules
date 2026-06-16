@@ -1,0 +1,3 @@
+[submodule "external/WeChatMsg_Lite"]
+	path = external/WeChatMsg_Lite
+	url = git@github.com:yann1215/WeChatMsg_Lite.git
