@@ -1,0 +1,14 @@
+ollama
+requests
+pandas
+numpy
+scipy
+openpyxl
+matplotlib
+pydantic
+loguru
+PySide6
+pypdf
+python-docx
+pillow
+pyinstaller
