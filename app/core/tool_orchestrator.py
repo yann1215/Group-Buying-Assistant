@@ -20,6 +20,8 @@ from app.analysis.share_calculator import calculate_share
 from app.analysis.share_config import (
     create_product_share_config_file,
     load_product_share_config_file,
+    summarize_product_share_config,
+    update_product_share_config_file,
 )
 from app.core.intent_parser import parse_user_intent
 
@@ -34,6 +36,9 @@ class ShareRequestState:
     calculation_scope: str | None = None
     amount: str | None = None
     force: bool = False
+
+    pending_config_confirmation: bool = False
+    config_confirmed: bool = False
 
 
 @dataclass
@@ -160,78 +165,14 @@ class ToolOrchestrator:
             self.update_share_request_from_intent(ctx, intent)
             return self.handle_calculate_share(ctx, intent)
 
+        if intent["intent"] == "update_share_config":
+            self.update_share_request_from_intent(ctx, intent)
+            return self.handle_update_share_config(ctx, intent)
+
+        if intent["intent"] == "confirm_share_config":
+            return self.handle_confirm_share_config(ctx, intent)
+
         return None
-
-    def handle_calculate_share(
-            self,
-            ctx: SessionToolContext,
-            intent: dict[str, Any],
-    ) -> str:
-        req = ctx.share_request
-
-        if not ctx.group_name:
-            return (
-                "需要先设置待处理的群聊名称。\n"
-                "例如：群聊名称：xxx"
-            )
-
-        if not ctx.order_input:
-            return (
-                "需要先设置当前订单文件或输入目录。\n"
-                "例如：订单文件：D:\\xxx\\订单.xlsx\n"
-                "或：输入目录：D:\\xxx\\input"
-            )
-
-        if not req.share_mode:
-            return (
-                "请说明均摊方式：\n"
-                "1. 人头摊：例如“按人头”或“人头摊”\n"
-                "2. 个数摊：例如“按个数”或“按件数”"
-            )
-
-        calculation_scope = req.calculation_scope or "flat"
-
-        if calculation_scope == "flat" and not req.amount:
-            return (
-                "请补充需要均摊的总金额。\n"
-                "例如：金额120\n"
-                "也可以直接说：拉通人头，金额120"
-            )
-
-        check_result = self.ensure_member_checked(ctx)
-
-        if not check_result.get("ok"):
-            return format_member_check_result(check_result)
-
-        blocking_issues = get_blocking_member_issues(check_result)
-
-        if blocking_issues and not req.force:
-            return (
-                    "计算均摊前发现名单核对问题，暂不计算。\n\n"
-                    + format_member_check_result(check_result)
-                    + "\n\n如果确认要忽略这些问题继续计算，可以输入：忽略名单问题，继续计算。"
-            )
-
-        parsed_order_file = check_result.get("parsed_order_file") or ctx.parsed_order_file
-
-        if not parsed_order_file:
-            return "没有找到简化后的订单文件，无法计算均摊。"
-
-        self.ensure_share_config_loaded(ctx, parsed_order_file)
-
-        result = calculate_share(
-            parsed_order_file=parsed_order_file,
-            total_amount=req.amount,
-            share_mode=req.share_mode,
-            calculation_scope=calculation_scope,
-            product_configs=ctx.product_configs,
-            output_dir=ctx.order_output_dir,
-        )
-
-        if not result.get("ok") and result.get("need_user_input"):
-            return format_share_need_user_input(result)
-
-        return format_share_result(result)
 
 
     def ensure_member_checked(
@@ -295,6 +236,184 @@ class ToolOrchestrator:
         ctx.product_configs = load_product_share_config_file(
             ctx.share_config_file
         )
+
+
+    def handle_calculate_share(
+            self,
+            ctx: SessionToolContext,
+            intent: dict[str, Any],
+    ) -> str:
+        req = ctx.share_request
+
+        if not ctx.group_name:
+            return (
+                "需要先设置待处理的群聊名称。\n"
+                "例如：群聊名称：xxx"
+            )
+
+        if not ctx.order_input:
+            return (
+                "需要先设置当前订单文件或输入目录。\n"
+                "例如：订单文件：D:\\xxx\\订单.xlsx\n"
+                "或：输入目录：D:\\xxx\\input"
+            )
+
+        if not req.share_mode:
+            return (
+                "请说明均摊方式：\n"
+                "1. 人头摊：例如“按人头”或“人头摊”\n"
+                "2. 个数摊：例如“按个数”或“按件数”"
+            )
+
+        calculation_scope = req.calculation_scope or "flat"
+
+        if calculation_scope == "flat" and not req.amount:
+            return (
+                "请补充需要均摊的总金额。\n"
+                "例如：金额120\n"
+                "也可以直接说：拉通人头，金额120"
+            )
+
+        check_result = self.ensure_member_checked(ctx)
+
+        if not check_result.get("ok"):
+            return format_member_check_result(check_result)
+
+        blocking_issues = get_blocking_member_issues(check_result)
+
+        if blocking_issues and not req.force:
+            return (
+                    "计算均摊前发现名单核对问题，暂不计算。\n\n"
+                    + format_member_check_result(check_result)
+                    + "\n\n如果确认要忽略这些问题继续计算，可以输入：忽略名单问题，继续计算。"
+            )
+
+        parsed_order_file = check_result.get("parsed_order_file") or ctx.parsed_order_file
+
+        if not parsed_order_file:
+            return "没有找到简化后的订单文件，无法计算均摊。"
+
+        self.ensure_share_config_loaded(ctx, parsed_order_file)
+
+        if calculation_scope == "independent" and req.pending_config_confirmation:
+            return (
+                "商品独立均摊配置还未确认。\n"
+                "确认无误后请输入：确认计算"
+            )
+
+        result = calculate_share(
+            parsed_order_file=parsed_order_file,
+            total_amount=req.amount,
+            share_mode=req.share_mode,
+            calculation_scope=calculation_scope,
+            product_configs=ctx.product_configs,
+            output_dir=ctx.order_output_dir,
+        )
+
+        if not result.get("ok") and result.get("need_user_input"):
+            return format_share_need_user_input(result)
+
+        return format_share_result(result)
+
+
+    def handle_update_share_config(
+        self,
+        ctx: SessionToolContext,
+        intent: dict[str, Any],
+    ) -> str:
+        req = ctx.share_request
+
+        if not ctx.group_name:
+            return "需要先设置待处理的群聊名称。例如：群聊名称：xxx"
+
+        if not ctx.order_input:
+            return "需要先设置当前订单文件。例如：订单文件：订单1.xlsx"
+
+        calculation_scope = req.calculation_scope or intent.get("calculation_scope")
+
+        if calculation_scope != "independent":
+            return (
+                "检测到你输入了各商品均摊金额，但当前不是独立均摊模式。\n"
+                "请先输入：按人头独立 或 按个数独立。"
+            )
+
+        if not req.share_mode:
+            return (
+                "请先说明独立均摊方式：\n"
+                "1. 按人头独立\n"
+                "2. 按个数独立"
+            )
+
+        check_result = self.ensure_member_checked(ctx)
+
+        if not check_result.get("ok"):
+            return format_member_check_result(check_result)
+
+        parsed_order_file = check_result.get("parsed_order_file") or ctx.parsed_order_file
+
+        if not parsed_order_file:
+            return "没有找到简化后的订单文件，无法写入商品均摊配置表。"
+
+        self.ensure_share_config_loaded(ctx, parsed_order_file)
+
+        share_type = f"{req.share_mode}_independent"
+
+        update_result = update_product_share_config_file(
+            config_file=ctx.share_config_file,
+            updates=intent.get("product_share_amounts") or [],
+            share_type=share_type,
+        )
+
+        ctx.product_configs = load_product_share_config_file(ctx.share_config_file)
+
+        summary = summarize_product_share_config(
+            config_file=ctx.share_config_file,
+            total_amount=req.amount,
+        )
+
+        req.pending_config_confirmation = True
+        req.config_confirmed = False
+
+        return format_product_share_config_confirmation(
+            summary=summary,
+            updated_items=update_result.get("updated_items") or [],
+            unmatched_updates=update_result.get("unmatched_updates") or [],
+        )
+
+
+    def handle_confirm_share_config(
+        self,
+        ctx: SessionToolContext,
+        intent: dict[str, Any],
+    ) -> str:
+        req = ctx.share_request
+
+        if not req.pending_config_confirmation:
+            return "当前没有待确认的商品独立均摊配置。"
+
+        if not ctx.share_config_file:
+            return "没有找到商品均摊配置表，无法确认。"
+
+        summary = summarize_product_share_config(
+            config_file=ctx.share_config_file,
+            total_amount=req.amount,
+        )
+
+        if summary.get("matched") is False:
+            return (
+                "各商品均摊合计与用户输入的总均摊不一致，暂不计算。\n\n"
+                + format_product_share_config_confirmation(
+                    summary=summary,
+                    updated_items=[],
+                    unmatched_updates=[],
+                )
+                + "\n\n请修改各商品均摊，或重新输入正确的总均摊。"
+            )
+
+        req.config_confirmed = True
+        req.pending_config_confirmation = False
+
+        return self.handle_calculate_share(ctx, intent)
 
 
 def get_blocking_member_issues(result: dict[str, Any]) -> list[str]:
@@ -435,6 +554,75 @@ def format_share_need_user_input(result: dict) -> str:
                 f"商品均摊：{cfg.get('商品均摊') or '未填写'}｜"
                 f"单份均摊：{cfg.get('单份均摊') or '未计算'}"
             )
+
+    return "\n".join(lines)
+
+
+def format_product_share_config_confirmation(
+    summary: dict[str, Any],
+    updated_items: list[dict[str, Any]],
+    unmatched_updates: list[dict[str, Any]],
+) -> str:
+    lines: list[str] = []
+
+    lines.append("已写入商品独立均摊配置，请确认。")
+    lines.append(f"配置文件：{summary.get('config_file')}")
+
+    if updated_items:
+        lines.append("")
+        lines.append("本次写入：")
+        for item in updated_items:
+            lines.append(
+                f"- {item.get('商品序号')}｜"
+                f"{item.get('商品名称')}｜"
+                f"商品数量：{item.get('商品数量')}｜"
+                f"计入均摊：{item.get('计入均摊')}｜"
+                f"均摊类型：{item.get('均摊类型')}｜"
+                f"商品均摊：{item.get('商品均摊')}"
+            )
+
+    if unmatched_updates:
+        lines.append("")
+        lines.append("以下输入未匹配到配置表商品：")
+        for item in unmatched_updates:
+            lines.append(f"- {item}")
+
+    items = summary.get("items") or []
+
+    included_items = [
+        item for item in items
+        if item.get("计入均摊") and item.get("商品均摊")
+    ]
+
+    if included_items:
+        lines.append("")
+        lines.append("当前各商品均摊：")
+        for item in included_items:
+            lines.append(
+                f"- {item.get('商品序号')}｜"
+                f"{item.get('商品名称')}｜"
+                f"商品均摊：{item.get('商品均摊')}"
+            )
+
+    lines.append("")
+    lines.append(f"各商品均摊合计：{summary.get('config_total')}")
+
+    expected_total = summary.get("expected_total")
+    matched = summary.get("matched")
+
+    if expected_total:
+        lines.append(f"用户输入总均摊：{expected_total}")
+        lines.append(f"差额：{summary.get('diff')}")
+
+        if matched:
+            lines.append("校验结果：各商品均摊合计与总均摊一致。")
+        else:
+            lines.append("校验结果：各商品均摊合计与总均摊不一致，请检查。")
+    else:
+        lines.append("用户未输入总均摊，将以各商品均摊合计作为总均摊。")
+
+    lines.append("")
+    lines.append("确认无误后请输入：确认计算")
 
     return "\n".join(lines)
 

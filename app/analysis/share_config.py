@@ -298,6 +298,194 @@ def load_product_share_config_file(
     return configs
 
 
+def update_product_share_config_file(
+    config_file: str | Path,
+    updates: list[dict[str, Any]],
+    share_type: str | None = None,
+) -> dict[str, Any]:
+    """
+    根据用户对话输入，更新商品均摊配置表。
+
+    updates 支持两种格式：
+        {"商品序号": 1, "商品均摊": "10"}
+        {"商品名称": "雪梅蜂", "商品均摊": "10"}
+
+    share_type:
+        可选。如果传入，则同步写入“均摊类型”列。
+        例如：
+            head_independent
+            quantity_independent
+    """
+    config_file = Path(config_file)
+
+    if not config_file.exists():
+        raise FileNotFoundError(f"商品均摊配置表不存在：{config_file}")
+
+    with config_file.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    if not reader.fieldnames:
+        raise ShareConfigError("商品均摊配置表没有表头。")
+
+    missing_headers = [
+        name for name in CONFIG_FIELDNAMES
+        if name not in reader.fieldnames
+    ]
+
+    if missing_headers:
+        raise ShareConfigError(
+            f"商品均摊配置表缺少表头：{missing_headers}"
+        )
+
+    updated_items: list[dict[str, Any]] = []
+    unmatched_updates: list[dict[str, Any]] = []
+
+    for update in updates:
+        target_no = update.get("商品序号")
+        target_name = str(update.get("商品名称") or "").strip()
+        amount_raw = update.get("商品均摊")
+
+        amount = parse_optional_money_ceil(
+            amount_raw,
+            field_name="商品均摊",
+            row_idx=0,
+        )
+
+        matched = False
+
+        for row in rows:
+            row_name = str(row.get("商品名称", "") or "").strip()
+
+            if not row_name:
+                continue
+
+            row_no_text = str(row.get("商品序号", "") or "").strip()
+
+            by_no = (
+                target_no is not None
+                and row_no_text.isdigit()
+                and int(row_no_text) == int(target_no)
+            )
+
+            by_name = (
+                target_name
+                and row_name == target_name
+            )
+
+            if by_no or by_name:
+                row["商品均摊"] = amount
+
+                if share_type:
+                    row["均摊类型"] = share_type
+
+                updated_items.append(
+                    {
+                        "商品序号": row.get("商品序号"),
+                        "商品名称": row_name,
+                        "商品数量": row.get("商品数量"),
+                        "计入均摊": row.get("计入均摊"),
+                        "均摊类型": row.get("均摊类型"),
+                        "商品均摊": amount,
+                    }
+                )
+
+                matched = True
+                break
+
+        if not matched:
+            unmatched_updates.append(update)
+
+    with config_file.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CONFIG_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    summary = summarize_product_share_config(config_file)
+
+    return {
+        "ok": True,
+        "config_file": str(config_file.resolve()),
+        "updated_items": updated_items,
+        "unmatched_updates": unmatched_updates,
+        "summary": summary,
+    }
+
+
+def summarize_product_share_config(
+    config_file: str | Path,
+    total_amount: str | int | float | None = None,
+) -> dict[str, Any]:
+    """
+    汇总商品均摊配置表。
+
+    如果 total_amount 不为空，则检查：
+        各商品均摊合计 == 用户输入总均摊
+
+    如果 total_amount 为空，则代码自行计算总均摊：
+        总均摊 = 所有计入均摊商品的“商品均摊”之和
+    """
+    config_file = Path(config_file)
+
+    configs = load_product_share_config_file(config_file)
+
+    items: list[dict[str, Any]] = []
+    total = Decimal("0.00")
+
+    for cfg in configs:
+        include_share = bool(cfg.get("计入均摊"))
+        product_name = str(cfg.get("商品名称") or "").strip()
+
+        if not product_name:
+            continue
+
+        amount_text = str(cfg.get("商品均摊") or "").strip()
+
+        if include_share and amount_text:
+            amount = Decimal(amount_text)
+            total += amount
+        else:
+            amount = Decimal("0.00")
+
+        items.append(
+            {
+                "商品序号": cfg.get("商品序号"),
+                "商品名称": product_name,
+                "商品数量": cfg.get("商品数量"),
+                "计入均摊": include_share,
+                "均摊类型": cfg.get("均摊类型"),
+                "商品均摊": f"{amount:.2f}" if amount_text else "",
+            }
+        )
+
+    total = total.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+
+    expected_total = None
+    diff = None
+    matched = None
+
+    if total_amount is not None and str(total_amount).strip() != "":
+        expected_total = Decimal(str(total_amount)).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_CEILING,
+        )
+        diff = (total - expected_total).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_CEILING,
+        )
+        matched = diff == Decimal("0.00")
+
+    return {
+        "ok": True,
+        "config_file": str(config_file.resolve()),
+        "items": items,
+        "config_total": f"{total:.2f}",
+        "expected_total": "" if expected_total is None else f"{expected_total:.2f}",
+        "diff": "" if diff is None else f"{diff:.2f}",
+        "matched": matched,
+    }
+
+
 def default_include_share(product_name: str) -> bool:
     """
     默认是否计入均摊。
