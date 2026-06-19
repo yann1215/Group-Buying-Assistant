@@ -367,21 +367,10 @@ def build_product_configs(
                 supplied.get("均摊类型") or make_share_type(global_share_mode, calculation_scope)
             ).strip()
 
-            product_share_amount = optional_amount_to_decimal(
-                supplied.get("商品均摊")
-            )
-
-            unit_share_price = optional_amount_to_decimal(
-                supplied.get("单份均摊")
-            )
-
-            product_unit_price = optional_amount_to_decimal(
-                supplied.get("商品单价")
-            )
-
-            product_total_price = optional_amount_to_decimal(
-                supplied.get("商品大货总价")
-            )
+            product_share_amount = optional_money_to_decimal_allow_zero(supplied.get("商品均摊"))
+            unit_share_price = optional_money_to_decimal_allow_zero(supplied.get("单份均摊"))
+            product_unit_price = optional_money_to_decimal_allow_zero(supplied.get("商品单价"))
+            product_total_price = optional_money_to_decimal_allow_zero(supplied.get("商品大货总价"))
 
         else:
             product_no = idx
@@ -648,10 +637,6 @@ def default_include_share(product_name: str) -> bool:
     return "底胚" not in str(product_name or "")
 
 
-def default_exclude_from_quantity_share(product_name: str) -> bool:
-    return is_special_non_quantity_product(product_name)
-
-
 def is_special_non_quantity_product(product_name: str) -> bool:
     name = str(product_name or "").strip()
     return name.startswith("摊画师") or name.startswith("摊供稿人")
@@ -712,24 +697,6 @@ def normalize_share_type(value: str) -> str:
     raise ShareCalculateError(f"无法识别商品均摊类型：{value}")
 
 
-def parse_bool_or_default(value: Any, default: bool) -> bool:
-    if value is None or value == "":
-        return default
-
-    if isinstance(value, bool):
-        return value
-
-    text = str(value).strip().lower()
-
-    if text in {"1", "true", "yes", "y", "是", "参摊", "参与"}:
-        return True
-
-    if text in {"0", "false", "no", "n", "否", "不参摊", "不参与"}:
-        return False
-
-    return default
-
-
 def amount_to_decimal(value: int | float | str) -> Decimal:
     try:
         amount = Decimal(str(value)).quantize(
@@ -741,6 +708,28 @@ def amount_to_decimal(value: int | float | str) -> Decimal:
 
     if amount <= 0:
         raise ShareCalculateError(f"金额必须大于 0：{value!r}")
+
+    return amount
+
+
+def optional_money_to_decimal_allow_zero(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if text == "":
+        return None
+
+    try:
+        amount = Decimal(text).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_CEILING,
+        )
+    except Exception as e:
+        raise ShareCalculateError(f"金额格式错误：{value!r}") from e
+
+    if amount < 0:
+        raise ShareCalculateError(f"金额不能为负数：{value!r}")
 
     return amount
 

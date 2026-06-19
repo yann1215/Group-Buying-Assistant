@@ -14,24 +14,24 @@ def main():
     username = "Yann"
     ai_nickname = "Assistant"
 
-    group_name = input("请输入待处理群聊名称：").strip()
-    order_file = input("请输入当前订单文件路径：").strip()
-    output_dir = input("请输入输出目录，可留空：").strip()
-
-    chat_service.set_working_context(
-        session_id=session_id,
-        group_name=group_name,
-        order_input=order_file,
-        order_output_dir=output_dir or None,
-    )
-
     print(f"当前 session_id = {session_id}")
-    print("输入 exit 退出。")
-
-    print("示例：")
-    print("  核对成员")
-    print("  计算均摊，金额 120，按人头摊")
-    print("  计算均摊，金额 120，按个数摊")
+    print("输入 exit / quit / q 退出。")
+    print("")
+    print("你可以直接在对话中设置上下文，例如：")
+    print("  群聊名称：XXX")
+    print(r"  订单文件：D:\orders\当前订单.xlsx")
+    print(r"  输出目录：D:\orders\output")
+    print("")
+    print("也可以一句话输入：")
+    print(r"  群聊名称：XXX，订单文件：.\orders\当前订单.xlsx，输出目录：.\orders\output")
+    print("")
+    print("均摊示例：")
+    print("  算均摊")
+    print("  拉通人头，金额120")
+    print("  金额120，按人头拉通")
+    print("  按个数拉通，金额100")
+    print("  按人头独立")
+    print("")
 
     while True:
         user_text = input(f"\n{username}: ").strip()

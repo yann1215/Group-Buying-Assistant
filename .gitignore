@@ -150,6 +150,7 @@ results/
 tmp/
 temp/
 output/
+orders/
 
 # =========================
 # Large local data / models
