@@ -127,7 +127,7 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
     # 1. 确认配置
     # 2. 更新商品独立均摊配置
     # 3. 核对成员
-    # 4. 发起/补充均摊参数
+    # 4. 发起/补充均摊参数，或强制继续计算均摊
     # 5. 更新群聊、订单、输出目录
     # 6. 普通聊天
 
@@ -143,13 +143,15 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
         result["intent"] = "member_check"
         return result
 
-    # 即使没有说“算均摊”，只要给出人头/个数、拉通/独立或金额，
-    # 也视为对当前均摊任务的参数补充。
+    # 即使没有重新输入金额和均摊方式，
+    # “先算”“继续算”“忽略名单问题”等 force 指令，
+    # 也应当进入当前会话已有的均摊任务。
     if (
         has_share_words(text)
         or share_mode is not None
         or calculation_scope is not None
         or amount is not None
+        or force
     ):
         result["intent"] = "calculate_share"
         return result
@@ -173,7 +175,18 @@ def normalize_text(value: Any) -> str:
 # ----------------------------------------------------------------------
 
 def has_share_words(text: str) -> bool:
+    """
+    判断用户是否正在要求进行均摊计算。
+
+    除了“计算均摊”这类完整说法，也需要识别：
+    个数摊 ...
+    人头摊 ...
+    拉通个数 ...
+    个数拉通 ...
+    独立个数
+    """
     keywords = [
+        # 通用均摊词
         "均摊",
         "分摊",
         "摊钱",
@@ -182,8 +195,24 @@ def has_share_words(text: str) -> bool:
         "计算均摊",
         "算均摊",
         "算一下均摊",
-        "计算分摊",
-        "算分摊",
+
+        # 人头摊
+        "人头摊",
+        "按人头",
+        "人头拉通",
+        "拉通人头",
+        "人头独立",
+        "独立人头",
+
+        # 个数摊
+        "个数摊",
+        "按个数",
+        "按数量",
+        "按件数",
+        "个数拉通",
+        "拉通个数",
+        "个数独立",
+        "独立个数",
     ]
 
     return any(word in text for word in keywords)
@@ -211,8 +240,13 @@ def has_force_words(text: str) -> bool:
     不要把普通“确认计算”当成 force。
     """
     keywords = [
+        "先算",
+        "继续算",
         "忽略问题",
+        "无视问题",
+        "忽略名单",
         "忽略名单问题",
+        "无视名单",
         "忽略核对问题",
         "强制计算",
         "不管名单",
@@ -321,12 +355,13 @@ def parse_calculation_scope(text: str) -> str | None:
     """
     提取拉通或独立。
 
-    没有出现相关词时必须返回 None。
-    不要在这里默认返回 flat，否则多轮对话中：
-        第一句：按人头独立
-        第二句：金额120
-    第二句可能错误覆盖第一句的 independent。
+    规则：
+    1. 明确出现“独立”时，返回 independent。
+    2. 明确出现“拉通”时，返回 flat。
+    3. 只说“人头摊”或“个数摊”时，默认理解为拉通。
+    4. 只说“按人头”或“按个数”时，不修改已有计算范围。
     """
+
     flat_words = [
         "拉通",
         "拉通摊",
@@ -351,15 +386,29 @@ def parse_calculation_scope(text: str) -> str | None:
     has_flat = any(word in text for word in flat_words)
     has_independent = any(word in text for word in independent_words)
 
+    # 同时出现两种互相冲突的范围，不静默选择
     if has_flat and has_independent:
         return None
 
+    # 明确范围优先
     if has_independent:
         return "independent"
 
     if has_flat:
         return "flat"
 
+    # “人头摊”“个数摊”作为拉通均摊的简写
+    default_flat_words = [
+        "人头摊",
+        "个数摊",
+        "数量摊",
+        "件数摊",
+    ]
+
+    if any(word in text for word in default_flat_words):
+        return "flat"
+
+    # 没有明确范围时不覆盖会话中的旧值
     return None
 
 
@@ -387,12 +436,18 @@ def parse_amount(
     在没有商品独立金额时，还支持：
         30元
         30
+        个数摊 517
+        拉通个数 517
+        按个数拉通 517
+        人头摊 300
 
     当一句话里已经识别到商品独立均摊金额时，
     allow_unlabeled_amount=False，避免把：
         1号10元，2号20元
-    中的 10元 误识别为总均摊。
+    中的10元误识别为总均摊。
     """
+    text = text.strip()
+
     explicit_patterns = [
         (
             r"(?:总均摊金额|总均摊|均摊总额|均摊金额|"
@@ -403,24 +458,78 @@ def parse_amount(
         r"[￥¥]\s*(\d+(?:\.\d{1,4})?)",
     ]
 
+    # 1. 优先识别明确标注的总金额
     for pattern in explicit_patterns:
         match = re.search(pattern, text)
         if match:
             return match.group(1)
 
+    # 已识别到商品独立均摊金额时，
+    # 不再尝试解析无标签总金额。
     if not allow_unlabeled_amount:
         return None
 
+    # 2. 识别“30元”
     yuan_match = re.search(
-        r"(?<!\d)(\d+(?:\.\d{1,4})?)\s*元",
+        r"(?<![\d.])(\d+(?:\.\d{1,4})?)\s*元",
         text,
     )
     if yuan_match:
         return yuan_match.group(1)
 
-    # 支持多轮对话中用户只输入一个数字
-    if re.fullmatch(r"\d+(?:\.\d{1,4})?", text.strip()):
-        return text.strip()
+    # 3. 识别“均摊模式 + 裸金额”
+    #
+    # 例如：
+    # 个数摊 517
+    # 拉通个数：517
+    # 按个数拉通，517
+    # 人头摊为300
+    share_mode_amount_patterns = [
+        (
+            r"(?:"
+            r"按个数拉通|按数量拉通|按件数拉通|"
+            r"拉通个数|拉通数量|拉通件数|"
+            r"个数拉通|数量拉通|件数拉通|"
+            r"个数摊|数量摊|件数摊|按个数|按数量|按件数|"
+            r"按人头拉通|拉通人头|人头拉通|"
+            r"人头摊|按人头"
+            r")"
+            r"\s*(?:是|为|=|：|:|，|,)?\s*"
+            r"[￥¥]?\s*(\d+(?:\.\d{1,4})?)"
+            r"\s*(?:元)?"
+        ),
+    ]
+
+    for pattern in share_mode_amount_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+
+    # 4. 识别“裸金额 + 均摊模式”
+    #
+    # 例如：
+    # 517个数摊
+    # 300按人头拉通
+    amount_share_mode_pattern = (
+        r"(?<![\d.])(\d+(?:\.\d{1,4})?)"
+        r"\s*(?:元)?\s*"
+        r"(?:"
+        r"按个数拉通|按数量拉通|按件数拉通|"
+        r"拉通个数|拉通数量|拉通件数|"
+        r"个数拉通|数量拉通|件数拉通|"
+        r"个数摊|数量摊|件数摊|按个数|按数量|按件数|"
+        r"按人头拉通|拉通人头|人头拉通|"
+        r"人头摊|按人头"
+        r")"
+    )
+
+    match = re.search(amount_share_mode_pattern, text)
+    if match:
+        return match.group(1)
+
+    # 5. 支持多轮对话中用户只输入一个数字
+    if re.fullmatch(r"\d+(?:\.\d{1,4})?", text):
+        return text
 
     return None
 

@@ -34,7 +34,7 @@ def create_product_share_config_file(
     parsed_order_file: str | Path,
     output_dir: str | Path | None = None,
     max_product_slots: int = MAX_PRODUCT_SLOTS,
-    overwrite: bool = False,
+    overwrite: bool = True,
 ) -> str:
     """
     根据简化订单表生成商品均摊配置表。

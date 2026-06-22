@@ -131,8 +131,15 @@ class ToolOrchestrator:
         if intent.get("share_mode"):
             req.share_mode = intent["share_mode"]
 
-        if intent.get("calculation_scope"):
-            req.calculation_scope = intent["calculation_scope"]
+        new_scope = intent.get("calculation_scope")
+
+        if new_scope:
+            if new_scope != req.calculation_scope:
+                # 切换拉通/独立模式后，旧的独立配置确认状态不再有效
+                req.pending_config_confirmation = False
+                req.config_confirmed = False
+
+            req.calculation_scope = new_scope
 
         if intent.get("amount"):
             req.amount = intent["amount"]
@@ -230,7 +237,7 @@ class ToolOrchestrator:
             ctx.share_config_file = create_product_share_config_file(
                 parsed_order_file=parsed_order_file,
                 output_dir=ctx.order_output_dir,
-                overwrite=False,
+                overwrite=True,
             )
 
         ctx.product_configs = load_product_share_config_file(
@@ -494,6 +501,25 @@ def format_share_result(result: dict) -> str:
     lines.append(f"均摊方式：{result['share_mode_text']}")
     lines.append(f"计算方式：{result['calculation_scope_text']}")
     lines.append(f"原始均摊金额：{result['total_amount']}")
+    # 只有拉通个数摊才输出单个商品均摊。
+    if (
+            result.get("share_mode") == "quantity"
+            and result.get("calculation_scope") == "flat"
+            and result.get("unit_share_amount") is not None
+    ):
+        total_share_quantity = result.get(
+            "total_share_quantity"
+        )
+
+        if total_share_quantity is not None:
+            lines.append(
+                f"总参摊个数：{total_share_quantity}"
+            )
+
+        lines.append(
+            "单个参摊商品需均摊："
+            f"{result['unit_share_amount']} 元"
+        )
     lines.append(f"实际总收款：{result['total_collected']}")
     lines.append(f"向上取整多收：{result['over_collected']}")
     lines.append(f"参与人数：{result['participant_count']}")

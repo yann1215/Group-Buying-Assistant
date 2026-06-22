@@ -98,9 +98,10 @@ def parse_order_file(
 
     product_headers = _make_unique_headers(product_names)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # 考虑到前后的表格可能同名，并且在同一天进行处理，因此保留了h-m-s的后缀，用以保证区分文件
-    output_path = output_dir_path / f"{input_path.stem}_parsed_orders_{timestamp}.csv"
+    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # # 考虑到前后的表格可能同名，并且在同一天进行处理，因此保留了h-m-s的后缀，用以保证区分文件
+    # output_path = output_dir_path / f"{input_path.stem}_parsed_orders_{timestamp}.csv"
+    output_path = output_dir_path / f"{input_path.stem}_parsed_orders.csv"
 
     fieldnames = ["单号", "昵称"] + product_headers
 

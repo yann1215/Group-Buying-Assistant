@@ -144,6 +144,11 @@ def calculate_share(
         for row in order_rows
     }
 
+    # 拉通个数摊时，用于保存“单个商品均摊金额”。
+    # 其他均摊模式下保持为 None。
+    unit_share_cents: int | None = None
+    total_share_quantity: int | None = None
+
     if calculation_scope == "flat":
         if total_amount is None:
             return {
@@ -155,9 +160,14 @@ def calculate_share(
             }
 
         total_amount_decimal = amount_to_decimal(total_amount)
-        total_original_cents = decimal_yuan_to_cents(total_amount_decimal)
+        total_original_cents = decimal_yuan_to_cents(
+            total_amount_decimal
+        )
 
-        calculate_flat_share(
+        (
+            unit_share_cents,
+            total_share_quantity,
+        ) = calculate_flat_share(
             order_rows=order_rows,
             configs=active_configs,
             participant_results=participant_results,
@@ -210,16 +220,21 @@ def calculate_share(
     total_collected_cents = sum(item.share_cents for item in charged_results)
     over_collected_cents = total_collected_cents - total_original_cents
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # output_path = (
+    #     output_dir_path
+    #     / f"{parsed_order_file.stem}_share_{share_mode}_{calculation_scope}_{timestamp}.csv"
+    # )
     output_path = (
-        output_dir_path
-        / f"{parsed_order_file.stem}_share_{share_mode}_{calculation_scope}_{timestamp}.csv"
+            output_dir_path
+            / f"{parsed_order_file.stem}_share_{share_mode}_{calculation_scope}.csv"
     )
 
     write_share_result_csv(
         output_path=output_path,
         results=charged_results,
         configs=active_configs,
+        calculation_scope=calculation_scope,
     )
 
     return {
@@ -229,6 +244,12 @@ def calculate_share(
         "calculation_scope": calculation_scope,
         "calculation_scope_text": calculation_scope_to_text(calculation_scope),
         "total_amount": cents_to_yuan_text(total_original_cents),
+        "total_share_quantity": total_share_quantity,
+        "unit_share_amount": (
+            cents_to_yuan_text(unit_share_cents)
+            if unit_share_cents is not None
+            else None
+        ),
         "total_collected": cents_to_yuan_text(total_collected_cents),
         "over_collected": cents_to_yuan_text(over_collected_cents),
         "participant_count": len(charged_results),
@@ -420,7 +441,23 @@ def calculate_flat_share(
     participant_results: dict[str, ParticipantResult],
     total_amount: Decimal,
     share_mode: str,
-) -> None:
+) -> tuple[int | None, int | None]:
+    """
+    计算拉通均摊。
+
+    人头摊：
+        每个人的均摊金额单独计算，并向上取整到 0.01 元。
+
+    个数摊：
+        1. 先计算单个参摊商品需要均摊多少钱；
+        2. 单个均摊向上取整到 0.01 元；
+        3. 每个人应收金额 = 单个均摊 × 个人参摊个数；
+        4. 个人总金额不再重复取整。
+
+    返回值：
+        个数摊时返回单个均摊金额，单位为分。
+        人头摊时返回 None。
+    """
     eligible_product_names = {
         cfg.product_name
         for cfg in configs
@@ -432,8 +469,10 @@ def calculate_flat_share(
     for row in order_rows:
         if share_mode == "head":
             has_any_eligible_product = any(
-                product_name in eligible_product_names and quantity > 0
-                for product_name, quantity in row.quantities.items()
+                product_name in eligible_product_names
+                and quantity > 0
+                for product_name, quantity
+                in row.quantities.items()
             )
 
             if has_any_eligible_product:
@@ -446,7 +485,8 @@ def calculate_flat_share(
                 if product_name not in eligible_product_names:
                     continue
 
-                # “摊画师……”和“摊供稿人……”不计入个数摊数量权重
+                # “摊画师……”和“摊供稿人……”
+                # 不计入个数摊数量权重。
                 if is_special_non_quantity_product(product_name):
                     continue
 
@@ -456,12 +496,94 @@ def calculate_flat_share(
                 weights[row.order_no] = quantity_weight
 
         else:
-            raise ShareCalculateError(f"未知均摊方式：{share_mode}")
+            raise ShareCalculateError(
+                f"未知均摊方式：{share_mode}"
+            )
 
     if not weights:
-        raise ShareCalculateError("没有可参与拉通均摊的订单。")
+        raise ShareCalculateError(
+            "没有可参与拉通均摊的订单。"
+        )
 
     total_weight = sum(weights.values())
+
+    # -------------------------------------------------
+    # 拉通个数摊
+    # -------------------------------------------------
+    if share_mode == "quantity":
+        # 先计算单个商品均摊金额。
+        unit_amount = (
+            total_amount
+            / Decimal(total_weight)
+        )
+
+        # 单个金额先向上取整到 0.01 元。
+        unit_cents = ceil_yuan_decimal_to_cents(
+            unit_amount
+        )
+
+        unit_share_price = (
+            Decimal(unit_cents)
+            / Decimal("100")
+        )
+
+        # 将单份均摊写入商品配置返回结果。
+        # 特殊的不计个数商品不写入。
+        for cfg in configs:
+            if not cfg.product_name:
+                continue
+
+            if not cfg.include_share:
+                continue
+
+            if is_special_non_quantity_product(
+                cfg.product_name
+            ):
+                continue
+
+            cfg.unit_share_price = unit_share_price
+
+        for row in order_rows:
+            quantity_weight = weights.get(
+                row.order_no,
+                0,
+            )
+
+            if quantity_weight <= 0:
+                continue
+
+            # 个人金额直接使用：
+            # 单个均摊金额 × 个人参摊个数。
+            #
+            # unit_cents 已经是整数分，因此这里不需要、
+            # 也不应该再进行任何金额取整。
+            person_cents = (
+                unit_cents
+                * quantity_weight
+            )
+
+            participant = participant_results[
+                row.order_no
+            ]
+
+            participant.share_cents += person_cents
+            participant.details["拉通均摊"] = (
+                person_cents
+            )
+
+        return unit_cents, total_weight
+
+    # -------------------------------------------------
+    # 拉通人头摊
+    # -------------------------------------------------
+    per_person_amount = (
+        total_amount
+        / Decimal(total_weight)
+    )
+
+    per_person_cents = ceil_yuan_decimal_to_cents(
+        per_person_amount
+    )
 
     for row in order_rows:
         weight = weights.get(row.order_no, 0)
@@ -469,11 +591,16 @@ def calculate_flat_share(
         if weight <= 0:
             continue
 
-        amount = total_amount * Decimal(weight) / Decimal(total_weight)
-        cents = ceil_yuan_decimal_to_cents(amount)
+        participant = participant_results[
+            row.order_no
+        ]
 
-        participant_results[row.order_no].share_cents += cents
-        participant_results[row.order_no].details["拉通均摊"] = cents
+        participant.share_cents += per_person_cents
+        participant.details["拉通均摊"] = (
+            per_person_cents
+        )
+
+    return None, None
 
 
 def calculate_independent_share(
@@ -574,22 +701,47 @@ def write_share_result_csv(
     output_path: Path,
     results: list[ParticipantResult],
     configs: list[ProductShareConfig],
+    calculation_scope: str,
 ) -> None:
-    product_detail_columns = [
-        cfg.product_name
-        for cfg in configs
-        if cfg.product_name and cfg.include_share
-    ]
+    """
+    输出均摊结果 CSV。
 
-    fieldnames = [
+    拉通均摊：
+        只输出单号、昵称、商品总数、应收金额。
+        因为拉通均摊只计算每个订单的总应收金额，
+        不会计算每个商品分别承担了多少钱。
+
+    独立均摊：
+        在基础列后增加每个参摊商品名称。
+        商品列中写入该订单在对应商品上的均摊金额。
+    """
+    base_fieldnames = [
         "单号",
         "昵称",
         "商品总数",
         "应收金额",
-    ] + product_detail_columns
+    ]
 
-    with output_path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    if calculation_scope == "independent":
+        product_detail_columns = [
+            cfg.product_name
+            for cfg in configs
+            if cfg.product_name and cfg.include_share
+        ]
+    else:
+        product_detail_columns = []
+
+    fieldnames = base_fieldnames + product_detail_columns
+
+    with output_path.open(
+        "w",
+        encoding="utf-8-sig",
+        newline="",
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+        )
         writer.writeheader()
 
         for item in results:
@@ -597,12 +749,20 @@ def write_share_result_csv(
                 "单号": item.order_no,
                 "昵称": item.nickname,
                 "商品总数": item.total_quantity,
-                "应收金额": cents_to_yuan_text(item.share_cents),
+                "应收金额": cents_to_yuan_text(
+                    item.share_cents,
+                ),
             }
 
-            for product_name in product_detail_columns:
-                cents = item.details.get(product_name)
-                row_data[product_name] = "" if cents is None else cents_to_yuan_text(cents)
+            if calculation_scope == "independent":
+                for product_name in product_detail_columns:
+                    cents = item.details.get(product_name)
+
+                    row_data[product_name] = (
+                        ""
+                        if cents is None
+                        else cents_to_yuan_text(cents)
+                    )
 
             writer.writerow(row_data)
 
@@ -639,7 +799,10 @@ def default_include_share(product_name: str) -> bool:
 
 def is_special_non_quantity_product(product_name: str) -> bool:
     name = str(product_name or "").strip()
-    return name.startswith("摊画师") or name.startswith("摊供稿人")
+    special_1 = name.startswith(("摊画师", "画师摊", "画师专", "画师各", "画师一", "画师二", "画师1", "画师2"))
+    special_2 = name.startswith(("摊供稿", "供稿", "摊章稿", "摊授权", "授权老师", "授权专"))
+    special_flag = special_1 or special_2
+    return special_flag
 
 
 def make_share_type(global_share_mode: str, calculation_scope: str) -> str:
