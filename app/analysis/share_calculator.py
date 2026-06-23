@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from app.config import CSV_OUTPUT_DIR, ensure_dirs
+from app.analysis.order_validator import (
+    default_include_share,
+    find_orders_with_only_non_share_products,
+    format_only_non_share_orders_message,
+)
+
+ORDER_METADATA_COLUMNS = {"单号", "昵称", "总金额"}
 
 
 class ShareCalculateError(RuntimeError):
@@ -73,7 +80,7 @@ def calculate_share(
 
     parsed_order_file:
         order_parser.py 输出的宽表 CSV：
-            单号, 昵称, 商品A, 商品B, 商品C...
+            单号, 昵称, 总金额, 商品A, 商品B, 商品C...
 
     total_amount:
         拉通计算时使用的总均摊金额。
@@ -126,6 +133,33 @@ def calculate_share(
         global_share_mode=share_mode,
         calculation_scope=calculation_scope,
     )
+
+    # -------------------------------------------------
+    # 个数摊计算前检查：
+    # 是否存在只购买了不参摊商品的订单
+    # -------------------------------------------------
+    if share_mode == "quantity":
+        abnormal_orders = find_orders_with_only_non_share_products(
+            order_rows=order_rows,
+            product_configs=configs,
+        )
+
+        if abnormal_orders:
+            return {
+                "ok": False,
+                "need_user_input": False,
+                "error_code": "orders_only_non_share_products",
+                "message": format_only_non_share_orders_message(
+                    abnormal_orders=abnormal_orders,
+                    operation_name="个数摊计算",
+                ),
+                "abnormal_order_nos": [
+                    order["单号"]
+                    for order in abnormal_orders
+                ],
+                "abnormal_orders": abnormal_orders,
+                "product_configs": product_configs_to_dicts(configs),
+            }
 
     active_configs = [
         cfg for cfg in configs
@@ -282,8 +316,9 @@ def read_order_rows(parsed_order_file: Path) -> tuple[list[OrderRow], list[str]]
             raise ShareCalculateError("简化订单文件必须包含“单号”和“昵称”列。")
 
         product_names = [
-            col for col in reader.fieldnames
-            if col not in {"单号", "昵称"}
+            col
+            for col in reader.fieldnames
+            if col not in ORDER_METADATA_COLUMNS
         ]
 
         rows: list[OrderRow] = []
@@ -786,15 +821,6 @@ def product_configs_to_dicts(configs: list[ProductShareConfig]) -> list[dict[str
         )
 
     return result
-
-
-def default_include_share(product_name: str) -> bool:
-    """
-    默认计入均摊规则：
-        商品名含“底胚” → False
-        其他 → True
-    """
-    return "底胚" not in str(product_name or "")
 
 
 def is_special_non_quantity_product(product_name: str) -> bool:

@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from app.config import CSV_OUTPUT_DIR, ensure_dirs
+from app.analysis.order_validator import default_include_share
 
-
+ORDER_METADATA_COLUMNS = {"单号", "昵称", "总金额"}
 MAX_PRODUCT_SLOTS = 20
 
 CONFIG_FIELDNAMES = [
@@ -41,7 +42,7 @@ def create_product_share_config_file(
 
     输入：
         order_parser.py 输出的宽表 CSV：
-            单号, 昵称, 商品A, 商品B, 商品C...
+            单号, 昵称, 总金额, 商品A, 商品B, 商品C...
 
     输出：
         商品均摊配置表 CSV。
@@ -139,8 +140,9 @@ def read_product_summary_from_order_file(
             raise ShareConfigError("简化订单文件必须包含“单号”和“昵称”列。")
 
         product_names = [
-            name for name in reader.fieldnames
-            if name not in {"单号", "昵称"}
+            name
+            for name in reader.fieldnames
+            if name not in ORDER_METADATA_COLUMNS
         ]
 
         product_quantity_map = {
@@ -484,17 +486,6 @@ def summarize_product_share_config(
         "diff": "" if diff is None else f"{diff:.2f}",
         "matched": matched,
     }
-
-
-def default_include_share(product_name: str) -> bool:
-    """
-    默认是否计入均摊。
-
-    当前规则：
-        商品名称包含“底胚” → False
-        其他 → True
-    """
-    return "底胚" not in str(product_name or "")
 
 
 def parse_required_positive_int(

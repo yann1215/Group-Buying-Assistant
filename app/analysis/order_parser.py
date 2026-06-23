@@ -22,7 +22,17 @@ NICKNAME_COL = 2
 
 ORDER_NO_HEADER = "单号"
 NICKNAME_HEADER = "昵称"
-DEFAULT_PRODUCT_ANCHOR_HEADER = "收货人地址"
+TOTAL_AMOUNT_HEADER = "总金额"
+DEFAULT_PRODUCT_ANCHOR_HEADERS = (
+    "发货状态",
+    "卖家备注",
+    "个人备注用户信息",
+    "个人备注其他信息",
+    "联系人电话",
+    "收货人姓名",
+    "收货人联系方式",
+    "收货人地址",
+)
 
 
 class OrderParseError(RuntimeError):
@@ -32,7 +42,7 @@ class OrderParseError(RuntimeError):
 def parse_order_file(
     order_input: str | Path | dict[str, Any],
     output_dir: str | Path | None = None,
-    product_anchor_header: str = DEFAULT_PRODUCT_ANCHOR_HEADER,
+    product_anchor_header: str | None = None,
 ) -> str:
     """
     读取订单 Excel 的第 2 个 sheet，将订单商品数据整理为宽表 CSV。
@@ -42,7 +52,8 @@ def parse_order_file(
         - 第 3 行是表头
         - 第 1 列是“单号”
         - 第 2 列是“昵称”
-        - product_anchor_header 所在列之后，是商品名称列
+        - 从第 3 行最右侧向左查找商品定位关键词
+        - 找到关键词后，关键词所在列之后均为商品名称列
         - 商品数量只能是正整数或空
         - 单号必须是正整数，不能为空
 
@@ -79,9 +90,26 @@ def parse_order_file(
 
     _validate_fixed_headers(ws, merged_value_map)
 
-    product_anchor_col = _find_header_col(
+    # 定位订单总金额列
+    total_amount_col = _find_required_header_col(
         ws=ws,
-        header_name=product_anchor_header,
+        header_name=TOTAL_AMOUNT_HEADER,
+        merged_value_map=merged_value_map,
+    )
+
+    # 如果外部明确指定了定位表头，只查找指定表头；
+    # 否则使用默认候选关键词。
+    candidate_anchor_headers = (
+        (product_anchor_header,)
+        if product_anchor_header
+        else DEFAULT_PRODUCT_ANCHOR_HEADERS
+    )
+
+    # 从表头行最右侧向左查找。
+    # 找到任意候选关键词后，该关键词下一列即为商品起始列。
+    product_anchor_col, matched_anchor_header = _find_product_anchor_col(
+        ws=ws,
+        header_names=candidate_anchor_headers,
         merged_value_map=merged_value_map,
     )
 
@@ -93,7 +121,8 @@ def parse_order_file(
 
     if not product_names:
         raise OrderParseError(
-            f"没有在“{product_anchor_header}”列之后找到商品名称。"
+            f"已找到商品定位表头“{matched_anchor_header}”，"
+            f"但没有在该列之后找到商品名称。"
         )
 
     product_headers = _make_unique_headers(product_names)
@@ -103,7 +132,7 @@ def parse_order_file(
     # output_path = output_dir_path / f"{input_path.stem}_parsed_orders_{timestamp}.csv"
     output_path = output_dir_path / f"{input_path.stem}_parsed_orders.csv"
 
-    fieldnames = ["单号", "昵称"] + product_headers
+    fieldnames = ["单号", "昵称", "总金额"] + product_headers
 
     rows_written = 0
 
@@ -133,6 +162,13 @@ def parse_order_file(
                 merged_value_map=merged_value_map,
             )
 
+            total_amount_raw = _get_cell_value(
+                ws=ws,
+                row=row_idx,
+                col=total_amount_col,
+                merged_value_map=merged_value_map,
+            )
+
             order_no = _parse_positive_int_required(
                 value=order_no_raw,
                 field_name="单号",
@@ -142,6 +178,7 @@ def parse_order_file(
             row_data: dict[str, Any] = {
                 "单号": order_no,
                 "昵称": _to_text(nickname_raw),
+                "总金额": _format_total_amount(total_amount_raw),
             }
 
             for offset, product_header in enumerate(product_headers):
@@ -240,23 +277,78 @@ def _validate_fixed_headers(
         )
 
 
-def _find_header_col(
+def _find_required_header_col(
     ws: Worksheet,
     header_name: str,
     merged_value_map: dict[tuple[int, int], Any],
 ) -> int:
     """
-    在第 3 行查找指定表头所在列。
+    在第 3 行中查找指定表头。
+
+    用于查找“总金额”等必须存在、但列位置不固定的字段。
     """
     target = _normalize_header(header_name)
 
     for col in range(1, ws.max_column + 1):
-        value = _get_cell_value(ws, HEADER_ROW, col, merged_value_map)
+        value = _get_cell_value(
+            ws=ws,
+            row=HEADER_ROW,
+            col=col,
+            merged_value_map=merged_value_map,
+        )
 
         if _normalize_header(value) == target:
             return col
 
-    raise OrderParseError(f"第 {HEADER_ROW} 行没有找到表头：{header_name}")
+    raise OrderParseError(
+        f"第 {HEADER_ROW} 行没有找到表头“{header_name}”。"
+    )
+
+
+def _find_product_anchor_col(
+    ws: Worksheet,
+    header_names: tuple[str, ...],
+    merged_value_map: dict[tuple[int, int], Any],
+) -> tuple[int, str]:
+    """
+    从第 3 行最右侧向左查找商品定位表头。
+
+    找到以下任意候选表头后立即停止：
+    发货状态、卖家备注、个人备注用户信息、个人备注其他信息、
+    联系人电话、收货人姓名、收货人联系方式、收货人地址。
+
+    返回：
+        定位表头所在列号、匹配到的标准表头名称。
+    """
+    normalized_headers: dict[str, str] = {}
+
+    for header_name in header_names:
+        normalized_name = _normalize_header(header_name)
+        if normalized_name:
+            normalized_headers[normalized_name] = header_name
+
+    # 从最后一列向第一列查找
+    for col in range(ws.max_column, 0, -1):
+        value = _get_cell_value(
+            ws=ws,
+            row=HEADER_ROW,
+            col=col,
+            merged_value_map=merged_value_map,
+        )
+
+        normalized_value = _normalize_header(value)
+
+        if normalized_value in normalized_headers:
+            return col, normalized_headers[normalized_value]
+
+    expected_headers = "、".join(
+        f"“{header_name}”" for header_name in header_names
+    )
+
+    raise OrderParseError(
+        f"第 {HEADER_ROW} 行没有找到任何商品定位表头。"
+        f"可识别的表头包括：{expected_headers}"
+    )
 
 
 def _get_product_names(
@@ -436,6 +528,34 @@ def _to_text(value: Any) -> str:
         return ""
 
     return str(value).strip()
+
+
+def _format_total_amount(value: Any) -> str:
+    """
+    格式化订单文件中的总金额。
+
+    规则：
+    - 空值保持为空
+    - 数字统一输出为两位小数
+    - 非数字内容原样转成文本，避免因为格式异常导致整个订单解析失败
+    """
+    if _is_blank(value):
+        return ""
+
+    if isinstance(value, bool):
+        return _to_text(value)
+
+    if isinstance(value, (int, float)):
+        return f"{value:.2f}"
+
+    text = str(value).strip()
+
+    try:
+        number = float(text.replace(",", ""))
+    except ValueError:
+        return text
+
+    return f"{number:.2f}"
 
 
 if __name__ == "__main__":
