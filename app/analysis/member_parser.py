@@ -15,12 +15,16 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from integrations.wechatmsg_lite_client import get_wechat_group_members
 from app.analysis.order_parser import parse_order_file
+from app.analysis.special_member import (
+    enrich_special_members,
+)
 
 
 def parse_group_member_orders(
     group_name: str,
     order_input: str | Path | dict[str, Any],
     order_output_dir: str | Path | None = None,
+    special_members: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     比对微信群成员昵称开头序号与订单表第一列单号。
@@ -127,13 +131,36 @@ def parse_group_member_orders(
         output_dir=order_output_dir,
     )
 
-    # 5. 读取简化后 CSV 第一列订单号
-    order_serials = read_first_column_serials(parsed_order_file)
+    # 5. 读取订单成员
+    order_members = read_order_members(
+        parsed_order_file
+    )
+
+    # 6. 补全特殊成员信息
+    resolved_special_members = enrich_special_members(
+        special_members=special_members or [],
+        group_members=members,
+        order_members=order_members,
+    )
+
+    # 7. 获取订单单号集合
+    order_serials = sorted_serials(
+        [
+            item["单号"]
+            for item in order_members
+        ]
+    )
 
     order_serial_set = set(order_serials)
 
-    serials_in_group_not_in_orders = sorted_serials(group_serials - order_serial_set)
-    serials_in_orders_not_in_group = sorted_serials(order_serial_set - group_serials)
+    # 8. 比对群成员单号与订单单号
+    serials_in_group_not_in_orders = sorted_serials(
+        group_serials - order_serial_set
+    )
+
+    serials_in_orders_not_in_group = sorted_serials(
+        order_serial_set - group_serials
+    )
 
     return {
         "ok": True,
@@ -143,12 +170,15 @@ def parse_group_member_orders(
         "chatroom_wxid": member_result.get("chatroom_wxid"),
         "member_count": member_result.get("member_count", len(members)),
 
+        "members": members,
         "member_serials": member_serials,
         "members_without_serial": members_without_serial,
         "duplicate_member_serials": duplicate_member_serials,
 
         "parsed_order_file": parsed_order_file,
         "order_serials": sorted_serials(order_serial_set),
+
+        "special_members": resolved_special_members,
 
         "serials_in_group_not_in_orders": serials_in_group_not_in_orders,
         "serials_in_orders_not_in_group": serials_in_orders_not_in_group,
@@ -194,41 +224,68 @@ def normalize_serial(value: Any) -> str:
     return str(int(s))
 
 
-def read_first_column_serials(csv_path: str | Path) -> list[str]:
+def read_order_members(
+    csv_path: str | Path,
+) -> list[dict[str, str]]:
     """
-    读取 CSV 第一列的所有订单号。
-    默认 parse_order_file 输出的第一列是“单号”。
-    """
+    从简化后的订单 CSV 中读取订单成员信息。
 
+    返回：
+        [
+            {
+                "单号": "1",
+                "昵称": "Yann",
+            },
+            ...
+        ]
+    """
     csv_path = Path(csv_path)
+
     if not csv_path.exists():
-        raise FileNotFoundError(f"订单 CSV 文件不存在：{csv_path}")
+        raise FileNotFoundError(
+            f"订单 CSV 文件不存在：{csv_path}"
+        )
 
-    serials: list[str] = []
+    order_members: list[dict[str, str]] = []
 
-    with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.reader(f)
+    with csv_path.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as file:
+        reader = csv.DictReader(file)
 
-        # 跳过表头
-        header = next(reader, None)
-        if not header:
-            return serials
+        if not reader.fieldnames:
+            return order_members
 
-        for row_idx, row in enumerate(reader, start=2):
-            if not row:
-                continue
+        if "单号" not in reader.fieldnames:
+            raise ValueError(
+                "简化订单 CSV 中没有找到“单号”列。"
+            )
 
-            value = row[0]
-            serial = normalize_serial(value)
+        for row_index, row in enumerate(
+            reader,
+            start=2,
+        ):
+            raw_order_no = row.get("单号")
+            order_no = normalize_serial(raw_order_no)
 
-            if serial == "":
+            if not order_no:
                 raise ValueError(
-                    f"订单 CSV 第 {row_idx} 行第一列不是有效正整数单号：{value!r}"
+                    f"订单 CSV 第 {row_index} 行的单号"
+                    f"不是有效正整数：{raw_order_no!r}"
                 )
 
-            serials.append(serial)
+            order_members.append(
+                {
+                    "单号": order_no,
+                    "昵称": str(
+                        row.get("昵称") or ""
+                    ).strip(),
+                }
+            )
 
-    return sorted_serials(set(serials))
+    return order_members
 
 
 def sorted_serials(serials: set[str] | list[str]) -> list[str]:

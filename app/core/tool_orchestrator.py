@@ -15,6 +15,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from app.analysis.special_member import (
+    SpecialMemberError,
+    update_special_member_cache,
+    validate_special_member_cache,
+)
 from app.analysis.member_parser import parse_group_member_orders
 from app.analysis.share_calculator import calculate_share
 from app.analysis.share_config import (
@@ -23,7 +28,15 @@ from app.analysis.share_config import (
     summarize_product_share_config,
     update_product_share_config_file,
 )
-from app.core.intent_parser import parse_user_intent
+from app.analysis.bulk_calculator import (
+    create_bulk_receivable_orders,
+    find_only_non_share_orders,
+)
+from app.core.intent_parser import (
+    has_affirmative_words,
+    has_negative_words,
+    parse_user_intent,
+)
 
 
 DEFAULT_ORDER_INPUT_DIR = Path("./orders")
@@ -40,21 +53,47 @@ class ShareRequestState:
     pending_config_confirmation: bool = False
     config_confirmed: bool = False
 
+@dataclass
+class BulkGoodsRequestState:
+    pending_confirmation: bool = False
+    confirmed: bool = False
 
 @dataclass
 class SessionToolContext:
     group_name: str | None = None
+
+    special_members: list[dict[str, Any]] = field(
+        default_factory=list
+    )
+
+    # 均摊订单
     order_input: str | Path | dict[str, Any] | None = None
+
+    # 大货订单，必须和均摊订单分开保存
+    bulk_order_input: str | Path | dict[str, Any] | None = None
+
     order_output_dir: str | Path | None = None
 
+    # 均摊订单核对缓存
     member_checked: bool = False
     member_check_result: dict[str, Any] | None = None
     parsed_order_file: str | None = None
 
+    # 大货订单核对缓存
+    bulk_member_checked: bool = False
+    bulk_member_check_result: dict[str, Any] | None = None
+    bulk_parsed_order_file: str | None = None
+
     share_config_file: str | None = None
     product_configs: list[dict[str, Any]] | None = None
 
-    share_request: ShareRequestState = field(default_factory=ShareRequestState)
+    share_request: ShareRequestState = field(
+        default_factory=ShareRequestState
+    )
+
+    bulk_request: BulkGoodsRequestState = field(
+        default_factory=BulkGoodsRequestState
+    )
 
 
 class ToolOrchestrator:
@@ -71,7 +110,20 @@ class ToolOrchestrator:
         ctx = self.contexts.setdefault(session_id, SessionToolContext())
 
         if group_name is not None:
-            ctx.group_name = group_name
+            new_group_name = str(group_name).strip()
+
+            if (
+                    ctx.group_name is not None
+                    and ctx.group_name != new_group_name
+            ):
+                ctx.special_members.clear()
+                ctx.member_checked = False
+                ctx.member_check_result = None
+                ctx.parsed_order_file = None
+                ctx.share_config_file = None
+                ctx.product_configs = None
+
+            ctx.group_name = new_group_name
 
         if order_input is not None:
             ctx.order_input = normalize_order_input_path(order_input)
@@ -101,10 +153,43 @@ class ToolOrchestrator:
         只更新本轮明确提到的字段。
         """
         if intent.get("group_name"):
-            ctx.group_name = intent["group_name"]
+            new_group_name = intent["group_name"]
+
+            group_changed = (
+                    ctx.group_name is not None
+                    and ctx.group_name != new_group_name
+            )
+
+            if group_changed:
+                ctx.special_members.clear()
+
+                ctx.member_checked = False
+                ctx.member_check_result = None
+                ctx.parsed_order_file = None
+                ctx.share_config_file = None
+                ctx.product_configs = None
+
+            ctx.group_name = new_group_name
+            reset_bulk_goods_context(ctx)
+
+        if intent.get("bulk_order_input"):
+            ctx.bulk_order_input = normalize_order_input_path(
+                intent["bulk_order_input"]
+            )
+            reset_bulk_goods_context(ctx)
+
+            # 更换订单文件后需要重新查成员，
+            # 但同一群的特殊成员配置可以保留。
+            ctx.member_checked = False
+            ctx.member_check_result = None
+            ctx.parsed_order_file = None
+            ctx.share_config_file = None
+            ctx.product_configs = None
 
         if intent.get("order_input"):
-            ctx.order_input = normalize_order_input_path(intent["order_input"])
+            ctx.order_input = normalize_order_input_path(
+                intent["order_input"]
+            )
 
             ctx.member_checked = False
             ctx.member_check_result = None
@@ -148,15 +233,32 @@ class ToolOrchestrator:
             req.force = True
 
 
-    def handle(self, session_id: int, user_text: str) -> str | None:
-        """
-        如果用户输入需要调用工具，则返回工具结果文本。
-        如果不需要调用工具，则返回 None，让 ChatService 继续走普通 LLM 对话。
-        """
+    def handle(
+            self,
+            session_id: int,
+            user_text: str,
+    ) -> str | None:
         intent = parse_user_intent(user_text)
-        ctx = self.contexts.setdefault(session_id, SessionToolContext())
+        ctx = self.contexts.setdefault(
+            session_id,
+            SessionToolContext(),
+        )
 
         self.update_context_from_intent(ctx, intent)
+
+        # 只有处于“大货等待确认”状态时，
+        # 才把“是”“没问题”等识别成大货确认。
+        if ctx.bulk_request.pending_confirmation:
+            if has_affirmative_words(user_text):
+                return self.handle_confirm_bulk_goods(ctx)
+
+            if has_negative_words(user_text):
+                ctx.bulk_request.pending_confirmation = False
+                ctx.bulk_request.confirmed = False
+                return (
+                    "已取消本次大货计算。\n"
+                    "请修改或同步订单信息后，重新输入“查大货”或“算大货”。"
+                )
 
         if intent["intent"] == "chat":
             return None
@@ -164,8 +266,39 @@ class ToolOrchestrator:
         if intent["intent"] == "set_context":
             return format_context_update_result(ctx)
 
+        if intent["intent"] == "calculate_bulk_goods":
+            return self.handle_calculate_bulk_goods(ctx)
+
+        if intent["intent"] == "update_special_members":
+            try:
+                ctx.special_members = update_special_member_cache(
+                    current_members=ctx.special_members,
+                    updates=(
+                            intent.get("special_member_updates")
+                            or []
+                    ),
+                )
+            except SpecialMemberError as exc:
+                return f"特殊成员信息设置失败：{exc}"
+
+            # 特殊成员信息改变后，原名单检查结果已经失效。
+            ctx.member_checked = False
+            ctx.member_check_result = None
+
+            return format_special_members(
+                ctx.special_members
+            )
+
+        if intent["intent"] == "show_special_members":
+            return format_special_members(
+                ctx.special_members
+            )
+
         if intent["intent"] == "member_check":
-            check_result = self.ensure_member_checked(ctx, force=True)
+            check_result = self.ensure_member_checked(
+                ctx,
+                force=True,
+            )
             return format_member_check_result(check_result)
 
         if intent["intent"] == "calculate_share":
@@ -181,13 +314,80 @@ class ToolOrchestrator:
 
         return None
 
+    def handle_update_special_members(
+            self,
+            ctx: SessionToolContext,
+            intent: dict[str, Any],
+    ) -> str:
+        updates = (
+                intent.get("special_member_updates")
+                or []
+        )
+
+        if not updates:
+            return (
+                "没有识别到需要设置的特殊成员信息。\n"
+                "例如：车主：昵称=Yann，单号=1，不参摊"
+            )
+
+        try:
+            ctx.special_members = (
+                update_special_member_cache(
+                    current_members=ctx.special_members,
+                    updates=updates,
+                )
+            )
+        except SpecialMemberError as exc:
+            return (
+                "特殊成员信息设置失败：\n"
+                f"{exc}"
+            )
+
+        # 特殊成员发生变化后，旧名单检查结果必须失效。
+        ctx.member_checked = False
+        ctx.member_check_result = None
+        ctx.parsed_order_file = None
+
+        return (
+                "特殊成员信息已更新。\n\n"
+                + format_special_members(
+            ctx.special_members
+        )
+        )
 
     def ensure_member_checked(
-        self,
-        ctx: SessionToolContext,
-        force: bool = False,
+            self,
+            ctx: SessionToolContext,
+            force: bool = False,
     ) -> dict[str, Any]:
-        if ctx.member_checked and ctx.member_check_result and not force:
+        # 即使存在旧缓存，也应先确认特殊成员配置仍然有效。
+        special_member_errors = (
+            validate_special_member_cache(
+                ctx.special_members,
+                require_owner=True,
+                require_non_share_order_no=False,
+                require_order_no=False,
+                require_share_state=False,
+            )
+        )
+
+        if special_member_errors:
+            return {
+                "ok": False,
+                "need_special_member_setup": True,
+                "stage": "special_member_setup",
+                "message": (
+                    "查成员前需要先完成特殊成员设置。"
+                ),
+                "errors": special_member_errors,
+                "special_members": ctx.special_members,
+            }
+
+        if (
+                ctx.member_checked
+                and ctx.member_check_result
+                and not force
+        ):
             return ctx.member_check_result
 
         if not ctx.group_name:
@@ -206,11 +406,24 @@ class ToolOrchestrator:
             group_name=ctx.group_name,
             order_input=ctx.order_input,
             order_output_dir=ctx.order_output_dir,
+            special_members=ctx.special_members,
         )
+
+        # member_parser 可能根据群昵称和订单补全特殊成员信息。
+        resolved_special_members = result.get(
+            "special_members"
+        )
+
+        if resolved_special_members is not None:
+            ctx.special_members = (
+                resolved_special_members
+            )
 
         ctx.member_checked = True
         ctx.member_check_result = result
-        ctx.parsed_order_file = result.get("parsed_order_file")
+        ctx.parsed_order_file = result.get(
+            "parsed_order_file"
+        )
 
         if result.get("ok") and ctx.parsed_order_file:
             self.ensure_share_config_loaded(
@@ -219,6 +432,215 @@ class ToolOrchestrator:
             )
 
         return result
+
+    def ensure_bulk_member_checked(
+            self,
+            ctx: SessionToolContext,
+            force: bool = False,
+    ) -> dict[str, Any]:
+        if (
+                ctx.bulk_member_checked
+                and ctx.bulk_member_check_result
+                and not force
+        ):
+            return ctx.bulk_member_check_result
+
+        if not ctx.group_name:
+            return {
+                "ok": False,
+                "message": "缺少群聊名称。",
+            }
+
+        if not ctx.bulk_order_input:
+            return {
+                "ok": False,
+                "message": (
+                    "缺少大货订单文件。"
+                    "请使用“大货订单：文件名.xlsx”进行设置。"
+                ),
+            }
+
+        result = parse_group_member_orders(
+            group_name=ctx.group_name,
+            order_input=ctx.bulk_order_input,
+            order_output_dir=ctx.order_output_dir,
+        )
+
+        ctx.bulk_member_checked = True
+        ctx.bulk_member_check_result = result
+        ctx.bulk_parsed_order_file = result.get(
+            "parsed_order_file"
+        )
+
+        return result
+
+    def handle_calculate_bulk_goods(
+            self,
+            ctx: SessionToolContext,
+    ) -> str:
+        if not ctx.group_name:
+            return (
+                "需要先设置待处理的群聊名称。\n"
+                "例如：群聊名称：xxx"
+            )
+
+        if not ctx.bulk_order_input:
+            return (
+                "需要先设置大货订单文件。\n"
+                "例如：大货订单：大货订单.xlsx\n"
+                "均摊订单和大货订单会分别保存，不会互相覆盖。"
+            )
+
+        # 1. 检查群成员与大货订单
+        check_result = self.ensure_bulk_member_checked(
+            ctx,
+            force=True,
+        )
+
+        if not check_result.get("ok"):
+            return format_member_check_result(check_result)
+
+        blocking_issues = get_blocking_member_issues(
+            check_result
+        )
+
+        if blocking_issues:
+            return (
+                    "大货计算前发现群成员与订单不一致，"
+                    "暂不继续。\n\n"
+                    + format_member_check_result(check_result)
+                    + "\n\n请修正群昵称序号或大货订单后，"
+                      "重新输入“查大货”。"
+            )
+
+        parsed_order_file = (
+                check_result.get("parsed_order_file")
+                or ctx.bulk_parsed_order_file
+        )
+
+        if not parsed_order_file:
+            return "没有找到大货订单的简化文件。"
+
+        # 2. 检查订单是否只有不参摊商品
+        abnormal_orders = find_only_non_share_orders(
+            parsed_order_file
+        )
+
+        if abnormal_orders:
+            lines = [
+                "发现大货订单异常：以下订单只包含不参摊商品，"
+                "暂不继续计算。",
+                "",
+            ]
+
+            for item in abnormal_orders:
+                products = "、".join(item.get("商品") or [])
+                lines.append(
+                    f"- 单号 {item.get('单号')}｜"
+                    f"{item.get('昵称')}｜"
+                    f"商品：{products}"
+                )
+
+            lines.extend(
+                [
+                    "",
+                    "请检查这些订单是否漏拍了参摊商品，"
+                    "或商品参摊规则是否设置正确。",
+                ]
+            )
+
+            return "\n".join(lines)
+
+        # 3. 所有自动检查通过，进入人工确认
+        ctx.bulk_request.pending_confirmation = True
+        ctx.bulk_request.confirmed = False
+
+        return (
+            "群成员与大货订单核对完成，订单合规检查通过。\n\n"
+            "在生成大货应收结果前，请再次确认：\n"
+            "1. 商品单价与订单应收金额是否一致？\n"
+            "2. 订单信息是否已经全部同步？\n"
+            "3. 订单内商品价格是否准确？\n"
+            "4. 漏收、补收的均摊是否已经计入订单金额？\n\n"
+            "以上内容全部确认无误后，请回复“是”。"
+        )
+
+    def handle_confirm_bulk_goods(
+            self,
+            ctx: SessionToolContext,
+    ) -> str:
+        if not ctx.bulk_request.pending_confirmation:
+            return "当前没有等待确认的大货计算。"
+
+        # 用户确认时再强制重新读取一次订单，
+        # 防止两次消息之间订单文件被修改。
+        check_result = self.ensure_bulk_member_checked(
+            ctx,
+            force=True,
+        )
+
+        if not check_result.get("ok"):
+            ctx.bulk_request.pending_confirmation = False
+            return format_member_check_result(check_result)
+
+        blocking_issues = get_blocking_member_issues(
+            check_result
+        )
+
+        if blocking_issues:
+            ctx.bulk_request.pending_confirmation = False
+
+            return (
+                    "确认时重新检查发现群成员或订单已发生变化，"
+                    "本次大货计算已停止。\n\n"
+                    + format_member_check_result(check_result)
+            )
+
+        parsed_order_file = (
+                check_result.get("parsed_order_file")
+                or ctx.bulk_parsed_order_file
+        )
+
+        if not parsed_order_file:
+            ctx.bulk_request.pending_confirmation = False
+            return "没有找到大货订单的简化文件。"
+
+        abnormal_orders = find_only_non_share_orders(
+            parsed_order_file
+        )
+
+        if abnormal_orders:
+            ctx.bulk_request.pending_confirmation = False
+
+            order_numbers = "、".join(
+                str(item.get("单号"))
+                for item in abnormal_orders
+            )
+
+            return (
+                "确认时重新检查发现订单异常，"
+                "本次大货计算已停止。\n"
+                f"只有不参摊商品的订单号：{order_numbers}"
+            )
+
+        result = create_bulk_receivable_orders(
+            parsed_order_file=parsed_order_file,
+            output_dir=ctx.order_output_dir,
+        )
+
+        ctx.bulk_request.pending_confirmation = False
+        ctx.bulk_request.confirmed = True
+
+        lines = [
+            "大货应收订单已生成。",
+            f"订单数量：{result.get('order_count')}",
+            f"结果文件：{result.get('result_file')}",
+            "",
+            "其中原订单的“总金额”已作为“大货应收金额”，"
+            "代码没有重新计算或修改该金额。",
+        ]
+
+        return "\n".join(lines)
 
 
     def ensure_share_config_loaded(
@@ -423,6 +845,56 @@ class ToolOrchestrator:
         return self.handle_calculate_share(ctx, intent)
 
 
+def format_special_members(
+    special_members: list[dict[str, Any]],
+) -> str:
+    if not special_members:
+        return "当前没有设置特殊成员。"
+
+    role_order = {
+        "车主": 0,
+        "画师": 1,
+        "章稿画师": 2,
+        "供稿人": 3,
+        "工具人": 4,
+    }
+
+    sorted_members = sorted(
+        special_members,
+        key=lambda item: (
+            role_order.get(
+                str(item.get("角色") or ""),
+                99,
+            ),
+            int(item["单号"])
+            if str(
+                item.get("单号") or ""
+            ).isdigit()
+            else 999999,
+        ),
+    )
+
+    lines = ["当前特殊成员："]
+
+    for member in sorted_members:
+        share_text = (
+            "不参摊"
+            if member.get("参摊") is False
+            else "参摊"
+        )
+
+        lines.append(
+            f"- {member.get('角色')}｜"
+            f"昵称：{member.get('昵称') or '未设置'}｜"
+            f"群昵称："
+            f"{member.get('群昵称') or '未设置'}｜"
+            f"单号：{member.get('单号') or '未设置'}｜"
+            f"{share_text}"
+        )
+
+    return "\n".join(lines)
+
+
 def get_blocking_member_issues(result: dict[str, Any]) -> list[str]:
     issues: list[str] = []
 
@@ -441,9 +913,50 @@ def get_blocking_member_issues(result: dict[str, Any]) -> list[str]:
     return issues
 
 
-def format_member_check_result(result: dict[str, Any]) -> str:
+def format_member_check_result(
+    result: dict[str, Any],
+) -> str:
+    if result.get("need_special_member_setup"):
+        lines = [
+            "查成员前需要先完成特殊成员设置。",
+        ]
+
+        errors = result.get("errors") or []
+
+        if errors:
+            lines.append("")
+            lines.append("当前问题：")
+
+            for error in errors:
+                lines.append(f"- {error}")
+
+        current_members = (
+            result.get("special_members")
+            or []
+        )
+
+        if current_members:
+            lines.append("")
+            lines.append(
+                format_special_members(
+                    current_members
+                )
+            )
+
+        lines.append("")
+        lines.append("至少需要设置1名车主。")
+        lines.append(
+            "例如：车主：昵称=Yann，"
+            "群昵称=001 Yann，单号=1，不参摊"
+        )
+
+        return "\n".join(lines)
+
     if not result.get("ok"):
-        return f"成员与订单核对失败：{result.get('message')}"
+        return (
+            "成员与订单核对失败："
+            f"{result.get('message')}"
+        )
 
     lines: list[str] = []
 
@@ -653,11 +1166,21 @@ def format_product_share_config_confirmation(
     return "\n".join(lines)
 
 
+def reset_bulk_goods_context(ctx: SessionToolContext) -> None:
+    ctx.bulk_member_checked = False
+    ctx.bulk_member_check_result = None
+    ctx.bulk_parsed_order_file = None
+
+    ctx.bulk_request.pending_confirmation = False
+    ctx.bulk_request.confirmed = False
+
+
 def format_context_update_result(ctx: SessionToolContext) -> str:
     lines = ["已更新当前处理上下文。"]
 
     lines.append(f"群聊名称：{ctx.group_name or '未设置'}")
-    lines.append(f"订单文件/输入目录：{ctx.order_input or '未设置'}")
+    lines.append(f"订单文件：{ctx.order_input or '未设置'}")
+    lines.append(f"大货订单：{ctx.bulk_order_input or '未设置'}")
     lines.append(f"输出目录：{ctx.order_output_dir or '未设置'}")
 
     return "\n".join(lines)

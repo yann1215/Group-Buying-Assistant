@@ -5,6 +5,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.analysis.special_parser import (
+    has_show_special_member_words,
+    parse_special_member_updates,
+)
+
 
 # 不允许被识别成商品名称的字段词
 RESERVED_PRODUCT_NAMES = {
@@ -75,12 +80,14 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "intent": "chat",
+        "special_member_updates": [],
         "share_mode": None,
         "calculation_scope": None,
         "amount": None,
         "product_share_amounts": [],
         "group_name": None,
         "order_input": None,
+        "bulk_order_input": None,
         "order_output_dir": None,
         "force": False,
         "confirm": False,
@@ -89,6 +96,24 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
     if not text:
         return result
 
+    # 1. 查看特殊成员
+    if has_show_special_member_words(text):
+        result["intent"] = "show_special_members"
+        return result
+
+    # 2. 设置特殊成员
+    special_member_updates = (
+        parse_special_member_updates(text)
+    )
+
+    if special_member_updates:
+        result["intent"] = "update_special_members"
+        result["special_member_updates"] = (
+            special_member_updates
+        )
+        return result
+
+    # 3. 解析均摊、商品金额等
     # 必须先解析各商品金额，再解析总金额。
     # 否则“1号10元，2号20元”可能把 10元 误认成总金额。
     product_share_amounts = parse_product_share_amounts(text)
@@ -101,8 +126,17 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
         allow_unlabeled_amount=not bool(product_share_amounts),
     )
 
+    # 4. 设置群聊信息、文件路径
     group_name = parse_group_name(text)
+
+    # 必须先识别“大货订单”，否则“大货订单：xxx.xlsx”
+    # 会被普通的“订单”正则识别成均摊订单。
+    bulk_order_input = parse_bulk_order_input(text)
+
     order_input = parse_order_input(text)
+    if bulk_order_input is None:
+        order_input = parse_order_input(text)
+
     order_output_dir = parse_order_output_dir(text)
 
     force = has_force_words(text)
@@ -111,11 +145,13 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
     result.update(
         {
             "share_mode": share_mode,
+            "special_member_updates": special_member_updates,
             "calculation_scope": calculation_scope,
             "amount": amount,
             "product_share_amounts": product_share_amounts,
             "group_name": group_name,
             "order_input": order_input,
+            "bulk_order_input": bulk_order_input,
             "order_output_dir": order_output_dir,
             "force": force,
             "confirm": confirm,
@@ -139,6 +175,10 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
         result["intent"] = "update_share_config"
         return result
 
+    if has_bulk_goods_words(text):
+        result["intent"] = "calculate_bulk_goods"
+        return result
+
     if has_member_check_words(text):
         result["intent"] = "member_check"
         return result
@@ -156,7 +196,7 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
         result["intent"] = "calculate_share"
         return result
 
-    if group_name or order_input or order_output_dir:
+    if group_name or order_input or bulk_order_input or order_output_dir:
         result["intent"] = "set_context"
         return result
 
@@ -760,6 +800,74 @@ def dedupe_product_share_updates(
 
 
 # ----------------------------------------------------------------------
+# 大货动作
+# ----------------------------------------------------------------------
+
+def has_bulk_goods_words(text: str) -> bool:
+    """
+    判断用户是否要求检查或计算大货。
+    """
+    keywords = [
+        "查大货",
+        "算大货",
+        "计算大货",
+        "检查大货",
+        "核对大货",
+        "收大货",
+        "大货计算",
+        "大货核对",
+    ]
+    return any(word in text for word in keywords)
+
+
+def has_affirmative_words(text: str) -> bool:
+    normalized = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
+
+    exact_words = {
+        "是",
+        "好的",
+        "好",
+        "对",
+        "可以",
+        "确认",
+        "确认无误",
+        "没有问题",
+        "没问题",
+        "无误",
+        "都确认了",
+        "已确认",
+        "开始",
+        "开始计算",
+        "继续",
+        "继续计算",
+        "按这个算",
+        "按这个计算",
+    }
+
+    return normalized in exact_words
+
+
+# 不要把“是”直接设置成一个全局 intent，否则普通聊天中的“是”也会触发工具。
+# 只提供函数，让 orchestrator 在“大货等待确认”状态下调用。
+def has_negative_words(text: str) -> bool:
+    normalized = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
+
+    exact_words = {
+        "否",
+        "不是",
+        "不",
+        "不要",
+        "取消",
+        "先不算",
+        "有问题",
+        "还没确认",
+        "暂不确认",
+    }
+
+    return normalized in exact_words
+
+
+# ----------------------------------------------------------------------
 # 群聊和文件路径
 # ----------------------------------------------------------------------
 
@@ -817,6 +925,34 @@ def parse_order_input(text: str) -> str | None:
         if match:
             value = match.group(1).strip().strip('"').strip("'")
 
+            if value:
+                return value
+
+    return None
+
+
+def parse_bulk_order_input(text: str) -> str | None:
+    """
+    支持：
+
+    大货订单：大货订单.xlsx
+    大货订单文件：D:\\orders\\大货订单.xlsx
+    当前大货订单：大货订单.xlsx
+    大货文件：大货订单.xlsx
+    """
+    patterns = [
+        (
+            r"(?:当前大货订单文件|当前大货订单|大货订单文件|"
+            r"大货订单|大货订单表|大货文件|大货路径)"
+            r"\s*(?:是|为|=|：|:)?\s*"
+            r"([^，,。；;\n]+)"
+        ),
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            value = match.group(1).strip().strip('"').strip("'")
             if value:
                 return value
 
