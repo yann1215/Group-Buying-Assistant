@@ -5,7 +5,7 @@ import csv
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 # 让直接运行 python app/analysis/member_parser.py 时，也能正常导入项目根目录下的 integrations / app
@@ -25,6 +25,7 @@ def parse_group_member_orders(
     order_input: str | Path | dict[str, Any],
     order_output_dir: str | Path | None = None,
     special_members: list[dict[str, Any]] | None = None,
+    key_input_func: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     """
     比对微信群成员昵称开头序号与订单表第一列单号。
@@ -53,7 +54,11 @@ def parse_group_member_orders(
     """
 
     # 1. 获取群成员
-    member_result = get_wechat_group_members(group_name=group_name)
+    member_result = get_wechat_group_members(
+        group_name=group_name,
+        allow_manual_key_input=True,
+        key_input_func=key_input_func,
+    )
 
     if not member_result.get("ok"):
         return {

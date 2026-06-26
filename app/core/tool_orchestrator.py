@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.analysis.special_member import (
     SpecialMemberError,
@@ -100,8 +100,14 @@ class SessionToolContext:
 
 
 class ToolOrchestrator:
-    def __init__(self):
+
+    def __init__(
+        self,
+        key_input_func: Callable[[str], str] | None = None,
+    ) -> None:
         self.contexts: dict[int, SessionToolContext] = {}
+
+        self.key_input_func = key_input_func
 
     def set_context(
         self,
@@ -405,11 +411,13 @@ class ToolOrchestrator:
                 "message": "缺少订单文件。",
             }
 
+        # 普通订单输出
         result = parse_group_member_orders(
             group_name=ctx.group_name,
             order_input=ctx.order_input,
             order_output_dir=ctx.order_output_dir,
             special_members=ctx.special_members,
+            key_input_func=self.key_input_func,
         )
 
         # member_parser 可能根据群昵称和订单补全特殊成员信息。
@@ -463,10 +471,12 @@ class ToolOrchestrator:
                 ),
             }
 
+        # 大货订单输出
         result = parse_group_member_orders(
             group_name=ctx.group_name,
             order_input=ctx.bulk_order_input,
             order_output_dir=ctx.order_output_dir,
+            key_input_func=self.key_input_func,
         )
 
         ctx.bulk_member_checked = True

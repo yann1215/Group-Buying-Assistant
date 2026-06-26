@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.database.repositories import add_message, get_messages
 from app.llm.ollama_client import OllamaClient
@@ -11,9 +11,16 @@ from app.core.tool_orchestrator import ToolOrchestrator
 
 
 class ChatService:
-    def __init__(self):
+
+    def __init__(
+        self,
+        key_input_func: Callable[[str], str] | None = None,
+    ) -> None:
         self.llm = OllamaClient()
-        self.tools = ToolOrchestrator()
+
+        self.tools = ToolOrchestrator(
+            key_input_func=key_input_func,
+        )
 
     def set_working_context(
         self,

@@ -34,6 +34,15 @@ RESERVED_PRODUCT_NAMES = {
     "输出目录",
     "保存目录",
     "结果目录",
+    "人头",
+    "个数",
+    "数量",
+    "件数",
+    "商品数",
+    "按人头",
+    "按个数",
+    "按数量",
+    "按件数",
 }
 
 
@@ -116,10 +125,15 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
     # 3. 解析均摊、商品金额等
     # 必须先解析各商品金额，再解析总金额。
     # 否则“1号10元，2号20元”可能把 10元 误认成总金额。
-    product_share_amounts = parse_product_share_amounts(text)
-
     share_mode = parse_share_mode(text)
     calculation_scope = parse_calculation_scope(text)
+
+    # “个数摊100”“人头摊300”中的数字是总均摊金额，
+    # 不能识别成某个商品的独立均摊金额。
+    if is_global_share_amount_command(text):
+        product_share_amounts = []
+    else:
+        product_share_amounts = parse_product_share_amounts(text)
 
     amount = parse_amount(
         text=text,
@@ -577,6 +591,61 @@ def parse_amount(
 # ----------------------------------------------------------------------
 # 各商品独立均摊金额
 # ----------------------------------------------------------------------
+def is_global_share_amount_command(text: str) -> bool:
+    """
+    判断是否为“均摊模式 + 总均摊金额”。
+
+    应识别：
+    个数摊 100
+    人头摊300
+    拉通个数 517
+    个数拉通517
+    按个数拉通 517
+    独立个数 100
+    个数独立 100
+    """
+    normalized = re.sub(
+        r"\s+",
+        "",
+        str(text or "").strip(),
+    )
+
+    if not normalized:
+        return False
+
+    mode_pattern = (
+        r"(?:"
+        r"(?:人头|个数|数量|件数)摊"
+        r"|"
+        r"(?:按)?(?:人头|个数|数量|件数)"
+        r"(?:拉通|独立)?"
+        r"|"
+        r"(?:拉通|独立)"
+        r"(?:人头|个数|数量|件数)"
+        r")"
+    )
+
+    amount_label_pattern = (
+        r"(?:"
+        r"总均摊金额|总均摊|均摊金额|"
+        r"总金额|金额|总额"
+        r")?"
+    )
+
+    amount_pattern = (
+        r"(?:是|为|=|：|:)?"
+        r"[￥¥]?"
+        r"\d+(?:\.\d{1,4})?"
+        r"元?"
+    )
+
+    return re.fullmatch(
+        mode_pattern
+        + amount_label_pattern
+        + amount_pattern,
+        normalized,
+    ) is not None
+
 
 def parse_product_share_amounts(text: str) -> list[dict[str, Any]]:
     """
@@ -647,6 +716,15 @@ def parse_product_share_clause(
     clause_index 用于保持原顺序，之后实现“后出现覆盖前面”。
     """
     normalized = clause.strip()
+
+    if not normalized:
+        return None
+
+    # 防止将“个数摊100”解析成：
+    # 商品名称=个数，商品均摊=100
+    if is_global_share_amount_command(normalized):
+        return None
+
 
     # 跳过明显属于总金额的片段
     if re.search(
