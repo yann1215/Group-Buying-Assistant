@@ -2,20 +2,29 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WECHATMSG_LITE_ROOT = PROJECT_ROOT / "external" / "WeChatMsg_Lite"
+WECHATMSG_LITE_ROOT = (
+    PROJECT_ROOT
+    / "external"
+    / "WeChatMsg_Lite"
+)
 
 
 def _ensure_wechatmsg_lite_path() -> None:
+    """
+    确保 external/WeChatMsg_Lite 已加入 Python 模块搜索路径。
+    """
     if not WECHATMSG_LITE_ROOT.exists():
         raise FileNotFoundError(
-            f"未找到 WeChatMsg_Lite：{WECHATMSG_LITE_ROOT}"
+            "未找到 WeChatMsg_Lite："
+            f"{WECHATMSG_LITE_ROOT}"
         )
 
     root_str = str(WECHATMSG_LITE_ROOT)
+
     if root_str not in sys.path:
         sys.path.insert(0, root_str)
 
@@ -31,7 +40,18 @@ def get_wechat_group_members(
     use_cache_key: bool = True,
     force_decrypt: bool = True,
     force_find_key: bool = False,
+    allow_manual_key_input: bool = True,
+    key_input_func: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
+    """
+    获取指定微信群聊的成员信息。
+
+    数据库解密顺序：
+    1. 尝试使用缓存 key；
+    2. 缓存 key 失败后尝试自动识别；
+    3. 自动识别失败后允许用户手动输入 key；
+    4. 用户输入 auto/自动识别时重新自动识别。
+    """
     _ensure_wechatmsg_lite_path()
 
     from member import get_member
@@ -47,6 +67,8 @@ def get_wechat_group_members(
         use_cache_key=use_cache_key,
         force_decrypt=force_decrypt,
         force_find_key=force_find_key,
+        allow_manual_key_input=allow_manual_key_input,
+        key_input_func=key_input_func,
     )
 
 
@@ -66,7 +88,18 @@ def get_wechat_group_messages(
     use_cache_key: bool = True,
     force_decrypt: bool = True,
     force_find_key: bool = False,
+    allow_manual_key_input: bool = True,
+    key_input_func: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
+    """
+    获取并导出指定微信群聊的聊天记录。
+
+    数据库解密顺序：
+    1. 尝试使用缓存 key；
+    2. 缓存 key 失败后尝试自动识别；
+    3. 自动识别失败后允许用户手动输入 key；
+    4. 用户输入 auto/自动识别时重新自动识别。
+    """
     _ensure_wechatmsg_lite_path()
 
     from msg import get_msg
@@ -87,4 +120,6 @@ def get_wechat_group_messages(
         use_cache_key=use_cache_key,
         force_decrypt=force_decrypt,
         force_find_key=force_find_key,
+        allow_manual_key_input=allow_manual_key_input,
+        key_input_func=key_input_func,
     )

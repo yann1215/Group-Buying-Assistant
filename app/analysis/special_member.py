@@ -228,7 +228,7 @@ def update_special_member_cache(
     2. 工具人可以有多人。
     3. 单人角色再次输入时更新原记录，不新增第二条。
     4. 工具人优先按单号、群昵称、昵称匹配原记录。
-    5. 新增成员未说明是否参摊时，默认参摊。
+    5. 新增成员未说明是否参摊时，默认不参摊。
     """
     result = [
         normalize_special_member(
@@ -307,7 +307,7 @@ def _update_single_person_role(
             )
 
         if update["参摊"] is None:
-            update["参摊"] = True
+            update["参摊"] = False
 
         members.append(update)
         return
@@ -382,7 +382,7 @@ def _update_multi_person_role(
 
     # 没匹配到原工具人，作为新的工具人加入。
     if update["参摊"] is None:
-        update["参摊"] = True
+        update["参摊"] = False
 
     members.append(update)
 

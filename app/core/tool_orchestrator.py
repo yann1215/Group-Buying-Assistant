@@ -21,6 +21,9 @@ from app.analysis.special_member import (
     validate_special_member_cache,
 )
 from app.analysis.member_parser import parse_group_member_orders
+from app.analysis.special_member import (
+    get_non_share_order_nos,
+)
 from app.analysis.share_calculator import calculate_share
 from app.analysis.share_config import (
     create_product_share_config_file,
@@ -558,10 +561,9 @@ class ToolOrchestrator:
         return (
             "群成员与大货订单核对完成，订单合规检查通过。\n\n"
             "在生成大货应收结果前，请再次确认：\n"
-            "1. 商品单价与订单应收金额是否一致？\n"
-            "2. 订单信息是否已经全部同步？\n"
-            "3. 订单内商品价格是否准确？\n"
-            "4. 漏收、补收的均摊是否已经计入订单金额？\n\n"
+            "1. 订单内商品价格是否准确？是否有满百减一等单价变化？\n"
+            "2. 漏收、补收的均摊是否已经计入订单金额？\n"
+            "3. 订单信息是否已经全部同步？商品单价与订单应收金额是否一致？\n\n"
             "以上内容全部确认无误后，请回复“是”。"
         )
 
@@ -737,6 +739,9 @@ class ToolOrchestrator:
             calculation_scope=calculation_scope,
             product_configs=ctx.product_configs,
             output_dir=ctx.order_output_dir,
+            excluded_order_nos=get_non_share_order_nos(
+                ctx.special_members
+            ),
         )
 
         if not result.get("ok") and result.get("need_user_input"):

@@ -74,6 +74,7 @@ def calculate_share(
     product_configs: list[dict[str, Any]] | None = None,
     output_dir: str | Path | None = None,
     max_product_slots: int = 20,
+    excluded_order_nos: set[str] | None = None,
 ) -> dict[str, Any]:
     """
     均摊计算主函数。
@@ -117,8 +118,30 @@ def calculate_share(
 
     order_rows, product_names = read_order_rows(parsed_order_file)
 
+    # 排除不参摊成员的订单
+    excluded_order_no_set = {
+        normalize_order_no_for_compare(order_no)
+        for order_no in (excluded_order_nos or set())
+    }
+
+    excluded_order_rows = [
+        row
+        for row in order_rows
+        if normalize_order_no_for_compare(row.order_no)
+           in excluded_order_no_set
+    ]
+
+    order_rows = [
+        row
+        for row in order_rows
+        if normalize_order_no_for_compare(row.order_no)
+           not in excluded_order_no_set
+    ]
+
     if not order_rows:
-        raise ShareCalculateError("没有找到可参与均摊的订单。")
+        raise ShareCalculateError(
+            "排除不参摊特殊成员后，没有可参与均摊的订单。"
+        )
 
     if len(product_names) > max_product_slots:
         raise ShareCalculateError(
@@ -362,6 +385,17 @@ def read_order_rows(parsed_order_file: Path) -> tuple[list[OrderRow], list[str]]
                 )
 
         return rows, product_names
+
+
+def normalize_order_no_for_compare(
+    value: Any,
+) -> str:
+    text = str(value or "").strip()
+
+    if not text.isdigit():
+        return text
+
+    return str(int(text))
 
 
 def build_product_configs(
@@ -827,7 +861,8 @@ def is_special_non_quantity_product(product_name: str) -> bool:
     name = str(product_name or "").strip()
     special_1 = name.startswith(("摊画师", "画师摊", "画师专", "画师各", "画师一", "画师二", "画师1", "画师2"))
     special_2 = name.startswith(("摊供稿", "供稿", "摊章稿", "摊授权", "授权老师", "授权专"))
-    special_flag = special_1 or special_2
+    special_3 = name.endswith(("专拍"))
+    special_flag = special_1 or special_2 or special_3
     return special_flag
 
 
