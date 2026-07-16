@@ -39,6 +39,26 @@ FIELD_NAMES = (
     "序号",
 )
 
+EDITABLE_FIELD_ALIASES = {
+    "微信昵称": "昵称",
+    "昵称": "昵称",
+    "群昵称": "群昵称",
+    "群名片": "群昵称",
+    "群备注": "群昵称",
+    "订单号": "单号",
+    "单号": "单号",
+    "序号": "单号",
+}
+
+_EDITABLE_FIELD_PATTERN = "|".join(
+    re.escape(name)
+    for name in sorted(
+        EDITABLE_FIELD_ALIASES,
+        key=len,
+        reverse=True,
+    )
+)
+
 _FIELD_PATTERN_TEXT = "|".join(
     re.escape(name)
     for name in sorted(
@@ -199,6 +219,22 @@ def parse_special_member_updates(
     if has_show_special_member_words(normalized):
         return []
 
+    # 必须优先解析明确修改语句。
+    # 否则“修改工具人工具猫……”可能被普通设置语法识别。
+    edit_update = parse_special_member_edit(
+        normalized
+    )
+
+    if edit_update is not None:
+        return [edit_update]
+
+    reversed_update = parse_reversed_special_member(
+        normalized
+    )
+
+    if reversed_update is not None:
+        return [reversed_update]
+
     # 先处理“Yann是车主”“把Yann设为车主”。
     reversed_update = parse_reversed_special_member(
         normalized
@@ -245,6 +281,209 @@ def parse_special_member_updates(
             updates.append(update)
 
     return updates
+
+
+def parse_special_member_edit(
+    text: str,
+) -> dict[str, Any] | None:
+    """
+    解析特殊成员字段修改命令。
+
+    支持角色在前：
+        把工具人工具猫的昵称改为yann
+        修改工具人工具猫的昵称为yann
+        把工具人群昵称工具猫的昵称改为yann
+
+    支持检索条件在前：
+        把昵称为工具猫的工具人的昵称改为yann
+        把群昵称工具猫的工具人昵称改为yann
+        把单号12的工具人的群昵称改为001 yann
+    """
+    normalized = normalize_text(text)
+
+    if not normalized:
+        return None
+
+    # ----------------------------------------------------------
+    # 1. 检索条件在角色前面
+    # ----------------------------------------------------------
+    #
+    # 例如：
+    # 把昵称为工具猫的工具人的昵称改为yann
+    # 把单号12的工具人群昵称改为001 yann
+    #
+    condition_first_pattern = re.compile(
+        rf"^\s*"
+        rf"(?:请\s*)?"
+        rf"(?:把|修改)\s*"
+        rf"(?P<match_field>{_EDITABLE_FIELD_PATTERN})"
+        rf"\s*(?:是|为|=|：|:)?\s*"
+        rf"(?P<match_value>.+?)"
+        rf"\s*的?\s*"
+        rf"(?P<role>{_ROLE_PATTERN_TEXT})"
+        rf"\s*的?\s*"
+        rf"(?P<target_field>{_EDITABLE_FIELD_PATTERN})"
+        rf"\s*"
+        rf"(?:修改为|改为|改成|修改成|为|成)"
+        rf"\s*"
+        rf"(?P<new_value>.+?)"
+        rf"\s*$"
+    )
+
+    match = condition_first_pattern.fullmatch(
+        normalized
+    )
+
+    if match:
+        role = match.group("role")
+
+        match_field = EDITABLE_FIELD_ALIASES[
+            match.group("match_field")
+        ]
+
+        match_value = normalize_text(
+            match.group("match_value")
+        )
+
+        target_field = EDITABLE_FIELD_ALIASES[
+            match.group("target_field")
+        ]
+
+        new_value = normalize_text(
+            match.group("new_value")
+        )
+
+    else:
+        # ------------------------------------------------------
+        # 2. 角色在前面
+        # ------------------------------------------------------
+        #
+        # 例如：
+        # 把工具人工具猫的昵称改为yann
+        # 把工具人群昵称工具猫的昵称改为yann
+        #
+        role_first_pattern = re.compile(
+            rf"^\s*"
+            rf"(?:请\s*)?"
+            rf"(?:把|修改)\s*"
+            rf"(?P<role>{_ROLE_PATTERN_TEXT})"
+            rf"\s*"
+            rf"(?P<selector>.+?)"
+            rf"\s*的?\s*"
+            rf"(?P<target_field>{_EDITABLE_FIELD_PATTERN})"
+            rf"\s*"
+            rf"(?:修改为|改为|改成|修改成|为|成)"
+            rf"\s*"
+            rf"(?P<new_value>.+?)"
+            rf"\s*$"
+        )
+
+        match = role_first_pattern.fullmatch(
+            normalized
+        )
+
+        if not match:
+            return None
+
+        role = match.group("role")
+        selector = normalize_text(
+            match.group("selector")
+        )
+
+        target_field = EDITABLE_FIELD_ALIASES[
+            match.group("target_field")
+        ]
+
+        new_value = normalize_text(
+            match.group("new_value")
+        )
+
+        if not selector:
+            return None
+
+        # 默认在昵称、群昵称、单号中搜索。
+        match_field = ""
+        match_value = selector
+
+        # 检查是否明确写了检索字段：
+        # 昵称工具猫、群昵称工具猫、单号12
+        selector_pattern = re.compile(
+            rf"^(?P<field>{_EDITABLE_FIELD_PATTERN})"
+            rf"\s*(?:是|为|=|：|:)?\s*"
+            rf"(?P<value>.+?)$"
+        )
+
+        selector_match = selector_pattern.fullmatch(
+            selector
+        )
+
+        if selector_match:
+            possible_field = EDITABLE_FIELD_ALIASES[
+                selector_match.group("field")
+            ]
+
+            possible_value = normalize_text(
+                selector_match.group("value")
+            )
+
+            if possible_value:
+                match_field = possible_field
+                match_value = possible_value
+
+    # ----------------------------------------------------------
+    # 3. 清理和校验解析结果
+    # ----------------------------------------------------------
+    match_value = match_value.strip(
+        " ，,。；;：:"
+    )
+    new_value = new_value.strip(
+        " ，,。；;：:"
+    )
+
+    if not match_value or not new_value:
+        return None
+
+    if match_field == "单号":
+        match_value = normalize_order_no(
+            match_value
+        )
+
+        if not match_value:
+            return {
+                "角色": role,
+                "_修改错误": (
+                    "用于检索成员的单号必须是正整数。"
+                ),
+            }
+
+    if target_field == "单号":
+        new_value = normalize_order_no(
+            new_value
+        )
+
+        if not new_value:
+            return {
+                "角色": role,
+                "_修改错误": (
+                    "修改后的单号必须是正整数。"
+                ),
+            }
+
+    update = {
+        "角色": role,
+        "昵称": "",
+        "群昵称": "",
+        "单号": "",
+        "参摊": None,
+
+        "_匹配字段": match_field,
+        "_匹配值": match_value,
+        "_修改字段": target_field,
+    }
+
+    update[target_field] = new_value
+
+    return update
 
 
 def parse_reversed_special_member(
@@ -400,6 +639,12 @@ def extract_special_member_field(
             reverse=True,
         )
     )
+
+    # “昵称”不能匹配“群昵称”“微信昵称”中的后半部分
+    if "昵称" in field_names:
+        names_pattern = (
+            rf"(?:微信昵称|(?<!群)(?<!微信)昵称)"
+        )
 
     stop_words = (
         list(FIELD_NAMES)

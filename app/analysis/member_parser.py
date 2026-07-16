@@ -17,6 +17,7 @@ from integrations.wechatmsg_lite_client import get_wechat_group_members
 from app.analysis.order_parser import parse_order_file
 from app.analysis.special_member import (
     enrich_special_members,
+    member_matches_special_member,
 )
 
 
@@ -148,6 +149,49 @@ def parse_group_member_orders(
         order_members=order_members,
     )
 
+    # 特殊成员不参与群昵称备注格式检查。
+    #
+    # 例如车主、工具人、供稿人没有在群昵称开头填写单号时，
+    # 不放入“群昵称前没有数字的成员”。
+    members_without_serial = [
+        member
+        for member in members_without_serial
+        if not is_special_group_member(
+            group_member=member,
+            special_members=resolved_special_members,
+        )
+    ]
+
+    # 重复序号提示中也排除特殊成员。
+    filtered_duplicate_member_serials = []
+
+    for item in duplicate_member_serials:
+        normal_members = [
+            member
+            for member in (
+                item.get("members")
+                or []
+            )
+            if not is_special_group_member(
+                group_member=member,
+                special_members=resolved_special_members,
+            )
+        ]
+
+        # 排除特殊成员后仍然至少有两名普通成员，
+        # 才属于真正的重复序号。
+        if len(normal_members) > 1:
+            filtered_duplicate_member_serials.append(
+                {
+                    "序号": item.get("序号"),
+                    "members": normal_members,
+                }
+            )
+
+    duplicate_member_serials = (
+        filtered_duplicate_member_serials
+    )
+
     # 7. 获取订单单号集合
     order_serials = sorted_serials(
         [
@@ -188,6 +232,30 @@ def parse_group_member_orders(
         "serials_in_group_not_in_orders": serials_in_group_not_in_orders,
         "serials_in_orders_not_in_group": serials_in_orders_not_in_group,
     }
+
+
+def is_special_group_member(
+    *,
+    group_member: dict[str, Any],
+    special_members: list[dict[str, Any]],
+) -> bool:
+    """
+    判断微信群成员是否属于已设置的特殊成员。
+
+    特殊成员包括：
+        车主
+        画师
+        章稿画师
+        供稿人
+        工具人
+    """
+    return any(
+        member_matches_special_member(
+            group_member=group_member,
+            special_member=special_member,
+        )
+        for special_member in special_members
+    )
 
 
 def extract_leading_number(text: str) -> str:

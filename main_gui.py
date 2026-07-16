@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+# 必须尽量放在入口文件最前面，
+# 并且放在 PySide6、ChatService 等重量级模块导入之前。
+if __name__ == "__main__":
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+
+
 import html
 import os
 import sys

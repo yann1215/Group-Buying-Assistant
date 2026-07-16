@@ -757,7 +757,12 @@ class ToolOrchestrator:
         if not result.get("ok") and result.get("need_user_input"):
             return format_share_need_user_input(result)
 
-        return format_share_result(result)
+        return format_share_result(
+            result=result,
+            group_name=ctx.group_name,
+            member_check_result=check_result,
+            special_members=ctx.special_members,
+        )
 
 
     def handle_update_share_config(
@@ -910,6 +915,91 @@ def format_special_members(
     return "\n".join(lines)
 
 
+def get_special_member_display_name(member: dict[str, Any]) -> str:
+    return str(
+        member.get("昵称")
+        or member.get("群昵称")
+        or member.get("单号")
+        or "未命名成员"
+    ).strip()
+
+
+def format_non_share_special_member_note(
+    special_members: list[dict[str, Any]],
+) -> str:
+    """
+    生成“不参摊说明”。
+
+    规则：
+    1. 参摊=True 的特殊成员不显示。
+    2. 工具人有单号且参摊=True，不显示。
+    3. 工具人没有单号且不参摊，显示“工具人xxx不买不参摊”。
+    4. 其他不参摊成员显示“角色xxx（单号x）不参摊”。
+    """
+    notes: list[str] = []
+
+    role_order = {
+        "车主": 0,
+        "工具人": 1,
+        "供稿人": 2,
+        "画师": 3,
+        "章稿画师": 4,
+    }
+
+    sorted_members = sorted(
+        special_members or [],
+        key=lambda item: (
+            role_order.get(str(item.get("角色") or ""), 99),
+            int(item["单号"])
+            if str(item.get("单号") or "").isdigit()
+            else 999999,
+        ),
+    )
+
+    for member in sorted_members:
+        role = str(member.get("角色") or "").strip()
+        name = get_special_member_display_name(member)
+        order_no = str(member.get("单号") or "").strip()
+        include_share = member.get("参摊")
+
+        # 明确参摊的特殊成员，不进入“不参摊说明”。
+        if include_share is True:
+            continue
+
+        # 只说明不参摊成员。
+        if include_share is not False:
+            continue
+
+        if role == "工具人" and not order_no:
+            notes.append(f"工具人{name}不买不参摊")
+            continue
+
+        if order_no:
+            notes.append(f"{role}{name}（单号{order_no}）不参摊")
+        else:
+            notes.append(f"{role}{name}不参摊")
+
+    if not notes:
+        return "无"
+
+    return "，".join(notes) + "。"
+
+
+def format_member_check_summary_for_share(
+    member_check_result: dict[str, Any] | None,
+) -> str:
+    if not member_check_result:
+        return "群成员与订单检查结果未知"
+
+    if (
+        member_check_result.get("ok")
+        and not get_blocking_member_issues(member_check_result)
+    ):
+        return "群成员与订单检查没问题"
+
+    return "群成员与订单已检查，但存在被忽略的问题"
+
+
 def get_blocking_member_issues(result: dict[str, Any]) -> list[str]:
     issues: list[str] = []
 
@@ -1017,53 +1107,84 @@ def format_member_check_result(
     return "\n".join(lines)
 
 
-def format_share_result(result: dict) -> str:
+def format_share_result(
+    result: dict,
+    group_name: str | None = None,
+    member_check_result: dict[str, Any] | None = None,
+    special_members: list[dict[str, Any]] | None = None,
+) -> str:
     if not result.get("ok"):
         if result.get("need_user_input"):
             return format_share_need_user_input(result)
+
         return result.get("message", "均摊计算失败。")
 
-    lines = []
+    lines: list[str] = []
 
-    lines.append("均摊计算完成。")
+    lines.append(str(group_name or result.get("group_name") or "未设置群名称"))
+    lines.append(format_member_check_summary_for_share(member_check_result))
+    lines.append("")
+
     lines.append(f"均摊方式：{result['share_mode_text']}")
     lines.append(f"计算方式：{result['calculation_scope_text']}")
     lines.append(f"原始均摊金额：{result['total_amount']}")
-    # 只有拉通个数摊才输出单个商品均摊。
-    if (
-            result.get("share_mode") == "quantity"
-            and result.get("calculation_scope") == "flat"
-            and result.get("unit_share_amount") is not None
-    ):
-        total_share_quantity = result.get(
-            "total_share_quantity"
-        )
+
+    if result.get("share_mode") == "quantity":
+        total_share_quantity = result.get("total_share_quantity")
 
         if total_share_quantity is not None:
-            lines.append(
-                f"总参摊个数：{total_share_quantity}"
-            )
+            lines.append(f"总参摊个数：{total_share_quantity}")
+        else:
+            lines.append("总参摊个数：未统计")
 
+    lines.append(f"参与人数：{result['participant_count']}")
+
+    lines.append(
+        "不参摊说明："
+        + format_non_share_special_member_note(special_members or [])
+    )
+
+    # 拉通个数摊：显示单个参摊商品需均摊。
+    if (
+        result.get("share_mode") == "quantity"
+        and result.get("calculation_scope") == "flat"
+        and result.get("unit_share_amount") is not None
+    ):
         lines.append(
             "单个参摊商品需均摊："
             f"{result['unit_share_amount']} 元"
         )
+
+    # 拉通人头摊：可显示单人需均摊。
+    if (
+        result.get("share_mode") == "head"
+        and result.get("calculation_scope") == "flat"
+        and result.get("unit_share_amount") is not None
+    ):
+        lines.append(
+            "单人需均摊："
+            f"{result['unit_share_amount']} 元"
+        )
+
     lines.append(f"实际总收款：{result['total_collected']}")
     lines.append(f"向上取整多收：{result['over_collected']}")
-    lines.append(f"参与人数：{result['participant_count']}")
-    lines.append(f"结果文件：{result['result_file']}")
+
+    result_file = result.get("result_file")
+
+    if result_file:
+        lines.append(f"结果文件：{result_file}")
 
     lines.append("")
     lines.append("前 10 条结果预览：")
 
-    for item in result["items"][:10]:
+    for item in result.get("items", [])[:10]:
         lines.append(
             f"- {item['单号']}｜{item['昵称']}｜"
             f"商品总数 {item['商品总数']}｜应收 {item['应收金额']}"
         )
 
-    if len(result["items"]) > 10:
-        lines.append(f"... 其余 {len(result['items']) - 10} 条见结果文件。")
+    if len(result.get("items", [])) > 10:
+        lines.append(f"... 共 {len(result['items'])} 条，完整结果见结果文件。")
 
     return "\n".join(lines)
 

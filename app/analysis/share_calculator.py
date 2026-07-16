@@ -201,11 +201,18 @@ def calculate_share(
         for row in order_rows
     }
 
-    # 拉通个数摊时，用于保存“单个商品均摊金额”。
+    # 个数摊时，用于保存“参摊商品数量（总数）”
+    summary_total_share_quantity: int | None = None
+    if share_mode == "quantity":
+        summary_total_share_quantity = calculate_total_share_quantity_for_summary(
+            order_rows=order_rows,
+            configs=active_configs,
+        )
+
+    # 个数摊时，用于保存“单个商品均摊金额”
     # 其他均摊模式下保持为 None。
     unit_share_cents: int | None = None
     total_share_quantity: int | None = None
-
     if calculation_scope == "flat":
         if total_amount is None:
             return {
@@ -221,10 +228,7 @@ def calculate_share(
             total_amount_decimal
         )
 
-        (
-            unit_share_cents,
-            total_share_quantity,
-        ) = calculate_flat_share(
+        unit_share_cents, _ = calculate_flat_share(
             order_rows=order_rows,
             configs=active_configs,
             participant_results=participant_results,
@@ -301,7 +305,7 @@ def calculate_share(
         "calculation_scope": calculation_scope,
         "calculation_scope_text": calculation_scope_to_text(calculation_scope),
         "total_amount": cents_to_yuan_text(total_original_cents),
-        "total_share_quantity": total_share_quantity,
+        "total_share_quantity": summary_total_share_quantity,
         "unit_share_amount": (
             cents_to_yuan_text(unit_share_cents)
             if unit_share_cents is not None
@@ -646,8 +650,7 @@ def calculate_flat_share(
     # 拉通人头摊
     # -------------------------------------------------
     per_person_amount = (
-        total_amount
-        / Decimal(total_weight)
+            total_amount / Decimal(total_weight)
     )
 
     per_person_cents = ceil_yuan_decimal_to_cents(
@@ -665,11 +668,12 @@ def calculate_flat_share(
         ]
 
         participant.share_cents += per_person_cents
+
         participant.details["拉通均摊"] = (
             per_person_cents
         )
 
-    return None, None
+    return per_person_cents, None
 
 
 def calculate_independent_share(
@@ -764,6 +768,31 @@ def calculate_one_product_quantity_independent(
 
         participant_results[row.order_no].share_cents += cents
         participant_results[row.order_no].details[cfg.product_name] = cents
+
+
+def calculate_total_share_quantity_for_summary(
+    order_rows: list[OrderRow],
+    configs: list[ProductShareConfig],
+) -> int:
+    eligible_product_names = {
+        cfg.product_name
+        for cfg in configs
+        if cfg.product_name and cfg.include_share
+    }
+
+    total_quantity = 0
+
+    for row in order_rows:
+        for product_name, quantity in row.quantities.items():
+            if product_name not in eligible_product_names:
+                continue
+
+            if is_special_non_quantity_product(product_name):
+                continue
+
+            total_quantity += quantity
+
+    return total_quantity
 
 
 def write_share_result_csv(

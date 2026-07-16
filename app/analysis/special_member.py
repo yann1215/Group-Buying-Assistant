@@ -239,9 +239,26 @@ def update_special_member_cache(
     ]
 
     for raw_update in updates or []:
+        if raw_update.get("_修改错误"):
+            raise SpecialMemberError(
+                str(raw_update["_修改错误"])
+            )
+
         update = normalize_special_member(
             raw_update,
             default_include_share=None,
+        )
+
+        # normalize_special_member() 只保留标准成员字段，
+        # 所以需要把修改命令的定位信息重新放回去。
+        update["_匹配字段"] = normalize_text(
+            raw_update.get("_匹配字段")
+        )
+        update["_匹配值"] = normalize_text(
+            raw_update.get("_匹配值")
+        )
+        update["_修改字段"] = normalize_text(
+            raw_update.get("_修改字段")
         )
 
         role = update["角色"]
@@ -338,6 +355,14 @@ def _update_multi_person_role(
         if member["角色"] == role
     ]
 
+    if update.get("_修改字段"):
+        _apply_explicit_member_edit(
+            members=members,
+            update=update,
+            role_indexes=role_indexes,
+        )
+        return
+
     # 例如只有“工具人：不参摊”，没有指定具体是谁。
     if not has_member_identity(update):
         if not role_indexes:
@@ -385,6 +410,121 @@ def _update_multi_person_role(
         update["参摊"] = False
 
     members.append(update)
+
+
+def _apply_explicit_member_edit(
+    *,
+    members: list[dict[str, Any]],
+    update: dict[str, Any],
+    role_indexes: list[int],
+) -> None:
+    """
+    根据旧身份信息定位成员，然后修改指定字段。
+
+    明确修改命令绝不自动新增成员。
+    """
+    role = update["角色"]
+    match_field = normalize_text(
+        update.get("_匹配字段")
+    )
+    match_value = normalize_text(
+        update.get("_匹配值")
+    )
+    target_field = normalize_text(
+        update.get("_修改字段")
+    )
+
+    if not match_value:
+        raise SpecialMemberError(
+            f"修改{role}时没有提供用于定位成员的信息。"
+        )
+
+    if target_field not in IDENTITY_FIELDS:
+        raise SpecialMemberError(
+            f"不支持修改字段：{target_field or '空'}。"
+        )
+
+    matched_indexes: list[int] = []
+
+    for index in role_indexes:
+        member = members[index]
+
+        if match_field:
+            fields_to_check = (match_field,)
+        else:
+            # 未指定检索字段时，昵称、群昵称、单号都检查。
+            fields_to_check = IDENTITY_FIELDS
+
+        matched = False
+
+        for field in fields_to_check:
+            current_value = normalize_text(
+                member.get(field)
+            )
+            expected_value = match_value
+
+            if field == "单号":
+                current_value = normalize_serial(
+                    current_value
+                )
+                expected_value = normalize_serial(
+                    expected_value
+                )
+
+            if (
+                current_value
+                and expected_value
+                and current_value == expected_value
+            ):
+                matched = True
+                break
+
+        if matched:
+            matched_indexes.append(index)
+
+    if not matched_indexes:
+        field_text = (
+            f"{match_field}为“{match_value}”"
+            if match_field
+            else f"身份信息为“{match_value}”"
+        )
+
+        raise SpecialMemberError(
+            f"没有找到{field_text}的{role}，"
+            "因此没有进行修改。"
+        )
+
+    if len(matched_indexes) > 1:
+        field_text = (
+            f"{match_field}“{match_value}”"
+            if match_field
+            else f"“{match_value}”"
+        )
+
+        raise SpecialMemberError(
+            f"{field_text}匹配到了多名{role}，"
+            "请明确写出昵称、群昵称或单号进行检索。"
+        )
+
+    target = members[matched_indexes[0]]
+    new_value = normalize_text(
+        update.get(target_field)
+    )
+
+    if target_field == "单号":
+        new_value = normalize_serial(new_value)
+
+        if not new_value:
+            raise SpecialMemberError(
+                "新单号必须是正整数。"
+            )
+
+    if not new_value:
+        raise SpecialMemberError(
+            f"新的{target_field}不能为空。"
+        )
+
+    target[target_field] = new_value
 
 
 def _find_matching_indexes(
@@ -694,12 +834,12 @@ def enrich_special_members(
         # 第一轮可能通过昵称找到单号；
         # 第二轮再通过单号找到群昵称。
         for _ in range(2):
-            order_match = _find_unique_order_member(
+            order_match = _find_special_order_member(
                 special_member=member,
                 order_members=normalized_order_members,
             )
 
-            group_match = _find_unique_group_member(
+            group_match = _find_special_group_member(
                 special_member=member,
                 group_members=normalized_group_members,
             )
@@ -749,7 +889,7 @@ def _normalize_order_member(
     }
 
 
-def _find_unique_group_member(
+def _find_special_group_member(
     *,
     special_member: dict[str, Any],
     group_members: list[dict[str, str]],
@@ -786,23 +926,38 @@ def _find_unique_group_member(
             return unique
 
     if nickname:
+        # 优先按真正的微信昵称、备注或 wxid 匹配。
         matched = [
             member
             for member in group_members
             if nickname
-            in {
-                member["昵称"],
-                member["备注"],
-                member["wxid"],
-            }
+               in {
+                   member["昵称"],
+                   member["备注"],
+                   member["wxid"],
+               }
         ]
 
-        return _unique_item(matched)
+        unique = _unique_item(matched)
+
+        if unique:
+            return unique
+
+        # 兼容用户误把群昵称填入“昵称”字段的情况。
+        matched_by_group_nickname = [
+            member
+            for member in group_members
+            if member["群昵称"] == nickname
+        ]
+
+        return _unique_item(
+            matched_by_group_nickname
+        )
 
     return None
 
 
-def _find_unique_order_member(
+def _find_special_order_member(
     *,
     special_member: dict[str, Any],
     order_members: list[dict[str, str]],

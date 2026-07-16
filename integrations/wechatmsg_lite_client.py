@@ -5,9 +5,29 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+def get_runtime_dir() -> Path:
+    """
+    用户数据、缓存、输出文件所在目录。
+    打包后是 exe 所在目录。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+
+    return Path(__file__).resolve().parents[1]
+
+
+PROJECT_ROOT = get_runtime_dir()
+
+# PyInstaller 内置资源所在目录：
+# onedir 时通常是 _internal；
+# onefile 时通常是临时 _MEI... 目录；
+# 源码运行时则退回项目根目录。
+BUNDLE_ROOT = Path(
+    getattr(sys, "_MEIPASS", PROJECT_ROOT)
+).resolve()
+
 WECHATMSG_LITE_ROOT = (
-    PROJECT_ROOT
+    BUNDLE_ROOT
     / "external"
     / "WeChatMsg_Lite"
 )
