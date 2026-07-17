@@ -898,6 +898,9 @@ def _find_special_group_member(
     nickname = special_member["昵称"]
     order_no = special_member["单号"]
 
+    # --------------------------------------------------
+    # 1. 群昵称精确匹配
+    # --------------------------------------------------
     if group_nickname:
         matched = [
             member
@@ -910,14 +913,16 @@ def _find_special_group_member(
         if unique:
             return unique
 
+    # --------------------------------------------------
+    # 2. 单号精确匹配群昵称开头数字
+    # --------------------------------------------------
     if order_no:
         matched = [
             member
             for member in group_members
             if extract_leading_serial(
                 member["群昵称"]
-            )
-            == order_no
+            ) == order_no
         ]
 
         unique = _unique_item(matched)
@@ -925,17 +930,19 @@ def _find_special_group_member(
         if unique:
             return unique
 
+    # --------------------------------------------------
+    # 3. 昵称、备注、wxid 精确匹配
+    # --------------------------------------------------
     if nickname:
-        # 优先按真正的微信昵称、备注或 wxid 匹配。
         matched = [
             member
             for member in group_members
             if nickname
-               in {
-                   member["昵称"],
-                   member["备注"],
-                   member["wxid"],
-               }
+            in {
+                member["昵称"],
+                member["备注"],
+                member["wxid"],
+            }
         ]
 
         unique = _unique_item(matched)
@@ -943,16 +950,50 @@ def _find_special_group_member(
         if unique:
             return unique
 
-        # 兼容用户误把群昵称填入“昵称”字段的情况。
-        matched_by_group_nickname = [
+        # 兼容把群昵称误填到“昵称”字段。
+        matched = [
             member
             for member in group_members
             if member["群昵称"] == nickname
         ]
 
-        return _unique_item(
-            matched_by_group_nickname
+        unique = _unique_item(matched)
+
+        if unique:
+            return unique
+
+    # --------------------------------------------------
+    # 4. 群昵称模糊匹配
+    # --------------------------------------------------
+    if group_nickname:
+        unique = _find_unique_fuzzy_member(
+            query=group_nickname,
+            members=group_members,
+            fields=(
+                "群昵称",
+                "昵称",
+            ),
         )
+
+        if unique:
+            return unique
+
+    # --------------------------------------------------
+    # 5. 昵称模糊匹配
+    # --------------------------------------------------
+    if nickname:
+        unique = _find_unique_fuzzy_member(
+            query=nickname,
+            members=group_members,
+            fields=(
+                "昵称",
+                "群昵称",
+                "备注",
+            ),
+        )
+
+        if unique:
+            return unique
 
     return None
 
@@ -965,6 +1006,7 @@ def _find_special_order_member(
     order_no = special_member["单号"]
     nickname = special_member["昵称"]
 
+    # 1. 单号精确匹配
     if order_no:
         matched = [
             member
@@ -977,6 +1019,7 @@ def _find_special_order_member(
         if unique:
             return unique
 
+    # 2. 昵称精确匹配
     if nickname:
         matched = [
             member
@@ -984,7 +1027,20 @@ def _find_special_order_member(
             if member["昵称"] == nickname
         ]
 
-        return _unique_item(matched)
+        unique = _unique_item(matched)
+
+        if unique:
+            return unique
+
+    # 3. 昵称模糊匹配
+    # “微信群成员里暂时查不到，但订单中能找到”的情况
+    # 订单昵称无法覆盖已经从微信获取到的完整昵称
+    if nickname:
+        return _find_unique_fuzzy_member(
+            query=nickname,
+            members=order_members,
+            fields=("昵称",),
+        )
 
     return None
 
@@ -994,27 +1050,39 @@ def _fill_from_group_member(
     special_member: dict[str, Any],
     group_member: dict[str, str] | None,
 ) -> None:
+    """
+    使用已确认匹配的微信群成员更新特殊成员信息。
+
+    由于传入的 group_member 已经经过唯一匹配，
+    因此昵称和群昵称可以更新为微信群中的完整值。
+    """
     if not group_member:
         return
 
-    if not special_member["群昵称"]:
+    full_group_nickname = normalize_text(
+        group_member.get("群昵称")
+    )
+
+    full_nickname = (
+        normalize_text(group_member.get("昵称"))
+        or normalize_text(group_member.get("备注"))
+        or normalize_text(group_member.get("wxid"))
+    )
+
+    if full_group_nickname:
         special_member["群昵称"] = (
-            group_member["群昵称"]
+            full_group_nickname
         )
 
-    if not special_member["昵称"]:
-        special_member["昵称"] = (
-            group_member["昵称"]
-            or group_member["备注"]
-            or group_member["wxid"]
-        )
+    if full_nickname:
+        special_member["昵称"] = full_nickname
 
-    if not special_member["单号"]:
-        special_member["单号"] = (
-            extract_leading_serial(
-                group_member["群昵称"]
-            )
-        )
+    serial = extract_leading_serial(
+        full_group_nickname
+    )
+
+    if serial:
+        special_member["单号"] = serial
 
 
 def _fill_from_order_member(
@@ -1156,6 +1224,78 @@ def _member_label(
         f"{member.get('角色', '特殊成员')}"
         f"“{name}”"
     )
+
+
+def normalize_name_for_match(value: Any) -> str:
+    """
+    将昵称规范化为适合检索的形式。
+
+    目前只忽略空白和英文大小写；
+    emoji、汉字和其他符号保留。
+    """
+    text = normalize_text(value)
+
+    return re.sub(
+        r"\s+",
+        "",
+        text,
+    ).casefold()
+
+
+def is_fuzzy_name_match(
+    query: Any,
+    candidate: Any,
+) -> bool:
+    """
+    判断昵称是否满足包含关系。
+
+    示例：
+        番茄      -> 番茄🍅
+        番茄      -> 001 番茄🍅
+        yann      -> Yann
+    """
+    query_text = normalize_name_for_match(query)
+    candidate_text = normalize_name_for_match(candidate)
+
+    if not query_text or not candidate_text:
+        return False
+
+    # 太短的检索词容易误匹配。
+    # 中文昵称建议至少输入两个字符。
+    if len(query_text) < 2:
+        return False
+
+    return (
+        query_text in candidate_text
+        or candidate_text in query_text
+    )
+
+
+def _find_unique_fuzzy_member(
+    *,
+    query: str,
+    members: list[dict[str, str]],
+    fields: tuple[str, ...],
+) -> dict[str, str] | None:
+    """
+    在指定字段中模糊查找成员。
+
+    只有唯一成员匹配时才返回；
+    同一个成员多个字段匹配不会被重复计算。
+    """
+    matched: list[dict[str, str]] = []
+
+    for member in members:
+        if any(
+            is_fuzzy_name_match(
+                query,
+                member.get(field),
+            )
+            for field in fields
+        ):
+            matched.append(member)
+
+    return _unique_item(matched)
 
 
 def _unique_item(

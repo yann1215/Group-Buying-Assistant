@@ -1172,6 +1172,7 @@ def format_share_result(
     result_file = result.get("result_file")
 
     if result_file:
+        lines.append("")
         lines.append(f"结果文件：{result_file}")
 
     lines.append("")
@@ -1328,9 +1329,10 @@ def normalize_order_input_path(value: str | Path | dict[str, Any]) -> str | Path
 
     规则：
         1. 如果是 dict，尝试规范化其中的 file_path / order_file / path。
-        2. 如果是绝对路径，原样返回。
-        3. 如果只是文件名，例如“订单1.xlsx”，默认变成 ./orders/订单1.xlsx。
-        4. 如果是相对路径但已经包含目录，例如 orders/订单1.xlsx，则原样返回。
+        2. 没有文件后缀时，自动补充 .xlsx。
+        3. 如果是绝对路径，保留该路径。
+        4. 如果只有文件名，默认放到 ./orders 目录。
+        5. 如果相对路径中已经包含目录，则保留该路径。
     """
     if isinstance(value, dict):
         result = dict(value)
@@ -1343,6 +1345,10 @@ def normalize_order_input_path(value: str | Path | dict[str, Any]) -> str | Path
         return result
 
     path = Path(str(value).strip().strip('"').strip("'"))
+
+    # 没有后缀时，自动补充 .xlsx
+    if not path.suffix:
+        path = path.with_suffix(".xlsx")
 
     # 绝对路径：D:\xxx\订单1.xlsx 或 /xxx/订单1.xlsx
     if path.is_absolute():
