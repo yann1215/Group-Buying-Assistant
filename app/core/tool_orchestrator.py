@@ -56,10 +56,58 @@ class ShareRequestState:
     pending_config_confirmation: bool = False
     config_confirmed: bool = False
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "share_mode": self.share_mode,
+            "calculation_scope": self.calculation_scope,
+            "amount": self.amount,
+            "force": self.force,
+            "pending_config_confirmation": self.pending_config_confirmation,
+            "config_confirmed": self.config_confirmed,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ShareRequestState":
+        if not isinstance(data, dict):
+            return cls()
+
+        return cls(
+            share_mode=_optional_string(data.get("share_mode")),
+            calculation_scope=_optional_string(
+                data.get("calculation_scope")
+            ),
+            amount=_optional_string(data.get("amount")),
+            force=data.get("force") is True,
+            pending_config_confirmation=(
+                data.get("pending_config_confirmation") is True
+            ),
+            config_confirmed=data.get("config_confirmed") is True,
+        )
+
+
 @dataclass
 class BulkGoodsRequestState:
     pending_confirmation: bool = False
     confirmed: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pending_confirmation": self.pending_confirmation,
+            "confirmed": self.confirmed,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "BulkGoodsRequestState":
+        if not isinstance(data, dict):
+            return cls()
+
+        return cls(
+            pending_confirmation=(
+                data.get("pending_confirmation") is True
+            ),
+            confirmed=data.get("confirmed") is True,
+        )
+
 
 @dataclass
 class SessionToolContext:
@@ -98,6 +146,69 @@ class SessionToolContext:
         default_factory=BulkGoodsRequestState
     )
 
+    def to_dict(self) -> dict[str, Any]:
+        """
+        转换为可写入 JSON 的会话上下文。
+
+        群成员核对结果和解析订单路径属于易过期缓存，
+        不进行持久化。恢复会话后必须重新核对。
+        """
+        return {
+            "context_version": 1,
+            "group_name": self.group_name,
+            "special_members": _to_json_safe(self.special_members),
+            "order_input": _to_json_safe(self.order_input),
+            "bulk_order_input": _to_json_safe(self.bulk_order_input),
+            "order_output_dir": _to_json_safe(self.order_output_dir),
+            "share_config_file": self.share_config_file,
+            "product_configs": _to_json_safe(self.product_configs),
+            "share_request": self.share_request.to_dict(),
+            "bulk_request": self.bulk_request.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "SessionToolContext":
+        if not isinstance(data, dict):
+            return cls()
+
+        special_members = data.get("special_members")
+        product_configs = data.get("product_configs")
+
+        return cls(
+            group_name=_optional_string(data.get("group_name")),
+            special_members=_dict_list_or_empty(special_members),
+            order_input=_restore_order_input(data.get("order_input")),
+            bulk_order_input=_restore_order_input(
+                data.get("bulk_order_input")
+            ),
+            order_output_dir=_optional_string(
+                data.get("order_output_dir")
+            ),
+
+            # 核对状态始终使用默认值 False/None，避免恢复过期结果。
+            member_checked=False,
+            member_check_result=None,
+            parsed_order_file=None,
+            bulk_member_checked=False,
+            bulk_member_check_result=None,
+            bulk_parsed_order_file=None,
+
+            share_config_file=_optional_string(
+                data.get("share_config_file")
+            ),
+            product_configs=(
+                _dict_list_or_empty(product_configs)
+                if isinstance(product_configs, list)
+                else None
+            ),
+            share_request=ShareRequestState.from_dict(
+                data.get("share_request")
+            ),
+            bulk_request=BulkGoodsRequestState.from_dict(
+                data.get("bulk_request")
+            ),
+        )
+
 
 class ToolOrchestrator:
 
@@ -108,6 +219,27 @@ class ToolOrchestrator:
         self.contexts: dict[int, SessionToolContext] = {}
 
         self.key_input_func = key_input_func
+
+    def get_context(self, session_id: int) -> SessionToolContext:
+        return self.contexts.setdefault(
+            session_id,
+            SessionToolContext(),
+        )
+
+    def get_context_data(self, session_id: int) -> dict[str, Any]:
+        return self.get_context(session_id).to_dict()
+
+    def load_context(
+        self,
+        session_id: int,
+        context_data: dict[str, Any] | None,
+    ) -> SessionToolContext:
+        ctx = SessionToolContext.from_dict(context_data)
+        self.contexts[session_id] = ctx
+        return ctx
+
+    def remove_context(self, session_id: int) -> None:
+        self.contexts.pop(session_id, None)
 
     def set_context(
         self,
@@ -1301,6 +1433,59 @@ def format_product_share_config_confirmation(
     lines.append("确认无误后请输入：确认计算")
 
     return "\n".join(lines)
+
+
+def _to_json_safe(value: Any) -> Any:
+    """递归转换 Path 等对象，保证结果可以交给 json.dumps。"""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, dict):
+        return {
+            str(key): _to_json_safe(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_safe(item) for item in value]
+
+    raise TypeError(
+        f"会话上下文包含无法保存的类型：{type(value).__name__}"
+    )
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+
+    if not isinstance(value, (str, int, float)):
+        return None
+
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _dict_list_or_empty(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+
+    return [
+        _to_json_safe(item)
+        for item in value
+        if isinstance(item, dict)
+    ]
+
+
+def _restore_order_input(
+    value: Any,
+) -> str | dict[str, Any] | None:
+    if isinstance(value, dict):
+        return _to_json_safe(value)
+
+    return _optional_string(value)
 
 
 def reset_bulk_goods_context(ctx: SessionToolContext) -> None:

@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QHBoxLayout,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -51,7 +53,6 @@ os.chdir(RUNTIME_DIR)
 
 from app.core.chat_service import ChatService
 from app.database.db import init_db
-from app.database.repositories import create_session
 
 
 @dataclass
@@ -192,35 +193,64 @@ class ChatWindow(QMainWindow):
         self.session_id = session_id
         self.thread_pool = QThreadPool.globalInstance()
         self.is_processing = False
+        self._updating_session_list = False
 
         # 必须保存 worker 引用，防止任务结束前被 Python 回收
         self.current_worker: SendMessageWorker | None = None
 
         self.setWindowTitle("拼团辅助机器人")
-        self.resize(860, 680)
-        self.setMinimumSize(680, 500)
+        self.resize(1080, 700)
+        self.setMinimumSize(820, 520)
 
         self._build_ui()
         self._apply_style()
-
-        self.append_message(
-            "assistant",
-            (
-                "已启动。你可以直接输入命令，例如：\n"
-                "群聊名称：XXX\n"
-                "订单文件：订单1.xlsx\n"
-                "查成员\n"
-                "算均摊\n"
-                "算大货"
-            ),
-        )
+        self.load_session(session_id)
         self.input_box.setFocus()
 
     def _build_ui(self) -> None:
         central = QWidget(self)
         self.setCentralWidget(central)
 
-        main_layout = QVBoxLayout(central)
+        root_layout = QHBoxLayout(central)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setMinimumWidth(190)
+        sidebar.setMaximumWidth(260)
+
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(12, 16, 12, 16)
+        sidebar_layout.setSpacing(10)
+
+        self.new_session_button = QPushButton("＋ 新对话")
+        self.new_session_button.setObjectName("newSessionButton")
+        self.new_session_button.clicked.connect(self.create_new_session)
+        sidebar_layout.addWidget(self.new_session_button)
+
+        self.session_list = QListWidget()
+        self.session_list.setObjectName("sessionList")
+        self.session_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )
+        self.session_list.currentItemChanged.connect(
+            self.handle_session_selected
+        )
+        sidebar_layout.addWidget(self.session_list, 1)
+
+        self.delete_session_button = QPushButton("删除当前对话")
+        self.delete_session_button.setObjectName("deleteSessionButton")
+        self.delete_session_button.clicked.connect(
+            self.delete_current_session
+        )
+        sidebar_layout.addWidget(self.delete_session_button)
+
+        root_layout.addWidget(sidebar)
+
+        chat_panel = QWidget()
+        chat_panel.setObjectName("chatPanel")
+        main_layout = QVBoxLayout(chat_panel)
         main_layout.setContentsMargins(18, 18, 18, 18)
         main_layout.setSpacing(12)
 
@@ -255,6 +285,7 @@ class ChatWindow(QMainWindow):
         input_layout.addWidget(self.send_button)
 
         main_layout.addWidget(input_frame)
+        root_layout.addWidget(chat_panel, 1)
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -264,6 +295,67 @@ class ChatWindow(QMainWindow):
                 color: #26322C;
                 font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
                 font-size: 14px;
+            }
+
+            QFrame#sidebar {
+                background-color: #E2E8E4;
+                border-right: 1px solid #C8D1CB;
+            }
+
+            QListWidget#sessionList {
+                background-color: transparent;
+                border: none;
+                outline: none;
+                padding: 2px;
+            }
+
+            QListWidget#sessionList::item {
+                color: #34433B;
+                border-radius: 8px;
+                padding: 10px 9px;
+                margin: 2px 0;
+            }
+
+            QListWidget#sessionList::item:hover {
+                background-color: #D3DED7;
+            }
+
+            QListWidget#sessionList::item:selected {
+                background-color: #BFD8C9;
+                color: #1E4B33;
+                font-weight: 600;
+            }
+
+            QPushButton#newSessionButton {
+                background-color: #2F8F5B;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 8px;
+                font-weight: 600;
+                padding: 10px;
+            }
+
+            QPushButton#newSessionButton:hover {
+                background-color: #287C4F;
+            }
+
+            QPushButton#deleteSessionButton {
+                background-color: transparent;
+                color: #6B3D3D;
+                border: 1px solid #C9B5B5;
+                border-radius: 8px;
+                padding: 8px;
+            }
+
+            QPushButton#deleteSessionButton:hover {
+                background-color: #E8DADA;
+            }
+
+            QPushButton#newSessionButton:disabled,
+            QPushButton#deleteSessionButton:disabled {
+                background-color: #C3CCC6;
+                color: #7B867F;
+                border-color: #C3CCC6;
             }
 
             QTextBrowser#chatView {
@@ -312,6 +404,147 @@ class ChatWindow(QMainWindow):
             """
         )
 
+    def refresh_session_list(
+        self,
+        selected_session_id: int | None = None,
+    ) -> None:
+        sessions = self.chat_service.list_conversations()
+
+        self._updating_session_list = True
+        self.session_list.blockSignals(True)
+        try:
+            self.session_list.clear()
+            selected_item: QListWidgetItem | None = None
+
+            for session in sessions:
+                title = str(session.get("title") or "新对话")
+                item = QListWidgetItem(title)
+                item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    int(session["id"]),
+                )
+                item.setToolTip(
+                    f"群聊：{session.get('group_name') or '未设置'}\n"
+                    f"更新时间：{session.get('updated_at') or ''}"
+                )
+                self.session_list.addItem(item)
+
+                if int(session["id"]) == selected_session_id:
+                    selected_item = item
+
+            if selected_item is not None:
+                self.session_list.setCurrentItem(selected_item)
+            elif self.session_list.count() > 0:
+                self.session_list.setCurrentRow(0)
+        finally:
+            self.session_list.blockSignals(False)
+            self._updating_session_list = False
+
+    def load_session(self, session_id: int) -> None:
+        messages = self.chat_service.load_conversation(session_id)
+        self.session_id = session_id
+        self.chat_view.clear()
+
+        if messages:
+            for message in messages:
+                self.append_message(
+                    str(message.get("role") or "assistant"),
+                    str(message.get("content") or ""),
+                )
+        else:
+            self.append_message("assistant", self._welcome_text())
+
+        self.refresh_session_list(session_id)
+        self.input_box.setFocus()
+
+    @Slot(object, object)
+    def handle_session_selected(
+        self,
+        current: QListWidgetItem | None,
+        previous: QListWidgetItem | None,
+    ) -> None:
+        if self._updating_session_list or current is None:
+            return
+
+        selected_id = current.data(Qt.ItemDataRole.UserRole)
+        if selected_id is None or int(selected_id) == self.session_id:
+            return
+
+        if self.is_processing:
+            self.refresh_session_list(self.session_id)
+            return
+
+        try:
+            self.load_session(int(selected_id))
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "切换对话失败",
+                f"{type(exc).__name__}: {exc}",
+            )
+            self.refresh_session_list(self.session_id)
+
+    @Slot()
+    def create_new_session(self) -> None:
+        if self.is_processing:
+            return
+
+        try:
+            session_id = self.chat_service.create_conversation()
+            self.load_session(session_id)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "新建对话失败",
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    @Slot()
+    def delete_current_session(self) -> None:
+        if self.is_processing:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "删除对话",
+            "确定删除当前对话及其聊天记录吗？\n"
+            "已经生成的 Excel、CSV 等文件不会被删除。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        try:
+            self.chat_service.delete_conversation(self.session_id)
+            sessions = self.chat_service.list_conversations()
+
+            if sessions:
+                next_session_id = int(sessions[0]["id"])
+            else:
+                next_session_id = (
+                    self.chat_service.create_conversation()
+                )
+
+            self.load_session(next_session_id)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "删除对话失败",
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    @staticmethod
+    def _welcome_text() -> str:
+        return (
+            "已启动。你可以直接输入命令，例如：\n"
+            "群聊名称：XXX\n"
+            "订单文件：订单1.xlsx\n"
+            "查成员\n"
+            "算均摊\n"
+            "算大货"
+        )
+
     def send_current_message(self) -> None:
         if self.is_processing:
             return
@@ -342,6 +575,7 @@ class ChatWindow(QMainWindow):
     def handle_reply(self, reply: str) -> None:
         try:
             self.append_message("assistant", reply)
+            self.refresh_session_list(self.session_id)
         finally:
             self.set_processing(False)
 
@@ -356,6 +590,7 @@ class ChatWindow(QMainWindow):
                     f"{RUNTIME_DIR / 'logs' / 'gui_error.log'}"
                 ),
             )
+            self.refresh_session_list(self.session_id)
         finally:
             self.set_processing(False)
 
@@ -371,6 +606,9 @@ class ChatWindow(QMainWindow):
         self.is_processing = processing
         self.input_box.setEnabled(not processing)
         self.send_button.setEnabled(not processing)
+        self.session_list.setEnabled(not processing)
+        self.new_session_button.setEnabled(not processing)
+        self.delete_session_button.setEnabled(not processing)
         self.send_button.setText("处理中…" if processing else "发送")
 
         if not processing:
@@ -401,7 +639,7 @@ class ChatWindow(QMainWindow):
         message_html = f"""
         <table width="100%" cellspacing="0" cellpadding="0">
           <tr>
-            <td align="{align}">
+            <td align="{align}" style="padding: 4px 0;">
               <table cellspacing="0" cellpadding="9"
                      style="background-color:{background};
                             border:1px solid {border};">
@@ -416,7 +654,6 @@ class ChatWindow(QMainWindow):
             </td>
           </tr>
         </table>
-        <div style="height:8px;"></div>
         """
 
         self.chat_view.moveCursor(QTextCursor.End)
@@ -446,14 +683,18 @@ def main() -> int:
 
     try:
         init_db()
-        session_title = datetime.now().strftime("GUI 会话 %Y-%m-%d %H:%M:%S")
-        session_id = create_session(session_title)
 
         key_input_bridge = GuiKeyInputBridge()
 
         chat_service = ChatService(
             key_input_func=key_input_bridge,
         )
+
+        sessions = chat_service.list_conversations()
+        if sessions:
+            session_id = int(sessions[0]["id"])
+        else:
+            session_id = chat_service.create_conversation()
     except Exception as exc:
         QMessageBox.critical(
             None,

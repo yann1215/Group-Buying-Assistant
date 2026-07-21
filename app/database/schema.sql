@@ -2,7 +2,8 @@
 
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '新对话',
+    group_name TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -13,7 +14,18 @@ CREATE TABLE IF NOT EXISTS messages (
     role TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
+    FOREIGN KEY (session_id)
+        REFERENCES sessions(id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS session_contexts (
+    session_id INTEGER PRIMARY KEY,
+    context_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id)
+        REFERENCES sessions(id)
+        ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -23,7 +35,9 @@ CREATE TABLE IF NOT EXISTS files (
     saved_path TEXT NOT NULL,
     file_type TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
+    FOREIGN KEY (session_id)
+        REFERENCES sessions(id)
+        ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS analysis_tasks (
@@ -35,8 +49,12 @@ CREATE TABLE IF NOT EXISTS analysis_tasks (
     parameters_json TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TEXT,
-    FOREIGN KEY (session_id) REFERENCES sessions(id),
-    FOREIGN KEY (user_message_id) REFERENCES messages(id)
+    FOREIGN KEY (session_id)
+        REFERENCES sessions(id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (user_message_id)
+        REFERENCES messages(id)
+        ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS results (
@@ -46,5 +64,16 @@ CREATE TABLE IF NOT EXISTS results (
     content TEXT,
     file_path TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (task_id) REFERENCES analysis_tasks(id)
+    FOREIGN KEY (task_id)
+        REFERENCES analysis_tasks(id)
+        ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
+ON sessions(updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_messages_session_id_id
+ON messages(session_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_tasks_session_id
+ON analysis_tasks(session_id);
