@@ -339,7 +339,9 @@ def parse_special_member_edit(
     )
 
     if match:
-        role = match.group("role")
+        role = normalize_special_member_role(
+            match.group("role")
+        )
 
         match_field = EDITABLE_FIELD_ALIASES[
             match.group("match_field")
@@ -389,7 +391,9 @@ def parse_special_member_edit(
         if not match:
             return None
 
-        role = match.group("role")
+        role = normalize_special_member_role(
+            match.group("role")
+        )
         selector = normalize_text(
             match.group("selector")
         )
@@ -538,7 +542,9 @@ def parse_reversed_special_member(
     )
 
     tail_update = parse_special_member_segment(
-        role=match.group("role"),
+        role=normalize_special_member_role(
+            match.group("role")
+        ),
         segment=tail,
     )
 
@@ -548,6 +554,17 @@ def parse_reversed_special_member(
     )
 
     return tail_update
+
+
+def normalize_special_member_role(
+    role: str,
+) -> str:
+    normalized = normalize_text(role)
+
+    return SPECIAL_MEMBER_ROLE_ALIASES.get(
+        normalized,
+        normalized,
+    )
 
 
 def clean_role_segment(
