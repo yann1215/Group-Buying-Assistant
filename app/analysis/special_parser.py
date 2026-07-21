@@ -7,13 +7,15 @@ from typing import Any
 
 from app.analysis.special_constants import (
     SPECIAL_MEMBER_ROLES,
+    SPECIAL_MEMBER_ROLE_ALIASES,
 )
 
 
+# 对待检测名称进行排序
 # 长角色名必须排在短角色名前面。
 # 否则“章稿画师”可能先被识别成“画师”。
 _SORTED_ROLES = sorted(
-    SPECIAL_MEMBER_ROLES,
+    SPECIAL_MEMBER_ROLE_ALIASES,
     key=len,
     reverse=True,
 )
@@ -253,7 +255,9 @@ def parse_special_member_updates(
     updates: list[dict[str, Any]] = []
 
     for index, role_match in enumerate(role_matches):
-        role = role_match.group("role")
+        role = normalize_special_member_role(
+            role_match.group("role")
+        )
 
         segment_start = role_match.end()
         segment_end = (
