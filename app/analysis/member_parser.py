@@ -31,6 +31,13 @@ def parse_group_member_orders(
     """
     比对微信群成员昵称开头序号与订单表第一列单号。
 
+    [检查项目]            [特殊成员是否参与]
+    群昵称前没有数字              0
+    订单有、群昵称没有            0
+    群昵称重复序号               1
+    群里有、订单没有             1
+
+
     返回：
     {
         "ok": True,
@@ -150,7 +157,6 @@ def parse_group_member_orders(
     )
 
     # 特殊成员不参与群昵称备注格式检查。
-    #
     # 例如车主、工具人、供稿人没有在群昵称开头填写单号时，
     # 不放入“群昵称前没有数字的成员”。
     members_without_serial = [
@@ -162,35 +168,7 @@ def parse_group_member_orders(
         )
     ]
 
-    # 重复序号提示中也排除特殊成员。
-    filtered_duplicate_member_serials = []
-
-    for item in duplicate_member_serials:
-        normal_members = [
-            member
-            for member in (
-                item.get("members")
-                or []
-            )
-            if not is_special_group_member(
-                group_member=member,
-                special_members=resolved_special_members,
-            )
-        ]
-
-        # 排除特殊成员后仍然至少有两名普通成员，
-        # 才属于真正的重复序号。
-        if len(normal_members) > 1:
-            filtered_duplicate_member_serials.append(
-                {
-                    "序号": item.get("序号"),
-                    "members": normal_members,
-                }
-            )
-
-    duplicate_member_serials = (
-        filtered_duplicate_member_serials
-    )
+    # 重复序号提示中不排除特殊成员。
 
     # 7. 获取订单单号集合
     order_serials = sorted_serials(
@@ -203,12 +181,24 @@ def parse_group_member_orders(
     order_serial_set = set(order_serials)
 
     # 8. 比对群成员单号与订单单号
+    special_member_serials = {
+        normalize_serial(member.get("单号"))
+        for member in resolved_special_members
+        if normalize_serial(member.get("单号"))
+    }
+
+    # 群里有、订单没有：
+    # 特殊成员仍然参与，因此两边都使用完整序号集合。
     serials_in_group_not_in_orders = sorted_serials(
         group_serials - order_serial_set
     )
 
+    # 订单有、群昵称没有：
+    # 只从订单侧排除特殊成员的单号。
     serials_in_orders_not_in_group = sorted_serials(
-        order_serial_set - group_serials
+        order_serial_set
+        - special_member_serials
+        - group_serials
     )
 
     return {
