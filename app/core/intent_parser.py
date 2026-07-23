@@ -96,7 +96,6 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
         "product_share_amounts": [],
         "group_name": None,
         "order_input": None,
-        "bulk_order_input": None,
         "order_output_dir": None,
         "force": False,
         "confirm": False,
@@ -142,15 +141,7 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
 
     # 4. 设置群聊信息、文件路径
     group_name = parse_group_name(text)
-
-    # 必须先识别“大货订单”，否则“大货订单：xxx.xlsx”
-    # 会被普通的“订单”正则识别成均摊订单。
-    bulk_order_input = parse_bulk_order_input(text)
-
     order_input = parse_order_input(text)
-    if bulk_order_input is None:
-        order_input = parse_order_input(text)
-
     order_output_dir = parse_order_output_dir(text)
 
     force = has_force_words(text)
@@ -165,7 +156,6 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
             "product_share_amounts": product_share_amounts,
             "group_name": group_name,
             "order_input": order_input,
-            "bulk_order_input": bulk_order_input,
             "order_output_dir": order_output_dir,
             "force": force,
             "confirm": confirm,
@@ -210,7 +200,7 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
         result["intent"] = "calculate_share"
         return result
 
-    if group_name or order_input or bulk_order_input or order_output_dir:
+    if group_name or order_input or order_output_dir:
         result["intent"] = "set_context"
         return result
 
@@ -980,6 +970,7 @@ def parse_group_name(text: str) -> str | None:
 def parse_order_input(text: str) -> str | None:
     """
     支持：
+        订单：订单1.xlsx
         当前订单：订单1.xlsx
         订单文件：订单1.xlsx
         订单表：订单1.xlsx
@@ -990,8 +981,8 @@ def parse_order_input(text: str) -> str | None:
     """
     patterns = [
         (
-            r"(?:订单|当前订单文件|当前订单|订单文件|订单表|订单路径|"
-            r"输入文件|输入目录|订单目录)"
+            r"(?:(?<!大货)(?:当前订单文件|当前订单|订单文件|订单表|"
+            r"订单路径|订单|订单目录)|输入文件|输入目录)"
             r"\s*(?:是|为|=|：|:)?\s*"
             r"([^，,。；;\n]+)"
         ),
@@ -1003,34 +994,6 @@ def parse_order_input(text: str) -> str | None:
         if match:
             value = match.group(1).strip().strip('"').strip("'")
 
-            if value:
-                return value
-
-    return None
-
-
-def parse_bulk_order_input(text: str) -> str | None:
-    """
-    支持：
-
-    大货订单：大货订单.xlsx
-    大货订单文件：D:\\orders\\大货订单.xlsx
-    当前大货订单：大货订单.xlsx
-    大货文件：大货订单.xlsx
-    """
-    patterns = [
-        (
-            r"(?:当前大货订单文件|当前大货订单|大货订单文件|"
-            r"大货订单|大货订单表|大货文件|大货路径)"
-            r"\s*(?:是|为|=|：|:)?\s*"
-            r"([^，,。；;\n]+)"
-        ),
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            value = match.group(1).strip().strip('"').strip("'")
             if value:
                 return value
 

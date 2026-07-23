@@ -22,6 +22,14 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS session_contexts (
     session_id INTEGER PRIMARY KEY,
     context_json TEXT NOT NULL DEFAULT '{}',
+    new_order_file TEXT NOT NULL DEFAULT '',
+    new_order_updated_at TEXT NOT NULL DEFAULT '',
+    old_order_file TEXT NOT NULL DEFAULT '',
+    old_order_updated_at TEXT NOT NULL DEFAULT '',
+    order_cache_1_file TEXT NOT NULL DEFAULT '',
+    order_cache_1_updated_at TEXT NOT NULL DEFAULT '',
+    order_cache_2_file TEXT NOT NULL DEFAULT '',
+    order_cache_2_updated_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (session_id)
         REFERENCES sessions(id)

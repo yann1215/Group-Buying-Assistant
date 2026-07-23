@@ -42,7 +42,6 @@ from app.core.intent_parser import (
 )
 
 
-DEFAULT_ORDER_INPUT_DIR = Path("./orders")
 DEFAULT_ORDER_OUTPUT_DIR = Path("./orders/output")
 
 
@@ -117,23 +116,22 @@ class SessionToolContext:
         default_factory=list
     )
 
-    # 均摊订单
-    order_input: str | Path | dict[str, Any] | None = None
-
-    # 大货订单，必须和均摊订单分开保存
-    bulk_order_input: str | Path | dict[str, Any] | None = None
+    # 订单版本。现有业务统一使用 new_order_file，其余版本用于历史比较。
+    new_order_file: str | None = None
+    new_order_updated_at: str | None = None
+    old_order_file: str | None = None
+    old_order_updated_at: str | None = None
+    order_cache_1_file: str | None = None
+    order_cache_1_updated_at: str | None = None
+    order_cache_2_file: str | None = None
+    order_cache_2_updated_at: str | None = None
 
     order_output_dir: str | Path | None = None
 
-    # 均摊订单核对缓存
+    # 新订单核对缓存
     member_checked: bool = False
     member_check_result: dict[str, Any] | None = None
     parsed_order_file: str | None = None
-
-    # 大货订单核对缓存
-    bulk_member_checked: bool = False
-    bulk_member_check_result: dict[str, Any] | None = None
-    bulk_parsed_order_file: str | None = None
 
     share_config_file: str | None = None
     product_configs: list[dict[str, Any]] | None = None
@@ -157,8 +155,14 @@ class SessionToolContext:
             "context_version": 1,
             "group_name": self.group_name,
             "special_members": _to_json_safe(self.special_members),
-            "order_input": _to_json_safe(self.order_input),
-            "bulk_order_input": _to_json_safe(self.bulk_order_input),
+            "new_order_file": self.new_order_file,
+            "new_order_updated_at": self.new_order_updated_at,
+            "old_order_file": self.old_order_file,
+            "old_order_updated_at": self.old_order_updated_at,
+            "order_cache_1_file": self.order_cache_1_file,
+            "order_cache_1_updated_at": self.order_cache_1_updated_at,
+            "order_cache_2_file": self.order_cache_2_file,
+            "order_cache_2_updated_at": self.order_cache_2_updated_at,
             "order_output_dir": _to_json_safe(self.order_output_dir),
             "share_config_file": self.share_config_file,
             "product_configs": _to_json_safe(self.product_configs),
@@ -177,9 +181,25 @@ class SessionToolContext:
         return cls(
             group_name=_optional_string(data.get("group_name")),
             special_members=_dict_list_or_empty(special_members),
-            order_input=_restore_order_input(data.get("order_input")),
-            bulk_order_input=_restore_order_input(
-                data.get("bulk_order_input")
+            new_order_file=_optional_string(data.get("new_order_file")),
+            new_order_updated_at=_optional_string(
+                data.get("new_order_updated_at")
+            ),
+            old_order_file=_optional_string(data.get("old_order_file")),
+            old_order_updated_at=_optional_string(
+                data.get("old_order_updated_at")
+            ),
+            order_cache_1_file=_optional_string(
+                data.get("order_cache_1_file")
+            ),
+            order_cache_1_updated_at=_optional_string(
+                data.get("order_cache_1_updated_at")
+            ),
+            order_cache_2_file=_optional_string(
+                data.get("order_cache_2_file")
+            ),
+            order_cache_2_updated_at=_optional_string(
+                data.get("order_cache_2_updated_at")
             ),
             order_output_dir=_optional_string(
                 data.get("order_output_dir")
@@ -189,9 +209,6 @@ class SessionToolContext:
             member_checked=False,
             member_check_result=None,
             parsed_order_file=None,
-            bulk_member_checked=False,
-            bulk_member_check_result=None,
-            bulk_parsed_order_file=None,
 
             share_config_file=_optional_string(
                 data.get("share_config_file")
@@ -245,7 +262,6 @@ class ToolOrchestrator:
         self,
         session_id: int,
         group_name: str | None = None,
-        order_input: str | Path | dict[str, Any] | None = None,
         order_output_dir: str | Path | None = None,
     ) -> None:
         ctx = self.contexts.setdefault(session_id, SessionToolContext())
@@ -263,20 +279,9 @@ class ToolOrchestrator:
                 ctx.parsed_order_file = None
                 ctx.share_config_file = None
                 ctx.product_configs = None
+                reset_bulk_goods_context(ctx)
 
             ctx.group_name = new_group_name
-
-        if order_input is not None:
-            ctx.order_input = normalize_order_input_path(order_input)
-            ctx.member_checked = False
-            ctx.member_check_result = None
-            ctx.parsed_order_file = None
-
-            # 如果已经加了配置表缓存，也一起清空
-            if hasattr(ctx, "share_config_file"):
-                ctx.share_config_file = None
-            if hasattr(ctx, "product_configs"):
-                ctx.product_configs = None
 
         if order_output_dir is not None:
             ctx.order_output_dir = normalize_output_dir(order_output_dir)
@@ -312,31 +317,6 @@ class ToolOrchestrator:
 
             ctx.group_name = new_group_name
             reset_bulk_goods_context(ctx)
-
-        if intent.get("bulk_order_input"):
-            ctx.bulk_order_input = normalize_order_input_path(
-                intent["bulk_order_input"]
-            )
-            reset_bulk_goods_context(ctx)
-
-            # 更换订单文件后需要重新查成员，
-            # 但同一群的特殊成员配置可以保留。
-            ctx.member_checked = False
-            ctx.member_check_result = None
-            ctx.parsed_order_file = None
-            ctx.share_config_file = None
-            ctx.product_configs = None
-
-        if intent.get("order_input"):
-            ctx.order_input = normalize_order_input_path(
-                intent["order_input"]
-            )
-
-            ctx.member_checked = False
-            ctx.member_check_result = None
-            ctx.parsed_order_file = None
-            ctx.share_config_file = None
-            ctx.product_configs = None
 
         if intent.get("order_output_dir"):
             ctx.order_output_dir = normalize_output_dir(intent["order_output_dir"])
@@ -537,7 +517,7 @@ class ToolOrchestrator:
                 "message": "缺少群聊名称。",
             }
 
-        if not ctx.order_input:
+        if not ctx.new_order_file:
             return {
                 "ok": False,
                 "message": "缺少订单文件。",
@@ -546,7 +526,7 @@ class ToolOrchestrator:
         # 普通订单输出
         result = parse_group_member_orders(
             group_name=ctx.group_name,
-            order_input=ctx.order_input,
+            order_input=ctx.new_order_file,
             order_output_dir=ctx.order_output_dir,
             special_members=ctx.special_members,
             key_input_func=self.key_input_func,
@@ -576,49 +556,6 @@ class ToolOrchestrator:
 
         return result
 
-    def ensure_bulk_member_checked(
-            self,
-            ctx: SessionToolContext,
-            force: bool = False,
-    ) -> dict[str, Any]:
-        if (
-                ctx.bulk_member_checked
-                and ctx.bulk_member_check_result
-                and not force
-        ):
-            return ctx.bulk_member_check_result
-
-        if not ctx.group_name:
-            return {
-                "ok": False,
-                "message": "缺少群聊名称。",
-            }
-
-        if not ctx.bulk_order_input:
-            return {
-                "ok": False,
-                "message": (
-                    "缺少大货订单文件。"
-                    "请使用“大货订单：文件名.xlsx”进行设置。"
-                ),
-            }
-
-        # 大货订单输出
-        result = parse_group_member_orders(
-            group_name=ctx.group_name,
-            order_input=ctx.bulk_order_input,
-            order_output_dir=ctx.order_output_dir,
-            key_input_func=self.key_input_func,
-        )
-
-        ctx.bulk_member_checked = True
-        ctx.bulk_member_check_result = result
-        ctx.bulk_parsed_order_file = result.get(
-            "parsed_order_file"
-        )
-
-        return result
-
     def handle_calculate_bulk_goods(
             self,
             ctx: SessionToolContext,
@@ -629,15 +566,14 @@ class ToolOrchestrator:
                 "例如：群聊名称：xxx"
             )
 
-        if not ctx.bulk_order_input:
+        if not ctx.new_order_file:
             return (
-                "需要先设置大货订单文件。\n"
-                "例如：大货订单：大货订单.xlsx\n"
-                "均摊订单和大货订单会分别保存，不会互相覆盖。"
+                "需要先设置订单文件。\n"
+                "例如：订单：订单.xlsx"
             )
 
-        # 1. 检查群成员与大货订单
-        check_result = self.ensure_bulk_member_checked(
+        # 1. 检查群成员与新订单
+        check_result = self.ensure_member_checked(
             ctx,
             force=True,
         )
@@ -654,17 +590,17 @@ class ToolOrchestrator:
                     "大货计算前发现群成员与订单不一致，"
                     "暂不继续。\n\n"
                     + format_member_check_result(check_result)
-                    + "\n\n请修正群昵称序号或大货订单后，"
+                    + "\n\n请修正群昵称序号或订单后，"
                       "重新输入“查大货”。"
             )
 
         parsed_order_file = (
                 check_result.get("parsed_order_file")
-                or ctx.bulk_parsed_order_file
+                or ctx.parsed_order_file
         )
 
         if not parsed_order_file:
-            return "没有找到大货订单的简化文件。"
+            return "没有找到订单的简化文件。"
 
         # 2. 检查订单是否只有不参摊商品
         abnormal_orders = find_only_non_share_orders(
@@ -673,7 +609,7 @@ class ToolOrchestrator:
 
         if abnormal_orders:
             lines = [
-                "发现大货订单异常：以下订单只包含不参摊商品，"
+                "发现订单异常：以下订单只包含不参摊商品，"
                 "暂不继续计算。",
                 "",
             ]
@@ -701,7 +637,7 @@ class ToolOrchestrator:
         ctx.bulk_request.confirmed = False
 
         return (
-            "群成员与大货订单核对完成，订单合规检查通过。\n\n"
+            "群成员与订单核对完成，订单合规检查通过。\n\n"
             "在生成大货应收结果前，请再次确认：\n"
             "1. 订单内商品价格是否准确？是否有满百减一等单价变化？\n"
             "2. 漏收、补收的均摊是否已经计入订单金额？\n"
@@ -718,7 +654,7 @@ class ToolOrchestrator:
 
         # 用户确认时再强制重新读取一次订单，
         # 防止两次消息之间订单文件被修改。
-        check_result = self.ensure_bulk_member_checked(
+        check_result = self.ensure_member_checked(
             ctx,
             force=True,
         )
@@ -742,12 +678,12 @@ class ToolOrchestrator:
 
         parsed_order_file = (
                 check_result.get("parsed_order_file")
-                or ctx.bulk_parsed_order_file
+                or ctx.parsed_order_file
         )
 
         if not parsed_order_file:
             ctx.bulk_request.pending_confirmation = False
-            return "没有找到大货订单的简化文件。"
+            return "没有找到订单的简化文件。"
 
         abnormal_orders = find_only_non_share_orders(
             parsed_order_file
@@ -824,11 +760,10 @@ class ToolOrchestrator:
                 "例如：群聊名称：xxx"
             )
 
-        if not ctx.order_input:
+        if not ctx.new_order_file:
             return (
-                "需要先设置当前订单文件或输入目录。\n"
-                "例如：订单文件：D:\\xxx\\订单.xlsx\n"
-                "或：输入目录：D:\\xxx\\input"
+                "需要先设置订单。\n"
+                "例如：订单 D:\\xxx\\订单.xlsx"
             )
 
         if not req.share_mode:
@@ -907,8 +842,8 @@ class ToolOrchestrator:
         if not ctx.group_name:
             return "需要先设置待处理的群聊名称。例如：群聊名称：xxx"
 
-        if not ctx.order_input:
-            return "需要先设置当前订单文件。例如：订单文件：订单1.xlsx"
+        if not ctx.new_order_file:
+            return "需要先设置订单。例如：订单 订单1.xlsx"
 
         calculation_scope = req.calculation_scope or intent.get("calculation_scope")
 
@@ -1479,20 +1414,7 @@ def _dict_list_or_empty(value: Any) -> list[dict[str, Any]]:
     ]
 
 
-def _restore_order_input(
-    value: Any,
-) -> str | dict[str, Any] | None:
-    if isinstance(value, dict):
-        return _to_json_safe(value)
-
-    return _optional_string(value)
-
-
 def reset_bulk_goods_context(ctx: SessionToolContext) -> None:
-    ctx.bulk_member_checked = False
-    ctx.bulk_member_check_result = None
-    ctx.bulk_parsed_order_file = None
-
     ctx.bulk_request.pending_confirmation = False
     ctx.bulk_request.confirmed = False
 
@@ -1501,50 +1423,13 @@ def format_context_update_result(ctx: SessionToolContext) -> str:
     lines = ["已更新当前处理上下文。"]
 
     lines.append(f"群聊名称：{ctx.group_name or '未设置'}")
-    lines.append(f"订单文件：{ctx.order_input or '未设置'}")
-    lines.append(f"大货订单：{ctx.bulk_order_input or '未设置'}")
+    lines.append(f"新订单：{ctx.new_order_file or '未设置'}")
+    lines.append(f"旧订单：{ctx.old_order_file or '未设置'}")
+    lines.append(f"缓存1：{ctx.order_cache_1_file or '未设置'}")
+    lines.append(f"缓存2：{ctx.order_cache_2_file or '未设置'}")
     lines.append(f"输出目录：{ctx.order_output_dir or '未设置'}")
 
     return "\n".join(lines)
-
-
-def normalize_order_input_path(value: str | Path | dict[str, Any]) -> str | Path | dict[str, Any]:
-    """
-    规范化订单输入路径。
-
-    规则：
-        1. 如果是 dict，尝试规范化其中的 file_path / order_file / path。
-        2. 没有文件后缀时，自动补充 .xlsx。
-        3. 如果是绝对路径，保留该路径。
-        4. 如果只有文件名，默认放到 ./orders 目录。
-        5. 如果相对路径中已经包含目录，则保留该路径。
-    """
-    if isinstance(value, dict):
-        result = dict(value)
-
-        for key in ("file_path", "order_file", "path"):
-            if result.get(key):
-                result[key] = normalize_order_input_path(result[key])
-                break
-
-        return result
-
-    path = Path(str(value).strip().strip('"').strip("'"))
-
-    # 没有后缀时，自动补充 .xlsx
-    if not path.suffix:
-        path = path.with_suffix(".xlsx")
-
-    # 绝对路径：D:\xxx\订单1.xlsx 或 /xxx/订单1.xlsx
-    if path.is_absolute():
-        return str(path)
-
-    # 只有文件名，没有目录，例如：订单1.xlsx
-    if path.parent == Path(".") and path.suffix.lower() in {".xlsx", ".xlsm"}:
-        return str(DEFAULT_ORDER_INPUT_DIR / path)
-
-    # 已经包含相对目录，例如：orders/订单1.xlsx
-    return str(path)
 
 
 def normalize_output_dir(value: str | Path | None) -> str:

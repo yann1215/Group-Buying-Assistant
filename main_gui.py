@@ -271,7 +271,7 @@ class ChatWindow(QMainWindow):
         self.input_box = ChatInput()
         self.input_box.setObjectName("inputBox")
         self.input_box.setPlaceholderText(
-            "输入消息；Enter 发送，Shift+Enter 换行"
+            "输入消息，例如：订单：订单1；Enter 发送，Shift+Enter 换行"
         )
         self.input_box.setMinimumHeight(72)
         self.input_box.setMaximumHeight(125)
@@ -537,12 +537,22 @@ class ChatWindow(QMainWindow):
     @staticmethod
     def _welcome_text() -> str:
         return (
-            "已启动。你可以直接输入命令，例如：\n"
-            "群聊名称：XXX\n"
-            "订单文件：订单1.xlsx\n"
-            "查成员\n"
-            "算均摊\n"
-            "算大货"
+            "已启动。请先录入必填信息：\n"
+            "  群聊名称 XXX\n"
+            "  订单 XXX\n"
+            "  车主 XXX\n\n"
+            
+            "同时支持选填信息：\n"
+            "  工具人 XXX\n"
+            "  供稿人 XXX\n"
+            "  画师 XXX\n"
+            "  章稿画师 XXX\n"
+            "  （车主等特殊成员默认不参与均摊计算）\n\n"
+            
+            "信息录入完成后，支持以下指令：\n"
+            "  查成员\n"
+            "  算均摊\n"
+            "  算大货\n\n"
         )
 
     def send_current_message(self) -> None:

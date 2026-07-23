@@ -1,12 +1,26 @@
 # app/database/db.py
 
+import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 from app.config import DB_PATH, ensure_dirs
 
 
-CURRENT_DB_VERSION = 1
+CURRENT_DB_VERSION = 2
+
+
+ORDER_VERSION_COLUMNS = {
+    "new_order_file": "TEXT NOT NULL DEFAULT ''",
+    "new_order_updated_at": "TEXT NOT NULL DEFAULT ''",
+    "old_order_file": "TEXT NOT NULL DEFAULT ''",
+    "old_order_updated_at": "TEXT NOT NULL DEFAULT ''",
+    "order_cache_1_file": "TEXT NOT NULL DEFAULT ''",
+    "order_cache_1_updated_at": "TEXT NOT NULL DEFAULT ''",
+    "order_cache_2_file": "TEXT NOT NULL DEFAULT ''",
+    "order_cache_2_updated_at": "TEXT NOT NULL DEFAULT ''",
+}
 
 
 def get_conn() -> sqlite3.Connection:
@@ -49,6 +63,8 @@ def _migrate_database(conn: sqlite3.Connection) -> None:
 
     if "group_name" not in session_columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN group_name TEXT")
+
+    _migrate_order_version_columns(conn)
 
     if _has_current_foreign_keys(conn):
         return
@@ -153,6 +169,86 @@ def _migrate_database(conn: sqlite3.Connection) -> None:
         raise
     finally:
         conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _migrate_order_version_columns(conn: sqlite3.Connection) -> None:
+    """补齐订单版本字段，并迁移旧会话中已有的订单信息。"""
+    context_columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(session_contexts)"
+        ).fetchall()
+    }
+
+    for column_name, column_definition in ORDER_VERSION_COLUMNS.items():
+        if column_name in context_columns:
+            continue
+        conn.execute(
+            f"ALTER TABLE session_contexts "
+            f"ADD COLUMN {column_name} {column_definition}"
+        )
+
+    # 某些旧数据库可能曾把当前订单直接保存在 order_file 列中。
+    if "order_file" in context_columns:
+        conn.execute(
+            """
+            UPDATE session_contexts
+            SET new_order_file = TRIM(COALESCE(order_file, '')),
+                new_order_updated_at = CASE
+                    WHEN TRIM(COALESCE(new_order_updated_at, '')) = ''
+                    THEN COALESCE(updated_at, CURRENT_TIMESTAMP)
+                    ELSE new_order_updated_at
+                END
+            WHERE TRIM(COALESCE(new_order_file, '')) = ''
+              AND TRIM(COALESCE(order_file, '')) != ''
+            """
+        )
+
+    # 当前项目的旧版实际将订单保存在 context_json.order_input 中。
+    rows = conn.execute(
+        """
+        SELECT session_id, context_json, updated_at
+        FROM session_contexts
+        WHERE TRIM(COALESCE(new_order_file, '')) = ''
+        """
+    ).fetchall()
+    for row in rows:
+        order_file = _legacy_order_file_from_json(row["context_json"])
+        if not order_file:
+            continue
+        conn.execute(
+            """
+            UPDATE session_contexts
+            SET new_order_file = ?,
+                new_order_updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)
+            WHERE session_id = ?
+              AND TRIM(COALESCE(new_order_file, '')) = ''
+            """,
+            (order_file, row["session_id"]),
+        )
+
+
+def _legacy_order_file_from_json(context_json: Any) -> str:
+    """从旧版会话 JSON 中提取订单路径；无有效路径时返回空串。"""
+    try:
+        context = json.loads(context_json)
+    except (TypeError, json.JSONDecodeError):
+        return ""
+
+    if not isinstance(context, dict):
+        return ""
+
+    order_input = context.get("order_input")
+    if isinstance(order_input, str):
+        return order_input.strip()
+
+    if isinstance(order_input, dict):
+        for key in ("file_path", "order_file", "path"):
+            value = order_input.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return ""
 
 
 def _has_current_foreign_keys(conn: sqlite3.Connection) -> bool:
