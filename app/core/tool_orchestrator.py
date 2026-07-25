@@ -1064,7 +1064,7 @@ def format_member_check_summary_for_share(
     ):
         return "群成员与订单检查没问题"
 
-    return "群成员与订单已检查，但存在被忽略的问题"
+    return "群成员与订单已检查，已按“先算”强制继续"
 
 
 def get_blocking_member_issues(result: dict[str, Any]) -> list[str]:
@@ -1072,6 +1072,9 @@ def get_blocking_member_issues(result: dict[str, Any]) -> list[str]:
 
     if not result.get("ok"):
         issues.append("成员核对失败")
+
+    if result.get("members_without_serial"):
+        issues.append("存在群昵称前没有数字的成员")
 
     if result.get("duplicate_member_serials"):
         issues.append("群昵称中存在重复标注的序号")

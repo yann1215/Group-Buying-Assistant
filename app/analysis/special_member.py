@@ -834,9 +834,8 @@ def enrich_special_members(
         input_nickname = member["昵称"]
         input_group_nickname = member["群昵称"]
 
-        group_match = _find_group_member_by_names(
-            nickname=input_nickname,
-            group_nickname=input_group_nickname,
+        group_match = _find_special_group_member(
+            special_member=member,
             group_members=normalized_group_members,
         )
 
@@ -858,21 +857,10 @@ def enrich_special_members(
         if member["单号"]:
             continue
 
-        order_match = None
-
-        # 群成员定位成功后，优先用微信中的完整昵称匹配订单。
-        if group_match and member["昵称"]:
-            order_match = _find_order_member_by_nickname(
-                nickname=member["昵称"],
-                order_members=normalized_order_members,
-            )
-
-        # 微信完整昵称匹配失败后，才使用最初输入的短昵称。
-        if not order_match and input_nickname:
-            order_match = _find_order_member_by_nickname(
-                nickname=input_nickname,
-                order_members=normalized_order_members,
-            )
+        order_match = _find_special_order_member(
+            special_member=member,
+            order_members=normalized_order_members,
+        )
 
         _fill_from_order_member(
             special_member=member,
@@ -880,86 +868,6 @@ def enrich_special_members(
         )
 
     return result
-
-
-def _find_group_member_by_names(
-    *,
-    nickname: str,
-    group_nickname: str,
-    group_members: list[dict[str, str]],
-) -> dict[str, str] | None:
-    """只使用昵称和群昵称唯一定位微信群成员。"""
-    queries = (
-        (group_nickname, "群昵称"),
-        (nickname, "昵称"),
-    )
-
-    # 先进行精确匹配。
-    for query, preferred_field in queries:
-        if not query:
-            continue
-
-        matched = [
-            member
-            for member in group_members
-            if query
-            in {
-                member[preferred_field],
-                member[
-                    "昵称"
-                    if preferred_field == "群昵称"
-                    else "群昵称"
-                ],
-            }
-        ]
-
-        unique = _unique_item(matched)
-
-        if unique:
-            return unique
-
-    # 精确匹配失败后，允许短昵称包含匹配完整昵称。
-    for query, _ in queries:
-        if not query:
-            continue
-
-        unique = _find_unique_fuzzy_member(
-            query=query,
-            members=group_members,
-            fields=("昵称", "群昵称"),
-        )
-
-        if unique:
-            return unique
-
-    return None
-
-
-def _find_order_member_by_nickname(
-    *,
-    nickname: str,
-    order_members: list[dict[str, str]],
-) -> dict[str, str] | None:
-    """使用一个昵称唯一定位订单；先精确匹配，再模糊匹配。"""
-    if not nickname:
-        return None
-
-    exact_matches = [
-        member
-        for member in order_members
-        if member["昵称"] == nickname
-    ]
-
-    unique = _unique_item(exact_matches)
-
-    if unique:
-        return unique
-
-    return _find_unique_fuzzy_member(
-        query=nickname,
-        members=order_members,
-        fields=("昵称",),
-    )
 
 
 def _normalize_group_member(
