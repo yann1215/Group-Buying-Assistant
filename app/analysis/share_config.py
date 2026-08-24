@@ -159,15 +159,10 @@ def read_product_summary_from_order_file(
 
                 if not value.isdigit():
                     raise ShareConfigError(
-                        f"第 {row_idx} 行商品“{product_name}”数量不是正整数：{value!r}"
+                        f"第 {row_idx} 行商品“{product_name}”数量必须是非负整数：{value!r}"
                     )
 
                 quantity = int(value)
-
-                if quantity <= 0:
-                    raise ShareConfigError(
-                        f"第 {row_idx} 行商品“{product_name}”数量不是正整数：{value!r}"
-                    )
 
                 product_quantity_map[product_name] += quantity
 
@@ -242,7 +237,7 @@ def load_product_share_config_file(
                 row_idx=row_idx,
             )
 
-            product_quantity = parse_required_positive_int(
+            product_quantity = parse_required_non_negative_int(
                 row.get("商品数量"),
                 field_name="商品数量",
                 row_idx=row_idx,
@@ -500,17 +495,54 @@ def parse_required_positive_int(
 
     text = str(value).strip()
 
-    if not text.isdigit():
+    if not text.isdigit() and int(text)>0:
         raise ShareConfigError(
             f"第 {row_idx} 行“{field_name}”必须是正整数，实际值：{value!r}"
         )
 
     number = int(text)
 
+    # 检查数字非负
     if number <= 0:
         raise ShareConfigError(
             f"第 {row_idx} 行“{field_name}”必须是正整数，实际值：{value!r}"
         )
+
+    return number
+
+
+def parse_required_non_negative_int(
+    value: Any,
+    field_name: str,
+    row_idx: int,
+) -> int:
+    """
+    解析必填非负整数。
+
+    不允许：
+        空值
+        -1
+        1.5
+        abc
+    """
+    if value is None:
+        raise ShareConfigError(
+            f"第 {row_idx} 行“{field_name}”不能为空，必须是非负整数。"
+        )
+
+    text = str(value).strip()
+
+    if text == "":
+        raise ShareConfigError(
+            f"第 {row_idx} 行“{field_name}”不能为空，必须是非负整数。"
+        )
+
+    if not text.isdigit():
+        raise ShareConfigError(
+            f"第 {row_idx} 行“{field_name}”必须是非负整数，实际值：{value!r}"
+        )
+
+    number = int(text)
 
     return number
 

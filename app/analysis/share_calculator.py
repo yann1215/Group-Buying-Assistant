@@ -118,6 +118,29 @@ def calculate_share(
 
     order_rows, product_names = read_order_rows(parsed_order_file)
 
+    product_total_map = {
+        product_name: sum(
+            row.quantities.get(product_name, 0)
+            for row in order_rows
+        )
+        for product_name in product_names
+    }
+
+    total_product_quantity = sum(
+        product_total_map.values()
+    )
+
+    if total_product_quantity <= 0:
+        raise ShareCalculateError(
+            "订单中所有商品数量合计为 0，无法进行均摊计算。"
+        )
+
+    zero_quantity_products = [
+        product_name
+        for product_name, quantity in product_total_map.items()
+        if quantity == 0
+    ]
+
     # 排除不参摊成员的订单
     excluded_order_no_set = {
         normalize_order_no_for_compare(order_no)
@@ -329,6 +352,15 @@ def calculate_share(
             }
             for item in charged_results
         ],
+        "warnings": (
+            [
+                "以下商品的订单总数量为 0，"
+                "本次计算将自动忽略："
+                + "、".join(zero_quantity_products)
+            ]
+            if zero_quantity_products
+            else []
+        ),
     }
 
 
@@ -367,15 +399,10 @@ def read_order_rows(parsed_order_file: Path) -> tuple[list[OrderRow], list[str]]
 
                 if not value.isdigit():
                     raise ShareCalculateError(
-                        f"第 {row_idx} 行商品“{product_name}”数量不是正整数：{value!r}"
+                        f"第 {row_idx} 行商品“{product_name}”数量必须是非负整数：{value!r}"
                     )
 
                 quantity = int(value)
-
-                if quantity <= 0:
-                    raise ShareCalculateError(
-                        f"第 {row_idx} 行商品“{product_name}”数量不是正整数：{value!r}"
-                    )
 
                 quantities[product_name] = quantity
 
@@ -447,7 +474,7 @@ def build_product_configs(
                 default=idx,
             )
 
-            product_quantity = parse_optional_positive_int(
+            product_quantity = parse_optional_non_negative_int(
                 supplied.get("商品数量"),
                 default=total_quantity,
             )
@@ -1077,7 +1104,6 @@ def parse_optional_positive_int(value: Any, default: int | None = None) -> int |
 
     用于：
         商品序号
-        商品数量
     """
     if value is None or str(value).strip() == "":
         return default
@@ -1089,7 +1115,29 @@ def parse_optional_positive_int(value: Any, default: int | None = None) -> int |
 
     number = int(text)
 
+    # 检查数字非负
     if number <= 0:
         raise ShareCalculateError(f"应为正整数，实际值：{value!r}")
+
+    return number
+
+
+def parse_optional_non_negative_int(value: Any, default: int | None = None) -> int | None:
+    """
+    解析可选非负整数。
+
+    用于：
+        商品数量
+    """
+
+    if value is None or str(value).strip() == "":
+        return default
+
+    text = str(value).strip()
+
+    if not text.isdigit():
+        raise ShareCalculateError(f"应为非负整数，实际值：{value!r}")
+
+    number = int(text)
 
     return number

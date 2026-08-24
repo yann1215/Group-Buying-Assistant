@@ -548,12 +548,6 @@ class ToolOrchestrator:
             "parsed_order_file"
         )
 
-        if result.get("ok") and ctx.parsed_order_file:
-            self.ensure_share_config_loaded(
-                ctx=ctx,
-                parsed_order_file=ctx.parsed_order_file,
-            )
-
         return result
 
     def handle_calculate_bulk_goods(
@@ -1238,6 +1232,14 @@ def format_share_result(
 
     lines.append(f"实际总收款：{result['total_collected']}")
     lines.append(f"向上取整多收：{result['over_collected']}")
+
+    warnings = result.get("warnings") or []
+    if warnings:
+        lines.append("")
+        lines.append("提醒：")
+
+        for warning in warnings:
+            lines.append(f"- {warning}")
 
     result_file = result.get("result_file")
 

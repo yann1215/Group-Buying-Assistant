@@ -567,6 +567,17 @@ class ChatWindow(QMainWindow):
         self.input_box.clear()
         self.set_processing(True)
 
+        # 显示任务开始提示
+        processing_message = self.chat_service.get_processing_message(
+            user_text
+        )
+
+        if processing_message:
+            self.append_message(
+                "assistant",
+                processing_message,
+            )
+
         self.current_worker = SendMessageWorker(
             chat_service=self.chat_service,
             session_id=self.session_id,

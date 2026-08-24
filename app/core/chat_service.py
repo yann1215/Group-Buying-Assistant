@@ -146,6 +146,29 @@ class ChatService:
         self.save_working_context(session_id)
         return order_message
 
+    def get_processing_message(
+            self,
+            user_text: str,
+    ) -> str | None:
+        """
+        根据用户指令返回任务开始前显示的临时提示。
+
+        这里只返回文本，不写入数据库。
+        """
+        intent = parse_user_intent(user_text)
+        intent_name = intent.get("intent")
+
+        processing_messages = {
+            "member_check": "正在核对成员……",
+            "calculate_share": "正在计算均摊……",
+            "calculate_bulk_goods": "正在计算大货……",
+            "update_share_config": "正在更新均摊配置……",
+            "confirm_share_config": "正在确认均摊配置……",
+            "update_special_members": "正在更新特殊成员信息……",
+        }
+
+        return processing_messages.get(intent_name)
+
     def send_message(self, session_id: int, user_text: str) -> str:
         self._ensure_context_loaded(session_id)
         add_message(
