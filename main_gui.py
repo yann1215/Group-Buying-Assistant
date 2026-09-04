@@ -136,6 +136,7 @@ class ChatInput(QPlainTextEdit):
 
 class WorkerSignals(QObject):
     result = Signal(str)
+    progress = Signal(str)
     error = Signal(str)
     finished = Signal()
 
@@ -161,6 +162,7 @@ class SendMessageWorker(QRunnable):
             reply = self.chat_service.send_message(
                 self.session_id,
                 self.user_text,
+                progress_callback=self.signals.progress.emit,
             )
             self.signals.result.emit(str(reply))
         except Exception as exc:
@@ -567,17 +569,6 @@ class ChatWindow(QMainWindow):
         self.input_box.clear()
         self.set_processing(True)
 
-        # 显示任务开始提示
-        processing_message = self.chat_service.get_processing_message(
-            user_text
-        )
-
-        if processing_message:
-            self.append_message(
-                "assistant",
-                processing_message,
-            )
-
         self.current_worker = SendMessageWorker(
             chat_service=self.chat_service,
             session_id=self.session_id,
@@ -585,6 +576,7 @@ class ChatWindow(QMainWindow):
         )
 
         self.current_worker.signals.result.connect(self.handle_reply)
+        self.current_worker.signals.progress.connect(self.handle_progress)
         self.current_worker.signals.error.connect(self.handle_error)
         self.current_worker.signals.finished.connect(
             self.handle_worker_finished
@@ -599,6 +591,13 @@ class ChatWindow(QMainWindow):
             self.refresh_session_list(self.session_id)
         finally:
             self.set_processing(False)
+
+    @Slot(str)
+    def handle_progress(self, message: str) -> None:
+        self.append_message(
+            "assistant",
+            message,
+        )
 
     @Slot(str)
     def handle_error(self, error_text: str) -> None:

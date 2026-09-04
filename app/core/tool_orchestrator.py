@@ -26,7 +26,7 @@ from app.analysis.special_member import (
 )
 from app.analysis.share_calculator import calculate_share
 from app.analysis.share_config import (
-    create_product_share_config_file,
+    sync_product_config_file,
     load_product_share_config_file,
     summarize_product_share_config,
     update_product_share_config_file,
@@ -44,6 +44,12 @@ from app.core.intent_parser import (
 
 DEFAULT_ORDER_OUTPUT_DIR = Path("./orders/output")
 
+def emit_progress(
+    callback: Callable[[str], None] | None,
+    message: str,
+) -> None:
+    if callback is not None:
+        callback(message)
 
 @dataclass
 class ShareRequestState:
@@ -353,12 +359,13 @@ class ToolOrchestrator:
         if intent.get("force"):
             req.force = True
 
-
     def handle(
             self,
             session_id: int,
             user_text: str,
+            progress_callback: Callable[[str], None] | None = None,
     ) -> str | None:
+
         intent = parse_user_intent(user_text)
         ctx = self.contexts.setdefault(
             session_id,
@@ -419,12 +426,20 @@ class ToolOrchestrator:
             check_result = self.ensure_member_checked(
                 ctx,
                 force=True,
+                progress_callback=progress_callback,
             )
             return format_member_check_result(check_result)
 
         if intent["intent"] == "calculate_share":
-            self.update_share_request_from_intent(ctx, intent)
-            return self.handle_calculate_share(ctx, intent)
+            self.update_share_request_from_intent(
+                ctx,
+                intent,
+            )
+            return self.handle_calculate_share(
+                ctx,
+                intent,
+                progress_callback=progress_callback,
+            )
 
         if intent["intent"] == "update_share_config":
             self.update_share_request_from_intent(ctx, intent)
@@ -480,7 +495,14 @@ class ToolOrchestrator:
             self,
             ctx: SessionToolContext,
             force: bool = False,
+            progress_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
+
+        emit_progress(
+            progress_callback,
+            "正在检查成员……",
+        )
+
         # 即使存在旧缓存，也应先确认特殊成员配置仍然有效。
         special_member_errors = (
             validate_special_member_cache(
@@ -730,7 +752,7 @@ class ToolOrchestrator:
             - 每次计算前都重新读取配置表，方便用户手动编辑 CSV 后重新计算。
         """
         if not ctx.share_config_file:
-            ctx.share_config_file = create_product_share_config_file(
+            ctx.share_config_file = sync_product_config_file(
                 parsed_order_file=parsed_order_file,
                 output_dir=ctx.order_output_dir,
                 overwrite=True,
@@ -740,12 +762,13 @@ class ToolOrchestrator:
             ctx.share_config_file
         )
 
-
     def handle_calculate_share(
             self,
             ctx: SessionToolContext,
             intent: dict[str, Any],
+            progress_callback: Callable[[str], None] | None = None,
     ) -> str:
+
         req = ctx.share_request
 
         if not ctx.group_name:
@@ -776,7 +799,10 @@ class ToolOrchestrator:
                 "也可以直接说：拉通人头，金额120"
             )
 
-        check_result = self.ensure_member_checked(ctx)
+        check_result = self.ensure_member_checked(
+            ctx,
+            progress_callback=progress_callback,
+        )
 
         if not check_result.get("ok"):
             return format_member_check_result(check_result)
@@ -802,6 +828,12 @@ class ToolOrchestrator:
                 "商品独立均摊配置还未确认。\n"
                 "确认无误后请输入：确认计算"
             )
+
+        # 所有前置检查通过，真正开始计算
+        emit_progress(
+            progress_callback,
+            "正在计算均摊……",
+        )
 
         result = calculate_share(
             parsed_order_file=parsed_order_file,

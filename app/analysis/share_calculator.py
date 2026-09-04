@@ -73,7 +73,6 @@ def calculate_share(
     calculation_scope: str = "flat",
     product_configs: list[dict[str, Any]] | None = None,
     output_dir: str | Path | None = None,
-    max_product_slots: int = 20,
     excluded_order_nos: set[str] | None = None,
 ) -> dict[str, Any]:
     """
@@ -166,16 +165,10 @@ def calculate_share(
             "排除不参摊特殊成员后，没有可参与均摊的订单。"
         )
 
-    if len(product_names) > max_product_slots:
-        raise ShareCalculateError(
-            f"当前商品数量为 {len(product_names)}，超过预留上限 {max_product_slots}。"
-        )
-
     configs = build_product_configs(
         product_names=product_names,
         order_rows=order_rows,
         product_configs=product_configs,
-        max_product_slots=max_product_slots,
         global_share_mode=share_mode,
         calculation_scope=calculation_scope,
     )
@@ -433,7 +426,6 @@ def build_product_configs(
     product_names: list[str],
     order_rows: list[OrderRow],
     product_configs: list[dict[str, Any]] | None,
-    max_product_slots: int,
     global_share_mode: str,
     calculation_scope: str,
 ) -> list[ProductShareConfig]:
@@ -514,21 +506,6 @@ def build_product_configs(
                 unit_share_price=unit_share_price,
                 product_unit_price=product_unit_price,
                 product_total_price=product_total_price,
-            )
-        )
-
-    while len(result) < max_product_slots:
-        result.append(
-            ProductShareConfig(
-                product_no=len(result) + 1,
-                product_name="",
-                product_quantity=None,
-                include_share=False,
-                share_type="",
-                product_share_amount=None,
-                unit_share_price=None,
-                product_unit_price=None,
-                product_total_price=None,
             )
         )
 

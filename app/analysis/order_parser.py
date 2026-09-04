@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import csv
 import re
-from datetime import datetime
 from pathlib import Path
 from typing import Any
+from decimal import Decimal, InvalidOperation
 
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
@@ -33,6 +33,13 @@ DEFAULT_PRODUCT_ANCHOR_HEADERS = (
     "收货人联系方式",
     "收货人地址",
 )
+
+PRODUCT_PRICE_SHEET_INDEX = 0
+
+PRODUCT_NAME_HEADER = "商品名称"
+PRODUCT_PRICE_HEADER = "单价"
+
+PRODUCT_PRICE_HEADER_SEARCH_ROWS = (3, 1, 2, 4, 5)
 
 
 class OrderParseError(RuntimeError):
@@ -556,6 +563,91 @@ def _format_total_amount(value: Any) -> str:
         return text
 
     return f"{number:.2f}"
+
+
+def _find_product_price_headers(
+    ws: Worksheet,
+    merged_value_map: dict[tuple[int, int], Any],
+) -> tuple[int, int, int] | None:
+    """
+    返回：
+        表头行, 商品名称列, 单价列
+    """
+
+    for row_idx in PRODUCT_PRICE_HEADER_SEARCH_ROWS:
+        if row_idx > ws.max_row:
+            continue
+
+        product_name_col = None
+        price_col = None
+
+        for col_idx in range(1, ws.max_column + 1):
+            header = _normalize_header(
+                _get_cell_value(
+                    ws=ws,
+                    row=row_idx,
+                    col=col_idx,
+                    merged_value_map=merged_value_map,
+                )
+            )
+
+            if (
+                header == PRODUCT_NAME_HEADER
+                and product_name_col is None
+            ):
+                product_name_col = col_idx
+
+            elif (
+                header == PRODUCT_PRICE_HEADER
+                and price_col is None
+            ):
+                price_col = col_idx
+
+            if product_name_col and price_col:
+                return (
+                    row_idx,
+                    product_name_col,
+                    price_col,
+                )
+
+    return None
+
+
+def _get_original_product_name(product_name: str) -> str:
+    """
+    parsed orders 为避免重复 CSV 表头，会生成：
+        商品A
+        商品A__2
+        商品A__3
+
+    查原 Excel 时恢复为：
+        商品A
+    """
+    return re.sub(
+        r"__\d+$",
+        "",
+        str(product_name or "").strip(),
+    )
+
+
+def _format_product_unit_price(value: Any) -> str:
+    """
+    商品价格读取失败时返回空字符串，不抛异常。
+    """
+    if _is_blank(value):
+        return ""
+
+    try:
+        amount = Decimal(
+            str(value).replace(",", "").strip()
+        )
+    except (InvalidOperation, ValueError):
+        return ""
+
+    if amount < 0:
+        return ""
+
+    return f"{amount:.2f}"
 
 
 if __name__ == "__main__":
