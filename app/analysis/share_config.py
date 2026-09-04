@@ -22,7 +22,9 @@ CONFIG_FIELDNAMES = [
     "计入均摊",
     "均摊类型",
     "商品均摊",
+    "单份均摊",
     "商品单价",
+    "商品大货总价",
 ]
 
 
@@ -30,198 +32,62 @@ class ShareConfigError(RuntimeError):
     """商品均摊配置表处理失败。"""
 
 
-def sync_product_config_file(
-        parsed_order_file: str | Path,
-        original_order_file: str | Path,
-        output_dir: str | Path | None = None,
-        share_mode: str | None = None,
-        calculated_configs: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
+def _read_product_config_rows(
+    config_file: str | Path,
+) -> list[dict[str, Any]]:
     """
-    根据简化订单表生成商品均摊配置表。
+    读取商品配置文件。
 
-    输入：
-        order_parser.py 输出的宽表 CSV：
-            单号, 昵称, 总金额, 商品A, 商品B, 商品C...
-
-    输出：
-        商品均摊配置表 CSV。
-
-    默认规则：
-        - 商品名称包含“底胚” → 计入均摊=False
-        - 其他商品 → 计入均摊=True
-
-    返回：
-        配置表文件绝对路径。
+    同时统一检查：
+    1. 文件是否存在
+    2. 是否存在表头
+    3. 是否包含全部 CONFIG_FIELDNAMES
     """
+    config_file = Path(config_file)
 
-    parsed_order_file = Path(parsed_order_file)
-
-    output_dir_path = (
-        Path(output_dir)
-        if output_dir
-        else CSV_OUTPUT_DIR
-    )
-    output_dir_path.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    base_name = parsed_order_file.stem
-
-    if base_name.endswith("_parsed_orders"):
-        base_name = base_name.removesuffix(
-            "_parsed_orders"
+    if not config_file.exists():
+        raise FileNotFoundError(
+            f"商品配置文件不存在：{config_file}"
         )
 
-    output_path = (
-            output_dir_path
-            / f"{base_name}_parsed_product_config.csv"
-    )
+    with config_file.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as f:
+        reader = csv.DictReader(f)
 
-    product_rows = read_product_summary_from_order_file(
-        parsed_order_file
-    )
-
-    # -------------------------
-    # 读取旧配置
-    # -------------------------
-
-    old_map: dict[str, dict[str, Any]] = {}
-
-    if output_path.exists():
-        try:
-            old_configs = load_product_share_config_file(
-                output_path
+        if not reader.fieldnames:
+            raise ShareConfigError(
+                "商品配置文件没有表头。"
             )
 
-            old_map = {
-                str(item.get("商品名称") or "").strip(): item
-                for item in old_configs
-                if str(item.get("商品名称") or "").strip()
-            }
+        return list(reader)
 
-        except Exception:
-            # 配置文件格式已经是旧版时，
-            # 不需要阻止重新生成新版配置。
-            old_map = {}
 
-    # -------------------------
-    # 本次计算结果
-    # -------------------------
+def _write_product_config_rows(
+    config_file: str | Path,
+    rows: list[dict[str, Any]],
+) -> None:
+    """
+    将商品配置写回 CSV。
+    """
+    config_file = Path(config_file)
 
-    calculated_map = {
-        str(item.get("商品名称") or "").strip(): item
-        for item in (calculated_configs or [])
-        if str(item.get("商品名称") or "").strip()
-    }
-
-    # -------------------------
-    # 从 sheet1 获取价格
-    # -------------------------
-
-    product_names = [
-        item["商品名称"]
-        for item in product_rows
-    ]
-
-    price_result = read_product_unit_prices(
-        order_input=original_order_file,
-        product_names=product_names,
-    )
-
-    prices = price_result["prices"]
-    warnings = price_result["warnings"]
-
-    # -------------------------
-    # 生成新配置
-    # -------------------------
-
-    rows = []
-
-    for idx, product in enumerate(
-            product_rows,
-            start=1,
-    ):
-        product_name = product["商品名称"]
-
-        old = old_map.get(product_name, {})
-        calculated = calculated_map.get(
-            product_name,
-            {},
-        )
-
-        include_share = old.get("计入均摊")
-
-        if include_share is None:
-            include_share = default_include_share(
-                product_name
-            )
-
-        # 商品均摊：
-        # 计算结果有明确值 → 更新
-        # 否则 → 保留原值
-        product_share = calculated.get(
-            "商品均摊"
-        )
-
-        if product_share in (None, ""):
-            product_share = old.get(
-                "商品均摊",
-                "",
-            )
-
-        if (
-                not include_share
-                and product_share == ""
-        ):
-            product_share = "0.00"
-
-        # 均摊类型
-        if share_mode == "head":
-            share_type = "人头摊"
-        elif share_mode == "quantity":
-            share_type = "个数摊"
-        else:
-            share_type = old.get(
-                "均摊类型",
-                "",
-            )
-
-        rows.append(
-            {
-                "商品序号": idx,
-                "商品名称": product_name,
-                "商品数量": product["商品数量"],
-                "计入均摊": include_share,
-                "均摊类型": share_type,
-                "商品均摊": product_share,
-                "商品单价": prices.get(
-                    product_name,
-                    "",
-                ),
-            }
-        )
-
-    with output_path.open(
-            "w",
-            encoding="utf-8-sig",
-            newline="",
+    with config_file.open(
+        "w",
+        encoding="utf-8-sig",
+        newline="",
     ) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=CONFIG_FIELDNAMES,
+            extrasaction="ignore",
         )
+
         writer.writeheader()
         writer.writerows(rows)
 
-    return {
-        "ok": True,
-        "config_file": str(
-            output_path.resolve()
-        ),
-        "warnings": warnings,
-    }
 
 def read_product_summary_from_order_file(
     parsed_order_file: str | Path,
@@ -280,109 +146,303 @@ def load_product_share_config_file(
     config_file: str | Path,
 ) -> list[dict[str, Any]]:
     """
-    读取商品均摊配置表，转换成 share_calculator.py 可用的数据结构。
-
-    金额字段规则：
-        - 空值保持为空字符串
-        - 非空时转成两位小数字符串
-        - 多余小数位向上取整
-
-    返回示例：
-        [
-            {
-                "商品序号": 1,
-                "商品名称": "商品A",
-                "商品数量": 3,
-                "计入均摊": True,
-                "均摊类型": "",
-                "商品均摊": "12.35",
-                "商品单价": "",
-            }
-        ]
+    读取商品配置表，转换成 share_calculator.py 可用的数据结构。
     """
-    config_file = Path(config_file)
-
-    if not config_file.exists():
-        raise FileNotFoundError(f"商品均摊配置表不存在：{config_file}")
+    rows = _read_product_config_rows(config_file)
 
     configs: list[dict[str, Any]] = []
 
-    with config_file.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
+    for row_idx, row in enumerate(
+        rows,
+        start=2,
+    ):
+        product_name = str(
+            row.get("商品名称", "") or ""
+        ).strip()
 
-        if not reader.fieldnames:
-            raise ShareConfigError("商品均摊配置表没有表头。")
+        if not product_name:
+            continue
 
-        missing_headers = [
-            name for name in CONFIG_FIELDNAMES
-            if name not in reader.fieldnames
-        ]
+        product_no = parse_required_positive_int(
+            row.get("商品序号"),
+            field_name="商品序号",
+            row_idx=row_idx,
+        )
 
-        if missing_headers:
-            raise ShareConfigError(
-                f"商品均摊配置表缺少表头：{missing_headers}"
-            )
-
-        for row_idx, row in enumerate(reader, start=2):
-            product_name = str(row.get("商品名称", "") or "").strip()
-
-            # 预留空行跳过
-            if not product_name:
-                continue
-
-            product_no = parse_required_positive_int(
-                row.get("商品序号"),
-                field_name="商品序号",
-                row_idx=row_idx,
-            )
-
-            product_quantity = parse_required_non_negative_int(
+        product_quantity = (
+            parse_required_non_negative_int(
                 row.get("商品数量"),
                 field_name="商品数量",
                 row_idx=row_idx,
             )
+        )
 
-            include_share = parse_bool_required(
-                row.get("计入均摊"),
-                field_name="计入均摊",
-                row_idx=row_idx,
-            )
+        include_share = parse_bool_required(
+            row.get("计入均摊"),
+            field_name="计入均摊",
+            row_idx=row_idx,
+        )
 
-            product_share_amount = parse_optional_money_ceil(
+        product_share_amount = (
+            parse_optional_money_ceil(
                 row.get("商品均摊"),
                 field_name="商品均摊",
                 row_idx=row_idx,
             )
+        )
 
-            product_unit_price = parse_optional_money_ceil(
+        unit_share_amount = (
+            parse_optional_money_ceil(
+                row.get("单份均摊"),
+                field_name="单份均摊",
+                row_idx=row_idx,
+            )
+        )
+
+        product_unit_price = (
+            parse_optional_money_ceil(
                 row.get("商品单价"),
                 field_name="商品单价",
                 row_idx=row_idx,
             )
+        )
 
-            # 如果不计入均摊，商品均摊允许为空，也允许为 0.00。
-            if not include_share:
-                product_share_amount = normalize_zero_or_blank_money(product_share_amount)
+        product_total_price = (
+            parse_optional_money_ceil(
+                row.get("商品大货总价"),
+                field_name="商品大货总价",
+                row_idx=row_idx,
+            )
+        )
 
-            config = {
+        if not include_share:
+            product_share_amount = (
+                normalize_zero_or_blank_money(
+                    product_share_amount
+                )
+            )
+
+        configs.append(
+            {
                 "商品序号": product_no,
                 "商品名称": product_name,
                 "商品数量": product_quantity,
                 "计入均摊": include_share,
-                "均摊类型": str(row.get("均摊类型", "") or "").strip(),
+                "均摊类型": str(
+                    row.get("均摊类型", "") or ""
+                ).strip(),
                 "商品均摊": product_share_amount,
+                "单份均摊": unit_share_amount,
                 "商品单价": product_unit_price,
+                "商品大货总价": product_total_price,
             }
-
-            configs.append(config)
+        )
 
     return configs
+
+
+def ensure_product_config_file(
+    parsed_order_file: str | Path,
+    output_dir: str | Path | None = None,
+) -> str:
+    """
+    确保商品配置文件存在，并同步当前订单中的基础商品信息。
+
+    本函数只负责更新：
+        - 商品序号
+        - 商品名称
+        - 商品数量
+        - 计入均摊（仅新商品首次创建时初始化）
+
+    本函数不会更新：
+        - 均摊类型
+        - 商品均摊
+        - 单份均摊
+        - 商品单价
+        - 商品大货总价
+
+    如果配置文件已经存在：
+        - 保留现有商品的用户配置和各阶段计算结果
+        - 删除当前订单中已经不存在的旧商品
+        - 新商品按 default_include_share() 初始化
+        - 商品数量始终以当前 parsed_orders 为准
+
+    返回：
+        parsed_product_config.csv 的绝对路径
+    """
+    parsed_order_file = Path(parsed_order_file)
+
+    if not parsed_order_file.exists():
+        raise FileNotFoundError(
+            f"简化订单文件不存在：{parsed_order_file}"
+        )
+
+    output_dir_path = (
+        Path(output_dir)
+        if output_dir
+        else CSV_OUTPUT_DIR
+    )
+
+    output_dir_path.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ---------------------------------
+    # 生成配置文件路径
+    # ---------------------------------
+
+    base_name = parsed_order_file.stem
+
+    if base_name.endswith("_parsed_orders"):
+        base_name = base_name.removesuffix(
+            "_parsed_orders"
+        )
+
+    output_path = (
+        output_dir_path
+        / f"{base_name}_parsed_product_config.csv"
+    )
+
+    # ---------------------------------
+    # 读取当前 parsed_orders 的商品信息
+    # ---------------------------------
+
+    product_rows = read_product_summary_from_order_file(
+        parsed_order_file
+    )
+
+    # ---------------------------------
+    # 如果旧配置存在，读取旧配置
+    # ---------------------------------
+
+    old_rows: list[dict[str, Any]] = []
+
+    if output_path.exists():
+        old_rows = _read_product_config_rows(
+            output_path
+        )
+
+    old_map = {
+        str(row.get("商品名称") or "").strip(): row
+        for row in old_rows
+        if str(row.get("商品名称") or "").strip()
+    }
+
+    # ---------------------------------
+    # 根据当前订单重新生成配置行
+    # ---------------------------------
+
+    new_rows: list[dict[str, Any]] = []
+
+    for idx, product in enumerate(
+        product_rows,
+        start=1,
+    ):
+        product_name = str(
+            product.get("商品名称") or ""
+        ).strip()
+
+        if not product_name:
+            continue
+
+        product_quantity = product.get(
+            "商品数量",
+            0,
+        )
+
+        old = old_map.get(
+            product_name
+        )
+
+        # =============================
+        # 已有商品
+        # =============================
+
+        if old is not None:
+            # 先完整保留旧配置。
+            row = {
+                field_name: old.get(
+                    field_name,
+                    "",
+                )
+                for field_name in CONFIG_FIELDNAMES
+            }
+
+            # 只刷新基础字段。
+            row["商品序号"] = idx
+            row["商品名称"] = product_name
+            row["商品数量"] = product_quantity
+
+            # 注意：
+            # 已有商品的“计入均摊”也保留，
+            # 防止覆盖用户手动设置。
+            #
+            # 均摊类型、商品均摊、单份均摊、
+            # 商品单价、商品大货总价均不修改。
+
+        # =============================
+        # 新商品
+        # =============================
+
+        else:
+            row = {
+                "商品序号": idx,
+                "商品名称": product_name,
+                "商品数量": product_quantity,
+                "计入均摊": default_include_share(
+                    product_name
+                ),
+                "均摊类型": "",
+                "商品均摊": "",
+                "单份均摊": "",
+                "商品单价": "",
+                "商品大货总价": "",
+            }
+
+        new_rows.append(row)
+
+    # ---------------------------------
+    # 写回配置文件
+    # ---------------------------------
+
+    _write_product_config_rows(
+        output_path,
+        new_rows,
+    )
+
+    return str(
+        output_path.resolve()
+    )
+
+
+def make_share_type(
+    share_mode: str,
+    calculation_scope: str,
+) -> str:
+    mapping = {
+        ("head", "flat"): "拉通人头摊",
+        ("quantity", "flat"): "拉通个数摊",
+        ("head", "independent"): "独立人头摊",
+        ("quantity", "independent"): "独立个数摊",
+    }
+
+    result = mapping.get(
+        (share_mode, calculation_scope)
+    )
+
+    if result is None:
+        raise ShareConfigError(
+            f"无法生成均摊类型："
+            f"{share_mode=}, {calculation_scope=}"
+        )
+
+    return result
 
 
 def update_product_share_config_file(
     config_file: str | Path,
     updates: list[dict[str, Any]],
-    share_type: str | None = None,
 ) -> dict[str, Any]:
     """
     根据用户对话输入，更新商品均摊配置表。
@@ -391,33 +451,10 @@ def update_product_share_config_file(
         {"商品序号": 1, "商品均摊": "10"}
         {"商品名称": "雪梅蜂", "商品均摊": "10"}
 
-    share_type:
-        可选。如果传入，则同步写入“均摊类型”列。
-        例如：
-            head_independent
-            quantity_independent
     """
     config_file = Path(config_file)
 
-    if not config_file.exists():
-        raise FileNotFoundError(f"商品均摊配置表不存在：{config_file}")
-
-    with config_file.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-
-    if not reader.fieldnames:
-        raise ShareConfigError("商品均摊配置表没有表头。")
-
-    missing_headers = [
-        name for name in CONFIG_FIELDNAMES
-        if name not in reader.fieldnames
-    ]
-
-    if missing_headers:
-        raise ShareConfigError(
-            f"商品均摊配置表缺少表头：{missing_headers}"
-        )
+    rows = _read_product_config_rows(config_file)
 
     updated_items: list[dict[str, Any]] = []
     unmatched_updates: list[dict[str, Any]] = []
@@ -457,16 +494,12 @@ def update_product_share_config_file(
             if by_no or by_name:
                 row["商品均摊"] = amount
 
-                if share_type:
-                    row["均摊类型"] = share_type
-
                 updated_items.append(
                     {
                         "商品序号": row.get("商品序号"),
                         "商品名称": row_name,
                         "商品数量": row.get("商品数量"),
                         "计入均摊": row.get("计入均摊"),
-                        "均摊类型": row.get("均摊类型"),
                         "商品均摊": amount,
                     }
                 )
@@ -477,10 +510,7 @@ def update_product_share_config_file(
         if not matched:
             unmatched_updates.append(update)
 
-    with config_file.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CONFIG_FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(rows)
+    _write_product_config_rows(config_file,rows)
 
     summary = summarize_product_share_config(config_file)
 
@@ -493,77 +523,454 @@ def update_product_share_config_file(
     }
 
 
+def update_product_config_before_share(
+    config_file: str | Path,
+    share_mode: str,
+    calculation_scope: str,
+    total_amount: str | int | float | None = None,
+) -> dict[str, Any]:
+    config_file = Path(config_file)
+
+    rows = _read_product_config_rows(config_file)
+
+    share_type = make_share_type(
+        share_mode,
+        calculation_scope,
+    )
+
+    if calculation_scope == "flat":
+        if total_amount is None:
+            raise ShareConfigError(
+                "拉通均摊更新商品配置时缺少总均摊金额。"
+            )
+
+        common_amount = parse_optional_money_ceil(
+            total_amount,
+            field_name="商品均摊",
+            row_idx=0,
+        )
+
+        for row in rows:
+            # 此阶段只更新这两个字段
+            row["均摊类型"] = share_type
+            row["商品均摊"] = common_amount
+
+    elif calculation_scope == "independent":
+        for row in rows:
+            # 独立均摊金额已经由用户逐商品输入，
+            # 此处不要重新计算或覆盖。
+            row["均摊类型"] = share_type
+
+            include_share = parse_bool_required(
+                row.get("计入均摊"),
+                field_name="计入均摊",
+                row_idx=0,
+            )
+
+            if (
+                not include_share
+                and not str(
+                    row.get("商品均摊") or ""
+                ).strip()
+            ):
+                row["商品均摊"] = "0.00"
+
+    else:
+        raise ShareConfigError(
+            f"未知计算方式：{calculation_scope}"
+        )
+
+    _write_product_config_rows(config_file,rows)
+
+    return {
+        "ok": True,
+        "config_file": str(
+            config_file.resolve()
+        ),
+        "share_type": share_type,
+    }
+
+
+def update_product_config_after_share(
+    config_file: str | Path,
+    calculated_configs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    config_file = Path(config_file)
+
+    rows = _read_product_config_rows(config_file)
+
+    calculated_map = {
+        str(item.get("商品名称") or "").strip(): item
+        for item in calculated_configs
+        if str(item.get("商品名称") or "").strip()
+    }
+
+    for row_idx, row in enumerate(
+        rows,
+        start=2,
+    ):
+        product_name = str(
+            row.get("商品名称") or ""
+        ).strip()
+
+        calculated = calculated_map.get(
+            product_name
+        )
+
+        if calculated is None:
+            continue
+
+        # 此阶段只更新单份均摊。
+        row["单份均摊"] = parse_optional_money_ceil(
+            calculated.get("单份均摊"),
+            field_name="单份均摊",
+            row_idx=row_idx,
+        )
+
+    _write_product_config_rows(config_file,rows)
+
+    return {
+        "ok": True,
+        "config_file": str(
+            config_file.resolve()
+        ),
+    }
+
+
+def update_product_config_before_bulk(
+    config_file: str | Path,
+    original_order_file: str | Path,
+) -> dict[str, Any]:
+    config_file = Path(config_file)
+
+    rows = _read_product_config_rows(config_file)
+
+    product_names = [
+        str(row.get("商品名称") or "").strip()
+        for row in rows
+        if str(row.get("商品名称") or "").strip()
+    ]
+
+    price_result = read_product_unit_prices(
+        order_input=original_order_file,
+        product_names=product_names,
+    )
+
+    prices = price_result["prices"]
+    warnings = price_result["warnings"]
+
+    for row in rows:
+        product_name = str(
+            row.get("商品名称") or ""
+        ).strip()
+
+        if not product_name:
+            continue
+
+        price_text = prices.get(
+            product_name,
+            "",
+        )
+
+        # 此阶段只更新价格字段。
+        row["商品单价"] = price_text
+
+        if price_text == "":
+            row["商品大货总价"] = ""
+            continue
+
+        quantity_text = str(
+            row.get("商品数量") or ""
+        ).strip()
+
+        if not quantity_text.isdigit():
+            row["商品大货总价"] = ""
+            continue
+
+        quantity = int(quantity_text)
+
+        total_price = (
+            Decimal(price_text)
+            * Decimal(quantity)
+        ).quantize(
+            Decimal("0.01")
+        )
+
+        row["商品大货总价"] = (
+            f"{total_price:.2f}"
+        )
+
+    _write_product_config_rows(config_file,rows)
+
+    return {
+        "ok": True,
+        "config_file": str(
+            config_file.resolve()
+        ),
+        "warnings": warnings,
+    }
+
+
 def summarize_product_share_config(
     config_file: str | Path,
     total_amount: str | int | float | None = None,
 ) -> dict[str, Any]:
     """
-    汇总商品均摊配置表。
+    汇总商品配置中的均摊金额。
 
-    如果 total_amount 不为空，则检查：
-        各商品均摊合计 == 用户输入总均摊
+    规则：
 
-    如果 total_amount 为空，则代码自行计算总均摊：
-        总均摊 = 所有计入均摊商品的“商品均摊”之和
+    1. 拉通人头摊 / 拉通个数摊
+       - 每个商品的“商品均摊”都保存同一个总均摊金额。
+       - 因此不能逐商品求和。
+       - config_total 直接取共同的商品均摊金额。
+
+    2. 独立人头摊 / 独立个数摊
+       - 每个商品的“商品均摊”表示该商品自己的分均摊。
+       - config_total = 所有计入均摊商品的商品均摊之和。
+
+    3. total_amount 不为空时
+       - 检查配置中的总均摊与用户输入总均摊是否一致。
     """
     config_file = Path(config_file)
 
-    configs = load_product_share_config_file(config_file)
+    configs = load_product_share_config_file(
+        config_file
+    )
 
     items: list[dict[str, Any]] = []
-    total = Decimal("0.00")
+
+    # -------------------------------------------------
+    # 整理用于返回的商品信息
+    # -------------------------------------------------
 
     for cfg in configs:
-        include_share = bool(cfg.get("计入均摊"))
-        product_name = str(cfg.get("商品名称") or "").strip()
+        product_name = str(
+            cfg.get("商品名称") or ""
+        ).strip()
 
         if not product_name:
             continue
 
-        amount_text = str(cfg.get("商品均摊") or "").strip()
-
-        if include_share and amount_text:
-            amount = Decimal(amount_text)
-            total += amount
-        else:
-            amount = Decimal("0.00")
+        amount_text = str(
+            cfg.get("商品均摊") or ""
+        ).strip()
 
         items.append(
             {
                 "商品序号": cfg.get("商品序号"),
                 "商品名称": product_name,
                 "商品数量": cfg.get("商品数量"),
-                "计入均摊": include_share,
-                "均摊类型": cfg.get("均摊类型"),
-                "商品均摊": f"{amount:.2f}" if amount_text else "",
+                "计入均摊": bool(
+                    cfg.get("计入均摊")
+                ),
+                "均摊类型": str(
+                    cfg.get("均摊类型") or ""
+                ).strip(),
+                "商品均摊": amount_text,
             }
         )
 
-    total = total.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+    # -------------------------------------------------
+    # 判断均摊类型
+    # -------------------------------------------------
+
+    share_types = {
+        str(
+            cfg.get("均摊类型") or ""
+        ).strip()
+        for cfg in configs
+        if str(
+            cfg.get("均摊类型") or ""
+        ).strip()
+    }
+
+    flat_share_types = {
+        "拉通人头摊",
+        "拉通个数摊",
+    }
+
+    independent_share_types = {
+        "独立人头摊",
+        "独立个数摊",
+    }
+
+    config_total = Decimal("0.00")
+    flat_amount_consistent = True
+
+    # -------------------------------------------------
+    # 拉通均摊
+    # -------------------------------------------------
+
+    if (
+        len(share_types) == 1
+        and next(iter(share_types))
+        in flat_share_types
+    ):
+        flat_amounts: list[Decimal] = []
+
+        for cfg in configs:
+            amount_text = str(
+                cfg.get("商品均摊") or ""
+            ).strip()
+
+            if not amount_text:
+                continue
+
+            flat_amounts.append(
+                Decimal(amount_text)
+            )
+
+        if flat_amounts:
+            # 拉通情况下，每一行理论上应该完全相同。
+            config_total = flat_amounts[0]
+
+            flat_amount_consistent = all(
+                amount == config_total
+                for amount in flat_amounts
+            )
+
+        else:
+            config_total = Decimal("0.00")
+
+    # -------------------------------------------------
+    # 独立均摊
+    # -------------------------------------------------
+
+    elif (
+        len(share_types) == 1
+        and next(iter(share_types))
+        in independent_share_types
+    ):
+        for cfg in configs:
+            include_share = bool(
+                cfg.get("计入均摊")
+            )
+
+            if not include_share:
+                continue
+
+            amount_text = str(
+                cfg.get("商品均摊") or ""
+            ).strip()
+
+            if not amount_text:
+                continue
+
+            config_total += Decimal(
+                amount_text
+            )
+
+    # -------------------------------------------------
+    # 尚未设置均摊类型
+    # -------------------------------------------------
+
+    elif not share_types:
+        # 这里主要兼容：
+        # 用户还在输入独立商品均摊、
+        # 尚未正式执行均摊前更新的阶段。
+        #
+        # 此时仍按照独立商品均摊的方式求和，
+        # 保持原有 update_product_share_config_file()
+        # 的汇总功能可用。
+        for cfg in configs:
+            include_share = bool(
+                cfg.get("计入均摊")
+            )
+
+            if not include_share:
+                continue
+
+            amount_text = str(
+                cfg.get("商品均摊") or ""
+            ).strip()
+
+            if not amount_text:
+                continue
+
+            config_total += Decimal(
+                amount_text
+            )
+
+    # -------------------------------------------------
+    # 出现混合均摊类型
+    # -------------------------------------------------
+
+    else:
+        raise ShareConfigError(
+            "商品配置中存在多个不同的均摊类型："
+            + "、".join(sorted(share_types))
+        )
+
+    config_total = config_total.quantize(
+        Decimal("0.01"),
+        rounding=ROUND_CEILING,
+    )
+
+    # -------------------------------------------------
+    # 与用户输入的总均摊进行比较
+    # -------------------------------------------------
 
     expected_total = None
     diff = None
     matched = None
 
-    if total_amount is not None and str(total_amount).strip() != "":
-        expected_total = Decimal(str(total_amount)).quantize(
+    if (
+        total_amount is not None
+        and str(total_amount).strip() != ""
+    ):
+        try:
+            expected_total = Decimal(
+                str(total_amount)
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_CEILING,
+            )
+
+        except Exception as e:
+            raise ShareConfigError(
+                f"总均摊金额格式错误：{total_amount!r}"
+            ) from e
+
+        diff = (
+            config_total
+            - expected_total
+        ).quantize(
             Decimal("0.01"),
             rounding=ROUND_CEILING,
         )
-        diff = (total - expected_total).quantize(
-            Decimal("0.01"),
-            rounding=ROUND_CEILING,
+
+        matched = (
+            diff == Decimal("0.00")
         )
-        matched = diff == Decimal("0.00")
+
+        # 拉通情况下，如果各行的总均摊本身不一致，
+        # 即使第一行刚好等于 expected_total，
+        # 也不能认为配置正确。
+        if not flat_amount_consistent:
+            matched = False
 
     return {
         "ok": True,
-        "config_file": str(config_file.resolve()),
+        "config_file": str(
+            config_file.resolve()
+        ),
         "items": items,
-        "config_total": f"{total:.2f}",
-        "expected_total": "" if expected_total is None else f"{expected_total:.2f}",
-        "diff": "" if diff is None else f"{diff:.2f}",
+        "config_total": f"{config_total:.2f}",
+        "expected_total": (
+            ""
+            if expected_total is None
+            else f"{expected_total:.2f}"
+        ),
+        "diff": (
+            ""
+            if diff is None
+            else f"{diff:.2f}"
+        ),
         "matched": matched,
+        "flat_amount_consistent": (
+            flat_amount_consistent
+        ),
     }
 
 

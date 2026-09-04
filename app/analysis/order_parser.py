@@ -565,6 +565,185 @@ def _format_total_amount(value: Any) -> str:
     return f"{number:.2f}"
 
 
+def read_product_unit_prices(
+    order_input: str | Path | dict[str, Any],
+    product_names: list[str],
+) -> dict[str, Any]:
+    """
+    从原始订单 sheet1 中读取商品单价。
+
+    规则：
+    - 商品名称来自 parsed_orders，不在 sheet1 中发现新商品。
+    - 优先第3行寻找“商品名称”“单价”。
+    - 第3行失败后再检查第1-5行。
+    - 同一商品第一次出现即确定结果。
+    - 第一次出现时价格为空，也不再查后续重复项。
+    - 全部目标商品找到后立即结束扫描。
+    - 表头/商品/价格找不到均只返回 warning，不抛异常。
+    """
+    prices = {
+        product_name: ""
+        for product_name in product_names
+    }
+
+    warnings: list[str] = []
+
+    input_path = _get_input_path(order_input)
+
+    if not input_path.exists():
+        warnings.append(
+            f"原始订单文件不存在：{input_path}。"
+            "商品单价保持为空。"
+        )
+        return {
+            "prices": prices,
+            "warnings": warnings,
+        }
+
+    try:
+        wb = load_workbook(
+            input_path,
+            data_only=True,
+        )
+    except Exception as exc:
+        warnings.append(
+            f"无法读取原始订单文件：{exc}。"
+            "商品单价保持为空。"
+        )
+        return {
+            "prices": prices,
+            "warnings": warnings,
+        }
+
+    if len(wb.worksheets) <= PRODUCT_PRICE_SHEET_INDEX:
+        wb.close()
+
+        warnings.append(
+            "原始订单中没有 sheet1，"
+            "商品单价保持为空。"
+        )
+
+        return {
+            "prices": prices,
+            "warnings": warnings,
+        }
+
+    ws = wb.worksheets[PRODUCT_PRICE_SHEET_INDEX]
+
+    merged_value_map = _build_merged_value_map(ws)
+
+    header_result = _find_product_price_headers(
+        ws=ws,
+        merged_value_map=merged_value_map,
+    )
+
+    if header_result is None:
+        wb.close()
+
+        warnings.append(
+            "sheet1 第3行没有同时找到“商品名称”和“单价”，"
+            "第1-5行中也没有找到。"
+            "商品单价保持为空。"
+        )
+
+        return {
+            "prices": prices,
+            "warnings": warnings,
+        }
+
+    header_row, product_name_col, price_col = header_result
+
+    # parsed_orders 中：
+    # 商品A
+    # 商品A__2
+    #
+    # 查 sheet1 时都使用 商品A。
+    target_map: dict[str, list[str]] = {}
+
+    for product_name in product_names:
+        original_name = _get_original_product_name(
+            product_name
+        )
+
+        target_map.setdefault(
+            original_name,
+            [],
+        ).append(product_name)
+
+    unresolved = set(target_map.keys())
+
+    empty_price_products: list[str] = []
+
+    for row_idx in range(
+        header_row + 1,
+        ws.max_row + 1,
+    ):
+        sheet_product_name = _to_text(
+            _get_cell_value(
+                ws=ws,
+                row=row_idx,
+                col=product_name_col,
+                merged_value_map=merged_value_map,
+            )
+        )
+
+        if not sheet_product_name:
+            continue
+
+        if sheet_product_name not in unresolved:
+            continue
+
+        # 第一次找到该商品就读取价格。
+        raw_price = _get_cell_value(
+            ws=ws,
+            row=row_idx,
+            col=price_col,
+            merged_value_map=merged_value_map,
+        )
+
+        price = _format_product_unit_price(
+            raw_price
+        )
+
+        for config_product_name in target_map[
+            sheet_product_name
+        ]:
+            prices[config_product_name] = price
+
+        # 即使价格为空，也视为该商品已经查完。
+        unresolved.remove(sheet_product_name)
+
+        if price == "":
+            empty_price_products.append(
+                sheet_product_name
+            )
+
+        # 全部商品已找到，不继续扫描剩余行。
+        if not unresolved:
+            break
+
+    wb.close()
+
+    if unresolved:
+        warnings.append(
+            "以下商品未在 sheet1 中找到对应单价："
+            + "、".join(sorted(unresolved))
+            + "。商品单价保持为空。"
+        )
+
+    if empty_price_products:
+        warnings.append(
+            "以下商品第一次出现时没有有效单价："
+            + "、".join(empty_price_products)
+            + "。商品单价保持为空。"
+        )
+
+    return {
+        "prices": prices,
+        "warnings": warnings,
+    }
+
+
 def _find_product_price_headers(
     ws: Worksheet,
     merged_value_map: dict[tuple[int, int], Any],

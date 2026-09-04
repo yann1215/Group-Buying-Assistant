@@ -26,7 +26,6 @@ from app.analysis.special_member import (
 )
 from app.analysis.share_calculator import calculate_share
 from app.analysis.share_config import (
-    sync_product_config_file,
     load_product_share_config_file,
     summarize_product_share_config,
     update_product_share_config_file,

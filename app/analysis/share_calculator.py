@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass, field
-from datetime import datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
@@ -14,6 +13,9 @@ from app.analysis.order_validator import (
     default_include_share,
     find_orders_with_only_non_share_products,
     format_only_non_share_orders_message,
+)
+from app.analysis.share_config import (
+    make_share_type,
 )
 
 ORDER_METADATA_COLUMNS = {"单号", "昵称", "总金额"}
@@ -95,8 +97,7 @@ def calculate_share(
         independent / 独立
 
     product_configs:
-        商品配置数组，长度最多 20。
-        可以先不传，不传时自动根据商品名称生成默认配置。
+        商品配置数组
 
     计算金额规则：
         每个人每项应收金额向上取整到 0.01 元。
@@ -476,12 +477,9 @@ def build_product_configs(
                 product_name=product_name,
             )
 
-            share_type = str(
-                supplied.get("均摊类型") or make_share_type(global_share_mode, calculation_scope)
-            ).strip()
-
+            share_type = make_share_type(global_share_mode, calculation_scope)
             product_share_amount = optional_money_to_decimal_allow_zero(supplied.get("商品均摊"))
-            unit_share_price = optional_money_to_decimal_allow_zero(supplied.get("单份均摊"))
+            unit_share_price = None
             product_unit_price = optional_money_to_decimal_allow_zero(supplied.get("商品单价"))
             product_total_price = optional_money_to_decimal_allow_zero(supplied.get("商品大货总价"))
 
@@ -660,6 +658,13 @@ def calculate_flat_share(
     per_person_cents = ceil_yuan_decimal_to_cents(
         per_person_amount
     )
+    unit_share_price = (
+            Decimal(per_person_cents)
+            / Decimal("100")
+    )
+
+    for cfg in configs:
+        cfg.unit_share_price = unit_share_price
 
     for row in order_rows:
         weight = weights.get(row.order_no, 0)
@@ -899,10 +904,6 @@ def is_special_non_quantity_product(product_name: str) -> bool:
     return special_flag
 
 
-def make_share_type(global_share_mode: str, calculation_scope: str) -> str:
-    return f"{global_share_mode}_{calculation_scope}"
-
-
 def normalize_share_mode(value: str) -> str:
     value = str(value or "").strip().lower()
 
@@ -927,23 +928,30 @@ def normalize_calculation_scope(value: str) -> str:
     raise ShareCalculateError(f"无法识别计算方式：{value}")
 
 
-def normalize_share_type(value: str) -> str:
-    value = str(value or "").strip().lower()
+def normalize_share_type(
+    value: str,
+) -> str:
+    value = str(value or "").strip()
 
     mapping = {
+        # 新版正式名称
+        "拉通人头摊": "head_flat",
+        "拉通个数摊": "quantity_flat",
+        "独立人头摊": "head_independent",
+        "独立个数摊": "quantity_independent",
+
+        # 旧版兼容
         "head_flat": "head_flat",
+        "quantity_flat": "quantity_flat",
+        "head_independent": "head_independent",
+        "quantity_independent": "quantity_independent",
+
         "人头摊-拉通": "head_flat",
         "人头拉通": "head_flat",
-
-        "quantity_flat": "quantity_flat",
         "个数摊-拉通": "quantity_flat",
         "个数拉通": "quantity_flat",
-
-        "head_independent": "head_independent",
         "人头摊-独立": "head_independent",
         "人头独立": "head_independent",
-
-        "quantity_independent": "quantity_independent",
         "个数摊-独立": "quantity_independent",
         "个数独立": "quantity_independent",
     }
@@ -951,7 +959,9 @@ def normalize_share_type(value: str) -> str:
     if value in mapping:
         return mapping[value]
 
-    raise ShareCalculateError(f"无法识别商品均摊类型：{value}")
+    raise ShareCalculateError(
+        f"无法识别商品均摊类型：{value}"
+    )
 
 
 def amount_to_decimal(value: int | float | str) -> Decimal:
