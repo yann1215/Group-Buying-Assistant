@@ -14,7 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from decimal import Decimal
 
+from app.analysis.order_parser import parse_order_file
 from app.analysis.special_member import (
     SpecialMemberError,
     update_special_member_cache,
@@ -26,9 +28,13 @@ from app.analysis.special_member import (
 )
 from app.analysis.share_calculator import calculate_share
 from app.analysis.share_config import (
+    ensure_product_config_file,
     load_product_share_config_file,
     summarize_product_share_config,
     update_product_share_config_file,
+    update_product_config_before_share,
+    update_product_config_after_share,
+    update_product_config_before_bulk,
 )
 from app.analysis.bulk_calculator import (
     create_bulk_receivable_orders,
@@ -49,6 +55,71 @@ def emit_progress(
 ) -> None:
     if callback is not None:
         callback(message)
+
+
+def build_bulk_product_price_preview(
+    product_configs: list[dict[str, Any]] | None,
+) -> tuple[list[str], bool]:
+    """
+    生成大货确认阶段的商品单价展示。
+
+    不展示：
+        - 商品名称以“专拍”结尾
+        - 单价为空
+        - 单价 <= 0
+
+    返回：
+        price_lines
+        all_prices_below_8
+    """
+    lines: list[str] = []
+    valid_prices: list[Decimal] = []
+
+    for item in product_configs or []:
+        product_name = str(
+            item.get("商品名称") or ""
+        ).strip()
+
+        if not product_name:
+            continue
+
+        if product_name.endswith("专拍"):
+            continue
+
+        price_text = str(
+            item.get("商品单价") or ""
+        ).strip()
+
+        if not price_text:
+            continue
+
+        try:
+            price = Decimal(price_text)
+        except Exception:
+            continue
+
+        if price <= 0:
+            continue
+
+        lines.append(
+            f"- {product_name}：{price:.2f} 元"
+        )
+
+        valid_prices.append(price)
+
+    all_prices_below_8 = (
+        bool(valid_prices)
+        and all(
+            price < Decimal("8")
+            for price in valid_prices
+        )
+    )
+
+    return (
+        lines,
+        all_prices_below_8,
+    )
+
 
 @dataclass
 class ShareRequestState:
@@ -329,31 +400,44 @@ class ToolOrchestrator:
             ctx.order_output_dir = str(DEFAULT_ORDER_OUTPUT_DIR)
 
     def update_share_request_from_intent(
-        self,
-        ctx: SessionToolContext,
-        intent: dict[str, Any],
+            self,
+            ctx: SessionToolContext,
+            intent: dict[str, Any],
     ) -> None:
         """
-        从用户当前这句话中更新均摊参数槽位。
-        只更新非空字段，所以“最新明确输入的信息”会覆盖旧信息。
+        从用户当前输入中更新均摊参数。
+
+        当均摊方式或计算方式变化时，
+        原有商品配置确认状态失效。
         """
         req = ctx.share_request
 
-        if intent.get("share_mode"):
-            req.share_mode = intent["share_mode"]
+        new_share_mode = intent.get("share_mode")
+
+        if new_share_mode:
+            if new_share_mode != req.share_mode:
+                req.pending_config_confirmation = False
+                req.config_confirmed = False
+
+            req.share_mode = new_share_mode
 
         new_scope = intent.get("calculation_scope")
 
         if new_scope:
             if new_scope != req.calculation_scope:
-                # 切换拉通/独立模式后，旧的独立配置确认状态不再有效
                 req.pending_config_confirmation = False
                 req.config_confirmed = False
 
             req.calculation_scope = new_scope
 
-        if intent.get("amount"):
-            req.amount = intent["amount"]
+        new_amount = intent.get("amount")
+
+        if new_amount:
+            if new_amount != req.amount:
+                # 总均摊变化后，旧确认结果失效。
+                req.config_confirmed = False
+
+            req.amount = new_amount
 
         if intent.get("force"):
             req.force = True
@@ -377,7 +461,7 @@ class ToolOrchestrator:
         # 才把“是”“没问题”等识别成大货确认。
         if ctx.bulk_request.pending_confirmation:
             if has_affirmative_words(user_text):
-                return self.handle_confirm_bulk_goods(ctx)
+                return self.handle_confirm_bulk_goods(ctx,progress_callback=progress_callback)
 
             if has_negative_words(user_text):
                 ctx.bulk_request.pending_confirmation = False
@@ -587,82 +671,115 @@ class ToolOrchestrator:
                 "例如：订单：订单.xlsx"
             )
 
-        # 1. 检查群成员与新订单
-        check_result = self.ensure_member_checked(
-            ctx,
-            force=True,
+        # ---------------------------------
+        # 1. 这里只解析订单，不检查微信群成员
+        # ---------------------------------
+
+        parsed_order_file = parse_order_file(
+            order_input=ctx.new_order_file,
+            output_dir=ctx.order_output_dir,
         )
 
-        if not check_result.get("ok"):
-            return format_member_check_result(check_result)
+        ctx.parsed_order_file = parsed_order_file
 
-        blocking_issues = get_blocking_member_issues(
-            check_result
+        # ---------------------------------
+        # 2. 同步基础商品配置
+        # ---------------------------------
+
+        ctx.share_config_file = ensure_product_config_file(
+            parsed_order_file=parsed_order_file,
+            output_dir=ctx.order_output_dir,
         )
 
-        if blocking_issues:
-            return (
-                    "大货计算前发现群成员与订单不一致，"
-                    "暂不继续。\n\n"
-                    + format_member_check_result(check_result)
-                    + "\n\n请修正群昵称序号或订单后，"
-                      "重新输入“查大货”。"
+        # ---------------------------------
+        # 3. 大货阶段只更新：
+        #    商品单价
+        #    商品大货总价
+        # ---------------------------------
+
+        bulk_config_result = (
+            update_product_config_before_bulk(
+                config_file=ctx.share_config_file,
+                original_order_file=ctx.new_order_file,
             )
-
-        parsed_order_file = (
-                check_result.get("parsed_order_file")
-                or ctx.parsed_order_file
         )
 
-        if not parsed_order_file:
-            return "没有找到订单的简化文件。"
-
-        # 2. 检查订单是否只有不参摊商品
-        abnormal_orders = find_only_non_share_orders(
-            parsed_order_file
-        )
-
-        if abnormal_orders:
-            lines = [
-                "发现订单异常：以下订单只包含不参摊商品，"
-                "暂不继续计算。",
-                "",
-            ]
-
-            for item in abnormal_orders:
-                products = "、".join(item.get("商品") or [])
-                lines.append(
-                    f"- 单号 {item.get('单号')}｜"
-                    f"{item.get('昵称')}｜"
-                    f"商品：{products}"
-                )
-
-            lines.extend(
-                [
-                    "",
-                    "请检查这些订单是否漏拍了参摊商品，"
-                    "或商品参摊规则是否设置正确。",
-                ]
+        ctx.product_configs = (
+            load_product_share_config_file(
+                ctx.share_config_file
             )
+        )
 
-            return "\n".join(lines)
+        price_lines, all_prices_below_8 = (
+            build_bulk_product_price_preview(
+                ctx.product_configs
+            )
+        )
 
-        # 3. 所有自动检查通过，进入人工确认
+        # ---------------------------------
+        # 4. 进入等待人工确认状态
+        # ---------------------------------
+
         ctx.bulk_request.pending_confirmation = True
         ctx.bulk_request.confirmed = False
 
-        return (
-            "群成员与订单核对完成，订单合规检查通过。\n\n"
-            "在生成大货应收结果前，请再次确认：\n"
-            "1. 订单内商品价格是否准确？是否有满百减一等单价变化？\n"
-            "2. 漏收、补收的均摊是否已经计入订单金额？\n"
-            "3. 订单信息是否已经全部同步？商品单价与订单应收金额是否一致？\n\n"
-            "以上内容全部确认无误后，请回复“是”。"
+        lines = [
+            "大货计算前请确认以下信息。",
+            "",
+            "当前商品单价：",
+        ]
+
+        if price_lines:
+            lines.extend(price_lines)
+        else:
+            lines.append(
+                "- 没有读取到可展示的商品单价"
+            )
+
+        warnings = (
+                bulk_config_result.get("warnings")
+                or []
         )
+
+        if warnings:
+            lines.append("")
+            lines.append("商品单价读取提示：")
+
+            for warning in warnings:
+                lines.append(
+                    f"- {warning}"
+                )
+
+        if all_prices_below_8:
+            lines.extend(
+                [
+                    "",
+                    "注意：当前所有可识别的大货商品单价"
+                    "都低于 8 元。",
+                    "请确认订单中的金额是否可能是均摊金额，"
+                    "而不是实际大货单价。",
+                ]
+            )
+
+        lines.extend(
+            [
+                "",
+                "请再次确认：",
+                "1. 商品单价是否与实际大货单价一致？",
+                "2. 是否有满百减一等价格变化？",
+                "3. 漏收、补收的均摊是否已经处理？",
+                "4. 当前订单是否已经全部同步？",
+                "",
+                "以上内容全部确认无误后，请回复“是”。",
+            ]
+        )
+
+        return "\n".join(lines)
 
     def handle_confirm_bulk_goods(
             self,
             ctx: SessionToolContext,
+            progress_callback: Callable[[str], None] | None = None,
     ) -> str:
         if not ctx.bulk_request.pending_confirmation:
             return "当前没有等待确认的大货计算。"
@@ -672,6 +789,7 @@ class ToolOrchestrator:
         check_result = self.ensure_member_checked(
             ctx,
             force=True,
+            progress_callback=progress_callback,
         )
 
         if not check_result.get("ok"):
@@ -700,6 +818,20 @@ class ToolOrchestrator:
             ctx.bulk_request.pending_confirmation = False
             return "没有找到订单的简化文件。"
 
+        ctx.share_config_file = ensure_product_config_file(
+            parsed_order_file=parsed_order_file,
+            output_dir=ctx.order_output_dir,
+        )
+        bulk_config_result = update_product_config_before_bulk(
+            config_file=ctx.share_config_file,
+            original_order_file=ctx.new_order_file,
+        )
+        ctx.product_configs = (
+            load_product_share_config_file(
+                ctx.share_config_file
+            )
+        )
+
         abnormal_orders = find_only_non_share_orders(
             parsed_order_file
         )
@@ -717,6 +849,11 @@ class ToolOrchestrator:
                 "本次大货计算已停止。\n"
                 f"只有不参摊商品的订单号：{order_numbers}"
             )
+
+        emit_progress(
+            progress_callback,
+            "正在计算大货……",
+        )
 
         result = create_bulk_receivable_orders(
             parsed_order_file=parsed_order_file,
@@ -737,25 +874,24 @@ class ToolOrchestrator:
 
         return "\n".join(lines)
 
-
     def ensure_share_config_loaded(
-        self,
-        ctx: SessionToolContext,
-        parsed_order_file: str,
+            self,
+            ctx: SessionToolContext,
+            parsed_order_file: str,
     ) -> None:
         """
-        确保当前会话已经有商品均摊配置表，并读取成 product_configs。
+        确保当前商品配置文件存在，并同步基础商品信息。
 
-        说明：
-            - 如果还没有配置表，则根据简化订单表生成配置表。
-            - 每次计算前都重新读取配置表，方便用户手动编辑 CSV 后重新计算。
+        每次调用都会：
+            1. 根据当前 parsed_orders 同步商品序号、名称、数量；
+            2. 新商品初始化“计入均摊”；
+            3. 保留已有阶段字段；
+            4. 重新读取配置到 ctx.product_configs。
         """
-        if not ctx.share_config_file:
-            ctx.share_config_file = sync_product_config_file(
-                parsed_order_file=parsed_order_file,
-                output_dir=ctx.order_output_dir,
-                overwrite=True,
-            )
+        ctx.share_config_file = ensure_product_config_file(
+            parsed_order_file=parsed_order_file,
+            output_dir=ctx.order_output_dir,
+        )
 
         ctx.product_configs = load_product_share_config_file(
             ctx.share_config_file
@@ -828,6 +964,36 @@ class ToolOrchestrator:
                 "确认无误后请输入：确认计算"
             )
 
+        # ---------------------------------
+        # 正式计算前更新商品均摊配置
+        # ---------------------------------
+
+        # 拉通模式必须写入：
+        #     均摊类型
+        #     商品均摊 = 总均摊
+        #
+        # 独立模式如果尚未确认，则同步本次均摊类型。
+        #
+        # 独立模式确认后这里不重复更新，
+        # 因为 handle_update_share_config() 已经完成过阶段更新。
+        if (
+                calculation_scope == "flat"
+                or not req.config_confirmed
+        ):
+            update_product_config_before_share(
+                config_file=ctx.share_config_file,
+                share_mode=req.share_mode,
+                calculation_scope=calculation_scope,
+                total_amount=req.amount,
+            )
+
+            # 配置文件发生变化后重新读取
+            ctx.product_configs = (
+                load_product_share_config_file(
+                    ctx.share_config_file
+                )
+            )
+
         # 所有前置检查通过，真正开始计算
         emit_progress(
             progress_callback,
@@ -846,8 +1012,38 @@ class ToolOrchestrator:
             ),
         )
 
-        if not result.get("ok") and result.get("need_user_input"):
-            return format_share_need_user_input(result)
+        if not result.get("ok"):
+            if result.get("need_user_input"):
+                return format_share_need_user_input(
+                    result
+                )
+
+            return str(
+                result.get("message")
+                or "均摊计算失败。"
+            )
+
+        # ---------------------------------
+        # 均摊成功后，只更新“单份均摊”
+        # ---------------------------------
+
+        update_product_config_after_share(
+            config_file=ctx.share_config_file,
+            calculated_configs=(
+                    result.get("product_configs")
+                    or []
+            ),
+        )
+
+        # 保存最新配置到会话
+        ctx.product_configs = (
+            load_product_share_config_file(
+                ctx.share_config_file
+            )
+        )
+
+        # 让 result 里的配置也与最终文件一致
+        result["product_configs"] = ctx.product_configs
 
         return format_share_result(
             result=result,
@@ -897,12 +1093,17 @@ class ToolOrchestrator:
 
         self.ensure_share_config_loaded(ctx, parsed_order_file)
 
-        share_type = f"{req.share_mode}_independent"
-
         update_result = update_product_share_config_file(
             config_file=ctx.share_config_file,
             updates=intent.get("product_share_amounts") or [],
-            share_type=share_type,
+        )
+        # 独立均摊配置阶段：
+        # 只同步本次均摊类型，不覆盖各商品均摊。
+        update_product_config_before_share(
+            config_file=ctx.share_config_file,
+            share_mode=req.share_mode,
+            calculation_scope="independent",
+            total_amount=req.amount,
         )
 
         ctx.product_configs = load_product_share_config_file(ctx.share_config_file)
