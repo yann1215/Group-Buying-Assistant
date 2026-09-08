@@ -64,7 +64,6 @@ def parse_group_member_orders(
     # 1. 获取群成员
     member_result = get_wechat_group_members(
         group_name=group_name,
-        allow_manual_key_input=True,
         key_input_func=key_input_func,
     )
 

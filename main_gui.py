@@ -47,12 +47,37 @@ def get_runtime_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+from app.core.chat_service import ChatService
+from app.database.db import init_db
+from integrations.wechatmsg_lite_client import (
+    ensure_wechat_database_key,
+)
+
+
 # 让“./orders/xxx.xlsx”等相对路径始终相对于项目根目录或 exe 所在目录。
 RUNTIME_DIR = get_runtime_dir()
 os.chdir(RUNTIME_DIR)
 
-from app.core.chat_service import ChatService
-from app.database.db import init_db
+
+def show_key_input_dialog(
+    prompt: str,
+) -> str:
+
+    text, accepted = QInputDialog.getText(
+        None,
+        "输入微信数据库 Key",
+        (
+            f"{prompt}\n\n"
+            "请输入 64 位十六进制"
+            "数据库 Key。"
+        ),
+        QLineEdit.Normal,
+    )
+
+    if not accepted:
+        return "quit"
+
+    return text.strip()
 
 
 @dataclass
@@ -96,27 +121,19 @@ class GuiKeyInputBridge(QObject):
         return request.value
 
     @Slot(object)
-    def _show_key_dialog(self, request: KeyInputRequest) -> None:
+    def _show_key_dialog(
+            self,
+            request: KeyInputRequest,
+    ) -> None:
+
         try:
-            text, accepted = QInputDialog.getText(
-                None,
-                "输入微信数据库 Key",
-                (
-                    f"{request.prompt}\n\n"
-                    "请输入64位十六进制数据库 Key。\n"
-                    "也可以输入 auto 重新自动识别。"
-                ),
-                QLineEdit.Normal,
+            request.value = (
+                show_key_input_dialog(
+                    request.prompt
+                )
             )
 
-            if accepted:
-                request.value = text.strip()
-            else:
-                # 用户点击取消时，模拟输入 quit
-                request.value = "quit"
-
         finally:
-            # 无论正常输入还是异常，都必须解除工作线程等待
             request.finished.set()
 
 
@@ -702,6 +719,28 @@ def main() -> int:
     app.setStyle("Fusion")
 
     try:
+        key_result = (
+            ensure_wechat_database_key(
+                decrypt_output_root=str(
+                    RUNTIME_DIR / "temp"
+                ),
+                key_input_func=(
+                    show_key_input_dialog
+                ),
+            )
+        )
+
+        if not key_result.get("ok"):
+            QMessageBox.warning(
+                None,
+                "微信数据库 Key 未设置",
+                (
+                        key_result.get("message")
+                        or "没有获得有效数据库 Key"
+                ),
+            )
+            return 0
+
         init_db()
 
         key_input_bridge = GuiKeyInputBridge()

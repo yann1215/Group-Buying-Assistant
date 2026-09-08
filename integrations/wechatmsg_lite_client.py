@@ -49,6 +49,32 @@ def _ensure_wechatmsg_lite_path() -> None:
         sys.path.insert(0, root_str)
 
 
+def ensure_wechat_database_key(
+    db_version: int = 4,
+    source_dir: str | None = None,
+    decrypt_output_root: str = (
+        f"{PROJECT_ROOT}/temp"
+    ),
+    key_input_func: Callable[
+        [str],
+        str,
+    ] | None = None,
+) -> dict[str, Any]:
+
+    _ensure_wechatmsg_lite_path()
+
+    from wxManager.decrypt_runner import (
+        ensure_decrypt_key,
+    )
+
+    return ensure_decrypt_key(
+        db_version=db_version,
+        source_dir=source_dir,
+        output_root=decrypt_output_root,
+        key_input_func=key_input_func,
+    )
+
+
 def get_wechat_group_members(
     group_name: str,
     db_dir: str | None = None,
@@ -59,8 +85,6 @@ def get_wechat_group_members(
     use_cache_db: bool = False,
     use_cache_key: bool = True,
     force_decrypt: bool = True,
-    force_find_key: bool = False,
-    allow_manual_key_input: bool = True,
     key_input_func: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     """
@@ -86,8 +110,6 @@ def get_wechat_group_members(
         use_cache_db=use_cache_db,
         use_cache_key=use_cache_key,
         force_decrypt=force_decrypt,
-        force_find_key=force_find_key,
-        allow_manual_key_input=allow_manual_key_input,
         key_input_func=key_input_func,
     )
 
@@ -107,8 +129,6 @@ def get_wechat_group_messages(
     use_cache_db: bool = False,
     use_cache_key: bool = True,
     force_decrypt: bool = True,
-    force_find_key: bool = False,
-    allow_manual_key_input: bool = True,
     key_input_func: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     """
@@ -139,7 +159,5 @@ def get_wechat_group_messages(
         use_cache_db=use_cache_db,
         use_cache_key=use_cache_key,
         force_decrypt=force_decrypt,
-        force_find_key=force_find_key,
-        allow_manual_key_input=allow_manual_key_input,
         key_input_func=key_input_func,
     )
