@@ -530,10 +530,18 @@ class ToolOrchestrator:
     ) -> str | None:
 
         intent = parse_user_intent(user_text)
+
+        print("\n=== TOOL DEBUG ===")
+        print("tool_orchestrator:", __file__)
+        print("user_text:", repr(user_text))
+        print("intent:", intent)
+
         ctx = self.contexts.setdefault(
             session_id,
             SessionToolContext(),
         )
+
+        print("share_request BEFORE:", ctx.share_request)
 
         self.update_context_from_intent(ctx, intent)
 
@@ -576,6 +584,10 @@ class ToolOrchestrator:
 
         if intent["intent"] == "calculate_share":
             self.update_share_request_from_intent(ctx, intent)
+
+            print("ENTER: calculate_share")
+            print("share_request AFTER:", ctx.share_request)
+
             return self.handle_calculate_share(
                 ctx,
                 intent,
@@ -584,6 +596,9 @@ class ToolOrchestrator:
 
         if intent["intent"] == "update_share_config":
             self.update_share_request_from_intent(ctx, intent)
+
+            print("ENTER: update_share_config")
+
             return self.handle_update_share_config(ctx, intent)
 
         if intent["intent"] == "confirm_share_config":
@@ -698,15 +713,32 @@ class ToolOrchestrator:
         )
 
         if resolved_special_members is not None:
-            ctx.special_members = (
-                resolved_special_members
-            )
+            ctx.special_members = resolved_special_members
 
         ctx.member_checked = True
         ctx.member_check_result = result
+
         ctx.parsed_order_file = result.get(
             "parsed_order_file"
         )
+
+        # 查成员阶段已经同步过商品配置，
+        # 直接保存到当前会话，避免后续均摊/大货重复读取。
+        share_config_file = result.get(
+            "share_config_file"
+        )
+
+        if share_config_file:
+            ctx.share_config_file = str(
+                share_config_file
+            )
+
+        product_configs = result.get(
+            "product_configs"
+        )
+
+        if product_configs is not None:
+            ctx.product_configs = product_configs
 
         return result
 
@@ -1267,10 +1299,11 @@ def format_special_members(
 
     role_order = {
         "车主": 0,
-        "画师": 1,
-        "章稿画师": 2,
-        "供稿人": 3,
-        "工具人": 4,
+        "工具人": 1,
+        "供稿人": 2,
+        "画师": 3,
+        "章稿画师": 4,
+        "其他不参摊成员": 5,
     }
 
     sorted_members = sorted(
@@ -1338,6 +1371,7 @@ def format_non_share_special_member_note(
         "供稿人": 2,
         "画师": 3,
         "章稿画师": 4,
+        "其他不参摊成员": 5,
     }
 
     sorted_members = sorted(
@@ -1412,6 +1446,10 @@ def get_blocking_member_issues(result: dict[str, Any]) -> list[str]:
     if result.get("serials_in_orders_not_in_group"):
         issues.append("订单里有、但是群昵称没有的序号")
 
+    only_non_share_orders = (result.get("only_non_share_orders") or [])
+    if only_non_share_orders:
+        issues.append("存在只购买不参摊商品的订单")
+
     return issues
 
 
@@ -1440,9 +1478,7 @@ def format_member_check_result(
         if current_members:
             lines.append("")
             lines.append(
-                format_special_members(
-                    current_members
-                )
+                format_special_members(current_members)
             )
 
         lines.append("")
@@ -1470,36 +1506,83 @@ def format_member_check_result(
     if share_config_file:
         lines.append(f"商品均摊配置表：{share_config_file}")
 
-    members_without_serial = result.get("members_without_serial") or []
-    duplicate_member_serials = result.get("duplicate_member_serials") or []
-    serials_in_group_not_in_orders = result.get("serials_in_group_not_in_orders") or []
-    serials_in_orders_not_in_group = result.get("serials_in_orders_not_in_group") or []
+    auto_added_members = result.get("auto_added_special_members") or []
+    if auto_added_members:
+        lines.append("")
+        lines.append(
+            "检测到未录入身份的特殊成员，"
+            "已自动加入“其他不参摊成员”："
+        )
 
-    lines.append("")
-    lines.append(f"群昵称前没有数字的成员数量：{len(members_without_serial)}")
+        for member in auto_added_members:
+            order_no = str(member.get("单号") or "").strip()
+            nickname = str(member.get("昵称") or "").strip()
+            display_name = (nickname or "未识别昵称")
+
+            if order_no:
+                lines.append(f"- {order_no}｜{display_name}")
+            else:
+                lines.append(f"- {display_name}")
+
+    members_without_serial = result.get("members_without_serial") or []
     if members_without_serial:
+        lines.append("")
+        lines.append(f"群昵称前没有数字的成员数量：{len(members_without_serial)}")
         for member in members_without_serial:
             lines.append(f"- {member.get('群昵称') or member.get('昵称') or member.get('wxid')}")
 
-    lines.append("")
-    lines.append(f"群昵称中重复标注的序号数量：{len(duplicate_member_serials)}")
+    duplicate_member_serials = result.get("duplicate_member_serials") or []
     if duplicate_member_serials:
+        lines.append("")
+        lines.append(f"群昵称中重复标注的序号数量：{len(duplicate_member_serials)}")
         for item in duplicate_member_serials:
             serial = item.get("序号")
             members = item.get("members") or []
-            names = "、".join(
+            names = "，".join(
                 str(m.get("群昵称") or m.get("昵称") or m.get("wxid"))
                 for m in members
             )
             lines.append(f"- 序号 {serial}：{names}")
 
-    lines.append("")
-    lines.append("群昵称有、但是订单没有的序号：")
-    lines.append(str(serials_in_group_not_in_orders))
+    serials_in_group_not_in_orders = result.get("serials_in_group_not_in_orders") or []
+    if serials_in_group_not_in_orders:
+        lines.append("")
+        lines.append("群昵称有、但是订单没有的序号：")
+        lines.append("，".join(serials_in_group_not_in_orders))
 
-    lines.append("")
-    lines.append("订单里有、但是群昵称没有的序号：")
-    lines.append(str(serials_in_orders_not_in_group))
+    serials_in_orders_not_in_group = result.get("serials_in_orders_not_in_group") or []
+    if serials_in_orders_not_in_group:
+        lines.append("")
+        lines.append("订单里有、但是群昵称没有的序号：")
+        lines.append("，".join(serials_in_orders_not_in_group))
+
+    only_non_share_orders = result.get("only_non_share_orders") or []
+    if only_non_share_orders:
+        lines.append("")
+        lines.append(
+            "以下成员只含有不参摊商品，"
+            "请检查订单是否异常："
+        )
+
+        for order in only_non_share_orders:
+            order_no = str(order.get("单号") or "").strip()
+            nickname = str(order.get("昵称") or "").strip()
+            product_parts = []
+
+            for product in (order.get("不参摊商品") or []):
+                product_name = str(product.get("商品名称") or "").strip()
+                quantity = product.get("数量")
+                if not product_name:
+                    continue
+
+                product_parts.append(f"{product_name} × {quantity}")
+
+            member_text = "｜".join(part for part in (order_no, nickname) if part)
+            product_text = "，".join(product_parts)
+            if product_text:
+                lines.append(f"- {member_text}｜{product_text}")
+            else:
+                lines.append(f"- {member_text}")
 
     return "\n".join(lines)
 

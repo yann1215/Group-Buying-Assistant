@@ -11,6 +11,57 @@ from app.analysis.special_parser import (
 )
 
 
+# ----------------------------------------------------------------------
+# 均摊命令表达式
+# ----------------------------------------------------------------------
+
+# 统一描述“均摊方式 + 拉通/独立”的表达形式。
+#
+# 支持例如：
+#   个数摊
+#   人头摊
+#   按个数
+#   按人头
+#   个数拉通
+#   人头拉通
+#   按个数拉通
+#   拉通个数
+#   拉通人头
+#   拉通个数摊
+#   拉通人头摊
+#   个数拉通摊
+#   人头拉通摊
+#   个数独立
+#   独立个数
+#   独立个数摊
+#
+# 注意：全部使用非捕获组 (?:...)
+# 避免影响调用处的 match.group(1)。
+SHARE_COMMAND_PATTERN = (
+    r"(?:"
+    # 个数摊 / 人头摊
+    r"(?:人头|个数|数量|件数)摊"
+    r"|"
+
+    # 按个数 / 按人头
+    r"按(?:人头|个数|数量|件数)"
+    r"|"
+
+    # 个数拉通 / 按个数拉通 / 个数独立
+    # 以及末尾可带“摊”
+    r"(?:按)?(?:人头|个数|数量|件数)"
+    r"(?:拉通|独立)"
+    r"(?:摊)?"
+    r"|"
+
+    # 拉通个数 / 独立个数
+    # 以及：拉通个数摊 / 独立个数摊
+    r"(?:拉通|独立)"
+    r"(?:人头|个数|数量|件数)"
+    r"(?:摊)?"
+    r")"
+)
+
 # 不允许被识别成商品名称的字段词
 RESERVED_PRODUCT_NAMES = {
     "金额",
@@ -35,14 +86,22 @@ RESERVED_PRODUCT_NAMES = {
     "保存目录",
     "结果目录",
     "人头",
-    "个数",
-    "数量",
-    "件数",
-    "商品数",
+    "拉通人头",
+    "人头拉通",
+    "独立人头",
+    "人头独立",
     "按人头",
+    "个数",
+    "拉通个数",
+    "个数拉通",
+    "独立个数",
+    "个数独立",
     "按个数",
     "按数量",
     "按件数",
+    "数量",
+    "件数",
+    "商品数",
 }
 
 
@@ -525,49 +584,44 @@ def parse_amount(
     #
     # 例如：
     # 个数摊 517
-    # 拉通个数：517
-    # 按个数拉通，517
-    # 人头摊为300
-    share_mode_amount_patterns = [
-        (
-            r"(?:"
-            r"按个数拉通|按数量拉通|按件数拉通|"
-            r"拉通个数|拉通数量|拉通件数|"
-            r"个数拉通|数量拉通|件数拉通|"
-            r"个数摊|数量摊|件数摊|按个数|按数量|按件数|"
-            r"按人头拉通|拉通人头|人头拉通|"
-            r"人头摊|按人头"
-            r")"
-            r"\s*(?:是|为|=|：|:|，|,)?\s*"
-            r"[￥¥]?\s*(\d+(?:\.\d{1,4})?)"
-            r"\s*(?:元)?"
-        ),
-    ]
+    # 拉通个数 517
+    # 拉通个数摊 517
+    # 按个数拉通 517
+    # 独立个数摊 100
+    share_mode_amount_pattern = (
+            SHARE_COMMAND_PATTERN
+            + r"\s*(?:是|为|=|：|:|，|,)?\s*"
+            + r"[￥¥]?\s*"
+            + r"(\d+(?:\.\d{1,4})?)"
+            + r"\s*(?:元)?"
+    )
 
-    for pattern in share_mode_amount_patterns:
-        match = re.search(pattern, text)
-        if match:
-            return match.group(1)
+    match = re.search(
+        share_mode_amount_pattern,
+        text,
+    )
+
+    if match:
+        return match.group(1)
 
     # 4. 识别“裸金额 + 均摊模式”
     #
     # 例如：
     # 517个数摊
     # 300按人头拉通
+    # 100拉通个数摊
     amount_share_mode_pattern = (
-        r"(?<![\d.])(\d+(?:\.\d{1,4})?)"
-        r"\s*(?:元)?\s*"
-        r"(?:"
-        r"按个数拉通|按数量拉通|按件数拉通|"
-        r"拉通个数|拉通数量|拉通件数|"
-        r"个数拉通|数量拉通|件数拉通|"
-        r"个数摊|数量摊|件数摊|按个数|按数量|按件数|"
-        r"按人头拉通|拉通人头|人头拉通|"
-        r"人头摊|按人头"
-        r")"
+            r"(?<![\d.])"
+            r"(\d+(?:\.\d{1,4})?)"
+            r"\s*(?:元)?\s*"
+            + SHARE_COMMAND_PATTERN
     )
 
-    match = re.search(amount_share_mode_pattern, text)
+    match = re.search(
+        amount_share_mode_pattern,
+        text,
+    )
+
     if match:
         return match.group(1)
 
@@ -585,14 +639,15 @@ def is_global_share_amount_command(text: str) -> bool:
     """
     判断是否为“均摊模式 + 总均摊金额”。
 
-    应识别：
-    个数摊 100
-    人头摊300
-    拉通个数 517
-    个数拉通517
-    按个数拉通 517
-    独立个数 100
-    个数独立 100
+    例如：
+        个数摊 100
+        人头摊300
+        拉通个数 517
+        拉通个数摊 517
+        个数拉通517
+        按个数拉通 517
+        独立个数 100
+        独立个数摊 100
     """
     normalized = re.sub(
         r"\s+",
@@ -602,18 +657,6 @@ def is_global_share_amount_command(text: str) -> bool:
 
     if not normalized:
         return False
-
-    mode_pattern = (
-        r"(?:"
-        r"(?:人头|个数|数量|件数)摊"
-        r"|"
-        r"(?:按)?(?:人头|个数|数量|件数)"
-        r"(?:拉通|独立)?"
-        r"|"
-        r"(?:拉通|独立)"
-        r"(?:人头|个数|数量|件数)"
-        r")"
-    )
 
     amount_label_pattern = (
         r"(?:"
@@ -630,12 +673,11 @@ def is_global_share_amount_command(text: str) -> bool:
     )
 
     return re.fullmatch(
-        mode_pattern
+        SHARE_COMMAND_PATTERN
         + amount_label_pattern
         + amount_pattern,
         normalized,
     ) is not None
-
 
 def parse_product_share_amounts(text: str) -> list[dict[str, Any]]:
     """

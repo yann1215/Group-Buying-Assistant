@@ -20,6 +20,7 @@ from app.analysis.special_member import (
     add_auto_non_share_members,
     enrich_special_members,
     member_matches_special_member,
+    order_matches_special_member,
 )
 from app.analysis.share_config import (
     ensure_product_config_file,
@@ -175,16 +176,18 @@ def parse_group_member_orders(
         parsed_order_file=parsed_order_file,
         product_configs=product_configs,
     )
-
-    special_product_orders = (
-            order_status.get("special_product_orders")
-            or []
-    )
-
-    only_non_share_orders = (
-            order_status.get("only_non_share_orders")
-            or []
-    )
+    special_product_orders = (order_status.get("special_product_orders") or [])
+    only_non_share_orders = (order_status.get("only_non_share_orders") or [])
+    # 排除特殊成员“只购买普通不参摊商品”的异常订单提示
+    only_non_share_orders = [
+        order for order in only_non_share_orders if not any(
+            order_matches_special_member(
+                order_member=order,
+                special_member=special_member,
+            )
+            for special_member in resolved_special_members
+        )
+    ]
 
     # 9. 根据特殊商品自动补充未录入身份的特殊成员
     (
@@ -417,7 +420,7 @@ def sorted_serials(serials: set[str] | list[str]) -> list[str]:
 if __name__ == "__main__":
     result = parse_group_member_orders(
         group_name="临时喵喵",
-        order_input=r"miao4.xlsx",
+        order_input=r"D:\1_PychamProjects\Group-Buying-Assistant\orders\miao4.xlsx",
     )
 
     print("ok:", result["ok"])
@@ -426,24 +429,24 @@ if __name__ == "__main__":
     print("chatroom_wxid:", result["chatroom_wxid"])
     print("群成员数量:", result["member_count"])
 
-    print("\n群昵称前没有数字的成员：")
-    for member in result["members_without_serial"]:
-        print(member)
-
-    print("\n群昵称中重复标注的序号：")
-    for item in result["duplicate_member_serials"]:
-        print(f"序号 {item['序号']}：")
-        for member in item["members"]:
-            print("  ", member)
-
-    print("\n群昵称有、但是订单没有的序号：")
-    print(result["serials_in_group_not_in_orders"])
-
-    print("\n订单里有、但是群昵称没有的序号：")
-    print(result["serials_in_orders_not_in_group"])
-
-    print("\n简化后的订单文件：")
-    print(result["parsed_order_file"])
+    # print("\n群昵称前没有数字的成员：")
+    # for member in result["members_without_serial"]:
+    #     print(member)
+    #
+    # print("\n群昵称中重复标注的序号：")
+    # for item in result["duplicate_member_serials"]:
+    #     print(f"序号 {item['序号']}：")
+    #     for member in item["members"]:
+    #         print("  ", member)
+    #
+    # print("\n群昵称有、但是订单没有的序号：")
+    # print(result["serials_in_group_not_in_orders"])
+    #
+    # print("\n订单里有、但是群昵称没有的序号：")
+    # print(result["serials_in_orders_not_in_group"])
+    #
+    # print("\n简化后的订单文件：")
+    # print(result["parsed_order_file"])
 
     print("\n" + "=" * 80)
     print("订单状态检查结果")
