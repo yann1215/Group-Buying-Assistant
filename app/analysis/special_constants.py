@@ -1,9 +1,12 @@
+AUTO_NON_SHARE_ROLE = "其他不参摊成员"
+
 SPECIAL_MEMBER_ROLES = (
     "车主",
     "画师",
     "章稿画师",
     "供稿人",
     "工具人",
+    AUTO_NON_SHARE_ROLE,
 )
 
 SINGLE_PERSON_ROLES = frozenset(
@@ -15,9 +18,11 @@ SINGLE_PERSON_ROLES = frozenset(
     }
 )
 
+
 MULTI_PERSON_ROLES = frozenset(
     {
         "工具人",
+        AUTO_NON_SHARE_ROLE,
     }
 )
 
@@ -48,4 +53,9 @@ SPECIAL_MEMBER_ROLE_ALIASES = {
     "工具": "工具人",
     "助手": "工具人",
     "管理": "工具人",
+
+    "其他不参摊成员": AUTO_NON_SHARE_ROLE,
+    "其他不参摊": AUTO_NON_SHARE_ROLE,
+    "其他特殊成员": AUTO_NON_SHARE_ROLE,
+    "其他特殊": AUTO_NON_SHARE_ROLE,
 }

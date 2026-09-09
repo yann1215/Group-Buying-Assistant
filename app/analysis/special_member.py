@@ -5,6 +5,7 @@ from collections import Counter
 from typing import Any, Iterable
 
 from app.analysis.special_constants import (
+    AUTO_NON_SHARE_ROLE,
     MULTI_PERSON_ROLES,
     SINGLE_PERSON_ROLES,
     SPECIAL_MEMBER_ROLES,
@@ -204,6 +205,60 @@ def normalize_special_member(
     }
 
 
+def add_auto_non_share_members(
+    current_members: Iterable[dict[str, Any]] | None,
+    special_product_orders: Iterable[dict[str, Any]] | None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    result = [
+        normalize_special_member(
+            item,
+            default_include_share=True,
+        )
+        for item in (current_members or [])
+    ]
+
+    added_members = []
+
+    for order in special_product_orders or []:
+
+        # 已经属于任意特殊成员，则不新增
+        already_special = any(
+            order_matches_special_member(
+                order_member=order,
+                special_member=member,
+            )
+            for member in result
+        )
+
+        if already_special:
+            continue
+
+        new_member = {
+            "角色": AUTO_NON_SHARE_ROLE,
+            "昵称": normalize_text(
+                order.get("昵称")
+            ),
+            "群昵称": "",
+            "单号": normalize_serial(
+                order.get("单号")
+            ),
+            "参摊": False,
+        }
+
+        normalized = normalize_special_member(
+            new_member,
+            default_include_share=False,
+        )
+
+        result.append(normalized)
+        added_members.append(normalized.copy())
+
+    return result, added_members
+
+
 def has_member_identity(
     item: dict[str, Any],
 ) -> bool:
@@ -261,6 +316,15 @@ def update_special_member_cache(
             raw_update.get("_修改字段")
         )
 
+        # 先检查这是不是对自动成员的身份覆盖
+        promoted = _try_promote_auto_member(
+            members=result,
+            update=update,
+        )
+
+        if promoted:
+            continue
+
         role = update["角色"]
 
         if role in SINGLE_PERSON_ROLES:
@@ -293,6 +357,268 @@ def update_special_member_cache(
         )
 
     return result
+
+
+def _try_promote_auto_member(
+    *,
+    members: list[dict[str, Any]],
+    update: dict[str, Any],
+) -> bool:
+    """
+    尝试将“其他不参摊成员”转换为用户明确指定的特殊成员身份。
+
+    例如：
+
+        原记录：
+            其他不参摊成员｜昵称=annon｜群昵称=12 annon｜单号=12
+
+        用户输入：
+            12 画师
+
+        转换后：
+            画师｜昵称=annon｜群昵称=12 annon｜单号=12
+
+    返回：
+        True：
+            找到了对应的“其他不参摊成员”，并完成身份转换。
+
+        False：
+            本次输入不属于自动成员身份转换，
+            继续走原有特殊成员更新逻辑。
+    """
+
+    target_role = normalize_text(
+        update.get("角色")
+    )
+
+    # --------------------------------------------------
+    # 1. 目标本身就是“其他不参摊成员”
+    #    不属于身份升级。
+    # --------------------------------------------------
+
+    if target_role == AUTO_NON_SHARE_ROLE:
+        return False
+
+    # --------------------------------------------------
+    # 2. 明确的字段修改命令不属于身份升级
+    #
+    # 例如：
+    # 把画师A的昵称改为B
+    #
+    # 这种情况应该继续交给原来的
+    # _apply_explicit_member_edit() 处理。
+    # --------------------------------------------------
+
+    if normalize_text(
+        update.get("_修改字段")
+    ):
+        return False
+
+    # --------------------------------------------------
+    # 3. 本次必须提供至少一个身份信息
+    #
+    # 例如：
+    #   12 画师
+    #   麦乐鸡 画师
+    #   群昵称12麦乐鸡 画师
+    #
+    # 如果只是：
+    #   画师 不参摊
+    #
+    # 不应该尝试转换自动成员。
+    # --------------------------------------------------
+
+    if not has_member_identity(update):
+        return False
+
+    # --------------------------------------------------
+    # 4. 找出当前所有“其他不参摊成员”
+    # --------------------------------------------------
+
+    auto_indexes = [
+        index
+        for index, member in enumerate(members)
+        if normalize_text(
+            member.get("角色")
+        ) == AUTO_NON_SHARE_ROLE
+    ]
+
+    if not auto_indexes:
+        return False
+
+    # --------------------------------------------------
+    # 5. 第一阶段：精确匹配
+    #
+    # 单号 / 群昵称 / 昵称，只要本次输入提供了，
+    # 都检查。
+    #
+    # 如果不同字段分别匹配到不同的人，
+    # 说明输入存在冲突，不能自动判断。
+    # --------------------------------------------------
+
+    exact_matches: set[int] = set()
+
+    for field in IDENTITY_FIELDS:
+        expected_value = normalize_text(
+            update.get(field)
+        )
+
+        if not expected_value:
+            continue
+
+        if field == "单号":
+            expected_value = normalize_serial(
+                expected_value
+            )
+
+        for index in auto_indexes:
+            current_value = normalize_text(
+                members[index].get(field)
+            )
+
+            if field == "单号":
+                current_value = normalize_serial(
+                    current_value
+                )
+
+            if (
+                expected_value
+                and current_value
+                and expected_value == current_value
+            ):
+                exact_matches.add(index)
+
+    if len(exact_matches) > 1:
+        raise SpecialMemberError(
+            f"设置{target_role}时，提供的昵称、群昵称或单号"
+            "分别匹配到了多个“其他不参摊成员”，"
+            "请使用更明确的单号进行设置。"
+        )
+
+    target_index: int | None = None
+
+    if len(exact_matches) == 1:
+        target_index = next(
+            iter(exact_matches)
+        )
+
+    # --------------------------------------------------
+    # 6. 没有精确匹配时，再尝试昵称/群昵称模糊匹配
+    #
+    # 单号永远不进行模糊匹配。
+    # --------------------------------------------------
+
+    if target_index is None:
+        fuzzy_matches: set[int] = set()
+
+        for query_field in (
+            "群昵称",
+            "昵称",
+        ):
+            query = normalize_text(
+                update.get(query_field)
+            )
+
+            if not query:
+                continue
+
+            for index in auto_indexes:
+                member = members[index]
+
+                # 输入昵称时，同时允许去匹配：
+                # 昵称、群昵称
+                #
+                # 输入群昵称时也允许检查这两个字段，
+                # 方便“麦乐鸡”匹配“12 麦乐鸡”。
+                for candidate_field in (
+                    "昵称",
+                    "群昵称",
+                ):
+                    candidate = normalize_text(
+                        member.get(candidate_field)
+                    )
+
+                    if is_fuzzy_name_match(
+                        query,
+                        candidate,
+                    ):
+                        fuzzy_matches.add(index)
+                        break
+
+        if len(fuzzy_matches) > 1:
+            raise SpecialMemberError(
+                f"设置{target_role}时，"
+                "输入的信息模糊匹配到了多个"
+                "“其他不参摊成员”，"
+                "请使用单号明确指定成员。"
+            )
+
+        if len(fuzzy_matches) == 1:
+            target_index = next(
+                iter(fuzzy_matches)
+            )
+
+    # --------------------------------------------------
+    # 7. 没找到自动成员
+    #
+    # 返回 False，让原来的逻辑继续处理。
+    #
+    # 例如：
+    #   画师 Yann
+    #
+    # Yann 本来就不是自动成员，
+    # 那么还是按原来的画师新增/更新逻辑执行。
+    # --------------------------------------------------
+
+    if target_index is None:
+        return False
+
+    # --------------------------------------------------
+    # 8. 如果目标角色是单人角色，需要先检查
+    #    当前是否已经有另一个该角色。
+    #
+    # 例如：
+    # 已经存在画师A，
+    # 又试图把自动成员12升级为画师，
+    # 不能产生两个画师。
+    # --------------------------------------------------
+
+    if target_role in SINGLE_PERSON_ROLES:
+        existing_role_indexes = [
+            index
+            for index, member in enumerate(members)
+            if (
+                index != target_index
+                and normalize_text(
+                    member.get("角色")
+                ) == target_role
+            )
+        ]
+
+        if existing_role_indexes:
+            raise SpecialMemberError(
+                f"已存在一名{target_role}，"
+                f"{target_role}身份限制一人"
+            )
+
+    # --------------------------------------------------
+    # 9. 正式进行身份转换
+    # --------------------------------------------------
+
+    target = members[target_index]
+
+    # 只修改角色。
+    # 原来的完整昵称、群昵称、单号、参摊状态全部保留。
+    target["角色"] = target_role
+
+    # 本轮用户如果明确提供了新的身份信息，
+    # 再覆盖对应字段。
+    _merge_special_member(
+        target=target,
+        update=update,
+    )
+
+    return True
 
 
 def _update_single_person_role(

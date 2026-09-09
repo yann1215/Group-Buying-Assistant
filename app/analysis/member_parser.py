@@ -15,9 +15,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from integrations.wechatmsg_lite_client import get_wechat_group_members
 from app.analysis.order_parser import parse_order_file
+from app.analysis.order_validator import inspect_order_status
 from app.analysis.special_member import (
+    add_auto_non_share_members,
     enrich_special_members,
     member_matches_special_member,
+)
+from app.analysis.share_config import (
+    ensure_product_config_file,
+    load_product_share_config_file,
 )
 
 
@@ -144,13 +150,54 @@ def parse_group_member_orders(
     )
 
     # 5. 读取订单成员
-    order_members = read_order_members(
-        parsed_order_file
-    )
+    order_members = read_order_members(parsed_order_file)
 
     # 6. 补全特殊成员信息
+    # 必须先补全已有成员，再检查特殊商品。
+    # 否则一个已经设置为画师、但还没有补出单号的人，
+    # 可能会被错误自动添加成“其他不参摊成员”。
     resolved_special_members = enrich_special_members(
         special_members=special_members or [],
+        group_members=members,
+        order_members=order_members,
+    )
+
+    # 7. 同步商品配置文件
+    share_config_file = ensure_product_config_file(
+        parsed_order_file=parsed_order_file,
+        output_dir=order_output_dir,
+    )
+
+    product_configs = load_product_share_config_file(share_config_file)
+
+    # 8. 检查订单商品状态
+    order_status = inspect_order_status(
+        parsed_order_file=parsed_order_file,
+        product_configs=product_configs,
+    )
+
+    special_product_orders = (
+            order_status.get("special_product_orders")
+            or []
+    )
+
+    only_non_share_orders = (
+            order_status.get("only_non_share_orders")
+            or []
+    )
+
+    # 9. 根据特殊商品自动补充未录入身份的特殊成员
+    (
+        resolved_special_members,
+        auto_added_special_members,
+    ) = add_auto_non_share_members(
+        current_members=resolved_special_members,
+        special_product_orders=special_product_orders,
+    )
+
+    # 10. 再次补全自动识别出的特殊成员
+    resolved_special_members = enrich_special_members(
+        special_members=resolved_special_members,
         group_members=members,
         order_members=order_members,
     )
@@ -169,7 +216,7 @@ def parse_group_member_orders(
 
     # 重复序号提示中不排除特殊成员。
 
-    # 7. 获取订单单号集合
+    # 11. 获取订单单号集合
     order_serials = sorted_serials(
         [
             item["单号"]
@@ -179,7 +226,7 @@ def parse_group_member_orders(
 
     order_serial_set = set(order_serials)
 
-    # 8. 比对群成员单号与订单单号
+    # 12. 比对群成员单号与订单单号
     special_member_serials = {
         normalize_serial(member.get("单号"))
         for member in resolved_special_members
@@ -217,6 +264,12 @@ def parse_group_member_orders(
         "order_serials": sorted_serials(order_serial_set),
 
         "special_members": resolved_special_members,
+        "share_config_file": str(share_config_file),
+        "product_configs": product_configs,
+
+        "special_product_orders": special_product_orders,
+        "only_non_share_orders": only_non_share_orders,
+        "auto_added_special_members": auto_added_special_members,
 
         "serials_in_group_not_in_orders": serials_in_group_not_in_orders,
         "serials_in_orders_not_in_group": serials_in_orders_not_in_group,
@@ -364,8 +417,7 @@ def sorted_serials(serials: set[str] | list[str]) -> list[str]:
 if __name__ == "__main__":
     result = parse_group_member_orders(
         group_name="临时喵喵",
-        order_input=r"D:\2_PycharmTestData\test\miao2.xlsx",
-        order_output_dir=r"D:\2_PycharmTestData\test2",
+        order_input=r"miao4.xlsx",
     )
 
     print("ok:", result["ok"])
@@ -392,3 +444,37 @@ if __name__ == "__main__":
 
     print("\n简化后的订单文件：")
     print(result["parsed_order_file"])
+
+    print("\n" + "=" * 80)
+    print("订单状态检查结果")
+
+    print("\n【特殊商品订单】")
+    for item in result.get("special_product_orders", []):
+        print(item)
+
+    print("\n【本次自动增加的特殊成员】")
+    for item in result.get("auto_added_special_members", []):
+        print(item)
+
+    print("\n【只有普通不参摊商品的异常订单】")
+    for item in result.get("only_non_share_orders", []):
+        print(item)
+
+    print("\n【最终特殊成员名单】")
+    for item in result.get("special_members", []):
+        print(item)
+
+    print("\n【群昵称前没有数字】")
+    for item in result.get("members_without_serial", []):
+        print(item)
+
+    print("\n【订单有、群昵称没有】")
+    print(
+        result.get(
+            "serials_in_orders_not_in_group",
+            [],
+        )
+    )
+
+    print("\n【商品配置文件】")
+    print(result.get("share_config_file"))

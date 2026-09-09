@@ -59,21 +59,49 @@ def emit_progress(
 
 def build_bulk_product_price_preview(
     product_configs: list[dict[str, Any]] | None,
-) -> tuple[list[str], bool]:
+) -> tuple[
+    list[str],
+    list[str],
+    list[str],
+    list[str],
+    bool,
+]:
     """
-    生成大货确认阶段的商品单价展示。
-
-    不展示：
-        - 商品名称以“专拍”结尾
-        - 单价为空
-        - 单价 <= 0
+    生成大货确认阶段的商品价格检查信息。
 
     返回：
-        price_lines
-        all_prices_below_8
+        valid_price_lines:
+            有效商品单价展示
+
+        zero_price_products:
+            检测到单价为 0 的商品
+            忽略专拍商品
+
+        missing_price_products:
+            未检测到有效单价的商品
+            忽略专拍商品
+
+        zero_quantity_products:
+            商品数量为 0 的商品
+
+        all_detected_prices_below_8:
+            所有“检测到单价”的非专拍商品是否都 < 8 元
+
+    说明：
+        - 专拍商品不参与单价展示、0 元检查、缺失单价检查、
+          <8 元判断。
+        - 单价为 0 仍属于“检测到了单价”，因此参与 <8 元判断。
+        - 单价为空、无法解析、负数，都视为“未检测到单价”。
     """
-    lines: list[str] = []
-    valid_prices: list[Decimal] = []
+
+    valid_price_lines: list[str] = []
+    zero_price_products: list[str] = []
+    missing_price_products: list[str] = []
+    zero_quantity_products: list[str] = []
+
+    # 用于判断：
+    # “所有检测到单价的商品是否都 < 8”
+    detected_prices: list[Decimal] = []
 
     for item in product_configs or []:
         product_name = str(
@@ -83,41 +111,93 @@ def build_bulk_product_price_preview(
         if not product_name:
             continue
 
+        # ---------------------------------
+        # 1. 检查商品数量
+        # ---------------------------------
+        quantity = item.get("商品数量")
+
+        try:
+            quantity_number = int(quantity)
+        except (TypeError, ValueError):
+            quantity_number = None
+
+        if quantity_number == 0:
+            zero_quantity_products.append(
+                product_name
+            )
+
+        # ---------------------------------
+        # 2. 专拍不参与价格相关检查
+        # ---------------------------------
         if product_name.endswith("专拍"):
             continue
 
+        # ---------------------------------
+        # 3. 检查商品单价
+        # ---------------------------------
         price_text = str(
             item.get("商品单价") or ""
         ).strip()
 
         if not price_text:
+            missing_price_products.append(
+                product_name
+            )
             continue
 
         try:
             price = Decimal(price_text)
         except Exception:
+            missing_price_products.append(
+                product_name
+            )
             continue
 
-        if price <= 0:
+        if price < 0:
+            missing_price_products.append(
+                product_name
+            )
             continue
 
-        lines.append(
+        # 只要成功读到 >= 0 的价格，
+        # 就属于“检测到单价”
+        detected_prices.append(price)
+
+        if price == 0:
+            zero_price_products.append(
+                product_name
+            )
+            continue
+
+        # > 0 才属于正常展示的有效价格
+        valid_price_lines.append(
             f"- {product_name}：{price:.2f} 元"
         )
 
-        valid_prices.append(price)
-
-    all_prices_below_8 = (
-        bool(valid_prices)
+    # 注意：
+    # 缺失单价的商品不参与这个判断。
+    #
+    # 例如：
+    # A = 5
+    # B = 7
+    # C = 未检测到
+    #
+    # 对“检测到单价”的 A/B 来说全部 < 8，
+    # 因此仍然返回 True。
+    all_detected_prices_below_8 = (
+        bool(detected_prices)
         and all(
             price < Decimal("8")
-            for price in valid_prices
+            for price in detected_prices
         )
     )
 
     return (
-        lines,
-        all_prices_below_8,
+        valid_price_lines,
+        zero_price_products,
+        missing_price_products,
+        zero_quantity_products,
+        all_detected_prices_below_8,
     )
 
 
@@ -481,29 +561,10 @@ class ToolOrchestrator:
             return self.handle_calculate_bulk_goods(ctx)
 
         if intent["intent"] == "update_special_members":
-            try:
-                ctx.special_members = update_special_member_cache(
-                    current_members=ctx.special_members,
-                    updates=(
-                            intent.get("special_member_updates")
-                            or []
-                    ),
-                )
-            except SpecialMemberError as exc:
-                return f"特殊成员信息设置失败：{exc}"
-
-            # 特殊成员信息改变后，原名单检查结果已经失效。
-            ctx.member_checked = False
-            ctx.member_check_result = None
-
-            return format_special_members(
-                ctx.special_members
-            )
+            return self.handle_update_special_members(ctx, intent)
 
         if intent["intent"] == "show_special_members":
-            return format_special_members(
-                ctx.special_members
-            )
+            return format_special_members(ctx.special_members)
 
         if intent["intent"] == "member_check":
             check_result = self.ensure_member_checked(
@@ -514,10 +575,7 @@ class ToolOrchestrator:
             return format_member_check_result(check_result)
 
         if intent["intent"] == "calculate_share":
-            self.update_share_request_from_intent(
-                ctx,
-                intent,
-            )
+            self.update_share_request_from_intent(ctx, intent)
             return self.handle_calculate_share(
                 ctx,
                 intent,
@@ -557,10 +615,7 @@ class ToolOrchestrator:
                 )
             )
         except SpecialMemberError as exc:
-            return (
-                "特殊成员信息设置失败：\n"
-                f"{exc}"
-            )
+            return f"身份更新失败，原因：{exc}"
 
         # 特殊成员发生变化后，旧名单检查结果必须失效。
         ctx.member_checked = False
@@ -710,10 +765,14 @@ class ToolOrchestrator:
             )
         )
 
-        price_lines, all_prices_below_8 = (
-            build_bulk_product_price_preview(
-                ctx.product_configs
-            )
+        (
+            price_lines,
+            zero_price_products,
+            missing_price_products,
+            zero_quantity_products,
+            all_prices_below_8,
+        ) = build_bulk_product_price_preview(
+            ctx.product_configs
         )
 
         # ---------------------------------
@@ -726,38 +785,79 @@ class ToolOrchestrator:
         lines = [
             "大货计算前请确认以下信息。",
             "",
-            "当前商品单价：",
+            "当前有效商品单价：",
         ]
+
+        # ---------------------------------
+        # 1. 有效商品单价
+        # ---------------------------------
 
         if price_lines:
             lines.extend(price_lines)
         else:
             lines.append(
-                "- 没有读取到可展示的商品单价"
+                "- 没有检测到有效商品单价"
             )
 
-        warnings = (
-                bulk_config_result.get("warnings")
-                or []
-        )
+        # ---------------------------------
+        # 2. 单价异常
+        # ---------------------------------
 
-        if warnings:
-            lines.append("")
-            lines.append("商品单价读取提示：")
+        if zero_price_products:
+            lines.extend(
+                [
+                    "",
+                    "以下商品单价为 0：",
+                ]
+            )
 
-            for warning in warnings:
+            for product_name in zero_price_products:
                 lines.append(
-                    f"- {warning}"
+                    f"- {product_name}"
                 )
+
+        if missing_price_products:
+            lines.extend(
+                [
+                    "",
+                    "以下商品未检测到单价：",
+                ]
+            )
+
+            for product_name in missing_price_products:
+                lines.append(
+                    f"- {product_name}"
+                )
+
+        # ---------------------------------
+        # 3. 商品数量为 0
+        # ---------------------------------
+
+        if zero_quantity_products:
+            lines.extend(
+                [
+                    "",
+                    "以下商品当前数量为 0：",
+                ]
+            )
+
+            for product_name in zero_quantity_products:
+                lines.append(
+                    f"- {product_name}"
+                )
+
+        # ---------------------------------
+        # 4. 所有已检测单价均 < 8 元
+        # ---------------------------------
 
         if all_prices_below_8:
             lines.extend(
                 [
                     "",
-                    "注意：当前所有可识别的大货商品单价"
+                    "注意：当前所有检测到单价的商品单价"
                     "都低于 8 元。",
-                    "请确认订单中的金额是否可能是均摊金额，"
-                    "而不是实际大货单价。",
+                    "请确认订单中的价格是否仍然是均摊价格，"
+                    "尚未同步更新为实际大货单价。",
                 ]
             )
 
@@ -775,6 +875,7 @@ class ToolOrchestrator:
         )
 
         return "\n".join(lines)
+
 
     def handle_confirm_bulk_goods(
             self,

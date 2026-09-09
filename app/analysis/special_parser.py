@@ -222,29 +222,19 @@ def parse_special_member_updates(
         return []
 
     # 必须优先解析明确修改语句。
-    # 否则“修改工具人工具猫……”可能被普通设置语法识别。
-    edit_update = parse_special_member_edit(
-        normalized
-    )
+    # 否则“修改AAABBB……”可能被普通设置语法识别。
+    edit_update = parse_special_member_edit(normalized)
 
     if edit_update is not None:
         return [edit_update]
 
-    reversed_update = parse_reversed_special_member(
-        normalized
-    )
+    # 处理角色在后的表达
+    reversed_update = parse_reversed_special_member(normalized)
 
     if reversed_update is not None:
         return [reversed_update]
 
-    # 先处理“Yann是车主”“把Yann设为车主”。
-    reversed_update = parse_reversed_special_member(
-        normalized
-    )
-
-    if reversed_update is not None:
-        return [reversed_update]
-
+    # 剩余情况按“角色在前”解析
     role_matches = list(
         ROLE_PATTERN.finditer(normalized)
     )
@@ -498,19 +488,51 @@ def parse_reversed_special_member(
     text: str,
 ) -> dict[str, Any] | None:
     """
-    解析角色词在后面的表达方式：
+    解析角色位于成员身份之后的表达。
+
+    支持有连接词：
 
         Yann是车主
         Yann为车主
         Yann作为车主
         把Yann设为车主
         把Yann设置为车主
+
+        单号12是画师
+        群昵称001 Yann是画师
+
+    支持直接用空格 / 标点分隔：
+
+        Yann 画师
+        单号12 画师
+        12 画师
+        昵称Yann 画师
+        群昵称001 Yann 画师
+
+    同时支持角色后的补充信息：
+
+        Yann 画师 不参摊
+        单号12 画师 不参摊
     """
-    pattern = re.compile(
+
+    normalized = normalize_text(text)
+
+    if not normalized:
+        return None
+
+    # --------------------------------------------------
+    # 1. 优先处理有明确连接词的表达
+    #
+    # Yann是画师
+    # 把Yann设为画师
+    # 单号12是画师
+    # --------------------------------------------------
+
+    connector_pattern = re.compile(
         rf"^\s*"
         rf"(?:请\s*)?"
         rf"(?:把\s*)?"
-        rf"(?P<nickname>.+?)"
+        rf"(?P<identity>.+?)"
         rf"\s*"
         rf"(?:设置为|设为|作为|是|为)"
         rf"\s*"
@@ -519,41 +541,110 @@ def parse_reversed_special_member(
         rf"$"
     )
 
-    match = pattern.fullmatch(text)
-
-    if not match:
-        return None
-
-    nickname = normalize_text(
-        match.group("nickname")
+    match = connector_pattern.fullmatch(
+        normalized
     )
 
-    nickname = re.sub(
-        r"^(?:请|帮我|我要|我想)\s*",
-        "",
-        nickname,
-    ).strip()
+    if match is not None:
+        identity = normalize_text(
+            match.group("identity")
+        )
 
-    if not is_valid_bare_nickname(nickname):
+        # 清除部分自然语言前缀。
+        #
+        # 例如：
+        # 我要Yann作为画师
+        # 帮我把Yann设为画师
+        identity = re.sub(
+            r"^(?:请|帮我|我要|我想)\s*",
+            "",
+            identity,
+        ).strip()
+
+        tail = clean_role_segment(
+            match.group("tail")
+        )
+
+        segment = identity
+
+        if tail:
+            segment = (
+                f"{segment} {tail}"
+            ).strip()
+
+        update = parse_special_member_segment(
+            role=normalize_special_member_role(
+                match.group("role")
+            ),
+            segment=segment,
+        )
+
+        if has_special_member_update_content(
+            update
+        ):
+            return update
+
+        return None
+
+    # --------------------------------------------------
+    # 2. 再处理没有连接词、直接“身份 + 角色”的表达
+    #
+    # Yann 画师
+    # 12 画师
+    # 单号12 画师
+    # 群昵称001 Yann 画师
+    #
+    # 这里要求身份和角色之间存在空格或标点，
+    # 避免把普通昵称中的“画师”等文字误识别成角色。
+    # --------------------------------------------------
+
+    direct_pattern = re.compile(
+        rf"^\s*"
+        rf"(?P<identity>.+?)"
+        rf"(?:\s+|[，,；;：:])"
+        rf"(?P<role>{_ROLE_PATTERN_TEXT})"
+        rf"(?P<tail>.*)"
+        rf"$"
+    )
+
+    match = direct_pattern.fullmatch(
+        normalized
+    )
+
+    if match is None:
+        return None
+
+    identity = normalize_text(
+        match.group("identity")
+    )
+
+    if not identity:
         return None
 
     tail = clean_role_segment(
         match.group("tail")
     )
 
-    tail_update = parse_special_member_segment(
+    segment = identity
+
+    if tail:
+        segment = (
+            f"{segment} {tail}"
+        ).strip()
+
+    update = parse_special_member_segment(
         role=normalize_special_member_role(
             match.group("role")
         ),
-        segment=tail,
+        segment=segment,
     )
 
-    tail_update["昵称"] = (
-        tail_update["昵称"]
-        or nickname
-    )
+    if not has_special_member_update_content(
+        update
+    ):
+        return None
 
-    return tail_update
+    return update
 
 
 def normalize_special_member_role(

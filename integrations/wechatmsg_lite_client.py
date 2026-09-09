@@ -63,11 +63,9 @@ def ensure_wechat_database_key(
 
     _ensure_wechatmsg_lite_path()
 
-    from wxManager.decrypt_runner import (
-        ensure_decrypt_key,
-    )
+    from wxManager.decrypt_runner import ensure_cached_decrypt_key
 
-    return ensure_decrypt_key(
+    return ensure_cached_decrypt_key(
         db_version=db_version,
         source_dir=source_dir,
         output_root=decrypt_output_root,

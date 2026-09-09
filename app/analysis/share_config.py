@@ -8,7 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from app.config import CSV_OUTPUT_DIR, ensure_dirs
-from app.analysis.order_validator import default_include_share
+from app.analysis.order_validator import (
+    default_include_share,
+    is_special_member_product,
+)
 from app.analysis.order_parser import (
     read_product_unit_prices,
 )
@@ -380,6 +383,10 @@ def ensure_product_config_file(
             #
             # 均摊类型、商品均摊、单份均摊、
             # 商品单价、商品大货总价均不修改。
+
+            # 特殊商品固定不参摊
+            if is_special_member_product(product_name):
+                row["计入均摊"] = False
 
         # =============================
         # 新商品
