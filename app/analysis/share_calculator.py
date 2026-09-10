@@ -14,7 +14,7 @@ from app.analysis.order_validator import (
     find_orders_with_only_non_share_products,
     format_only_non_share_orders_message,
 )
-from app.analysis.share_config import (
+from app.analysis.product_config import (
     make_share_type,
 )
 

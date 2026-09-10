@@ -22,7 +22,7 @@ from app.analysis.special_member import (
     member_matches_special_member,
     order_matches_special_member,
 )
-from app.analysis.share_config import (
+from app.analysis.product_config import (
     ensure_product_config_file,
     load_product_share_config_file,
 )
@@ -416,68 +416,3 @@ def sorted_serials(serials: set[str] | list[str]) -> list[str]:
         key=lambda x: int(x),
     )
 
-
-if __name__ == "__main__":
-    result = parse_group_member_orders(
-        group_name="临时喵喵",
-        order_input=r"D:\1_PychamProjects\Group-Buying-Assistant\orders\miao4.xlsx",
-    )
-
-    print("ok:", result["ok"])
-    print("message:", result["message"])
-    print("群聊名称:", result["群聊名称"])
-    print("chatroom_wxid:", result["chatroom_wxid"])
-    print("群成员数量:", result["member_count"])
-
-    # print("\n群昵称前没有数字的成员：")
-    # for member in result["members_without_serial"]:
-    #     print(member)
-    #
-    # print("\n群昵称中重复标注的序号：")
-    # for item in result["duplicate_member_serials"]:
-    #     print(f"序号 {item['序号']}：")
-    #     for member in item["members"]:
-    #         print("  ", member)
-    #
-    # print("\n群昵称有、但是订单没有的序号：")
-    # print(result["serials_in_group_not_in_orders"])
-    #
-    # print("\n订单里有、但是群昵称没有的序号：")
-    # print(result["serials_in_orders_not_in_group"])
-    #
-    # print("\n简化后的订单文件：")
-    # print(result["parsed_order_file"])
-
-    print("\n" + "=" * 80)
-    print("订单状态检查结果")
-
-    print("\n【特殊商品订单】")
-    for item in result.get("special_product_orders", []):
-        print(item)
-
-    print("\n【本次自动增加的特殊成员】")
-    for item in result.get("auto_added_special_members", []):
-        print(item)
-
-    print("\n【只有普通不参摊商品的异常订单】")
-    for item in result.get("only_non_share_orders", []):
-        print(item)
-
-    print("\n【最终特殊成员名单】")
-    for item in result.get("special_members", []):
-        print(item)
-
-    print("\n【群昵称前没有数字】")
-    for item in result.get("members_without_serial", []):
-        print(item)
-
-    print("\n【订单有、群昵称没有】")
-    print(
-        result.get(
-            "serials_in_orders_not_in_group",
-            [],
-        )
-    )
-
-    print("\n【商品配置文件】")
-    print(result.get("share_config_file"))

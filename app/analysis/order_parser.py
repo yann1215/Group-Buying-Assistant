@@ -827,14 +827,3 @@ def _format_product_unit_price(value: Any) -> str:
         return ""
 
     return f"{amount:.2f}"
-
-
-if __name__ == "__main__":
-
-    output_path = parse_order_file(
-        order_input=r"D:\2_PycharmTestData\test\miao1.xlsx",
-        output_dir=r"D:\2_PycharmTestData\test2",
-    )
-
-    print("订单解析完成：")
-    print(output_path)

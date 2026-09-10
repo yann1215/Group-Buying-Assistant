@@ -27,7 +27,7 @@ from app.analysis.special_member import (
     get_non_share_order_nos,
 )
 from app.analysis.share_calculator import calculate_share
-from app.analysis.share_config import (
+from app.analysis.product_config import (
     ensure_product_config_file,
     load_product_share_config_file,
     summarize_product_share_config,
@@ -509,17 +509,17 @@ class ToolOrchestrator:
 
         intent = parse_user_intent(user_text)
 
-        print("\n=== TOOL DEBUG ===")
-        print("tool_orchestrator:", __file__)
-        print("user_text:", repr(user_text))
-        print("intent:", intent)
+        # print("\n=== TOOL DEBUG ===")
+        # print("tool_orchestrator:", __file__)
+        # print("user_text:", repr(user_text))
+        # print("intent:", intent)
 
         ctx = self.contexts.setdefault(
             session_id,
             SessionToolContext(),
         )
 
-        print("share_request BEFORE:", ctx.share_request)
+        # print("share_request BEFORE:", ctx.share_request)
 
         self.update_context_from_intent(ctx, intent)
 
@@ -563,8 +563,8 @@ class ToolOrchestrator:
         if intent["intent"] == "calculate_share":
             self.update_share_request_from_intent(ctx, intent)
 
-            print("ENTER: calculate_share")
-            print("share_request AFTER:", ctx.share_request)
+            # print("ENTER: calculate_share")
+            # print("share_request AFTER:", ctx.share_request)
 
             return self.handle_calculate_share(
                 ctx,
@@ -575,7 +575,7 @@ class ToolOrchestrator:
         if intent["intent"] == "update_share_config":
             self.update_share_request_from_intent(ctx, intent)
 
-            print("ENTER: update_share_config")
+            # print("ENTER: update_share_config")
 
             return self.handle_update_share_config(ctx, intent)
 

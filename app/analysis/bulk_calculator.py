@@ -6,7 +6,7 @@ import csv
 from pathlib import Path
 from typing import Any
 
-from app.analysis.share_config import default_include_share
+from app.analysis.product_config import default_include_share
 
 
 NON_PRODUCT_FIELDS = {

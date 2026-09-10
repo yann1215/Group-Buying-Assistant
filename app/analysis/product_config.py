@@ -1,4 +1,4 @@
-# app/analysis/share_config.py
+# app/analysis/product_config.py
 
 from __future__ import annotations
 
