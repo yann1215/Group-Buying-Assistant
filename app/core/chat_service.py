@@ -12,10 +12,12 @@ from app.core.order_version_manager import (
     shift_order_versions,
 )
 from app.core.tool_orchestrator import ToolOrchestrator
+
 from app.database.repositories import (
     add_message,
     create_session,
     delete_session,
+    find_session_by_group_name,
     get_order_versions,
     get_messages,
     get_session,
@@ -112,39 +114,84 @@ class ChatService:
             )
 
     def set_working_context(
-        self,
-        session_id: int,
-        group_name: str | None = None,
-        order_input: str | Path | None = None,
-        order_output_dir: str | Path | None = None,
+            self,
+            session_id: int,
+            group_name: str | None = None,
+            order_input: str | Path | None = None,
+            order_output_dir: str | Path | None = None,
     ) -> str | None:
-        """
-        设置当前会话的工作上下文。
 
-        例如：
-            - 当前处理哪个微信群
-            - 当前订单文件路径
-            - 输出目录
-        """
         self._ensure_context_loaded(session_id)
 
-        order_message: str | None = None
+        messages: list[str] = []
+
+        # ---------------------------------
+        # 群聊名称独立处理
+        # ---------------------------------
+        if group_name is not None:
+            normalized_group_name = str(
+                group_name
+            ).strip()
+
+            if normalized_group_name:
+                conflict_session = (
+                    self._check_group_name_conflict(
+                        session_id,
+                        normalized_group_name,
+                    )
+                )
+
+                if conflict_session is not None:
+                    messages.append(
+                        "群聊名称重名。\n"
+                        f"“{normalized_group_name}”"
+                        "已经被其他对话使用，"
+                        "当前车的群聊名称未修改。"
+                    )
+                else:
+                    self.tools.set_context(
+                        session_id=session_id,
+                        group_name=normalized_group_name,
+                    )
+
+                    messages.append(
+                        f"群聊名称已更新："
+                        f"{normalized_group_name}"
+                    )
+
+        # ---------------------------------
+        # 订单独立处理
+        # ---------------------------------
         if order_input is not None:
             result = self._update_order_versions(
                 session_id,
                 order_input,
             )
-            order_message = self._format_order_update_result(result)
-            if not result.success:
-                return order_message
 
-        self.tools.set_context(
-            session_id=session_id,
-            group_name=group_name,
-            order_output_dir=order_output_dir,
-        )
+            messages.append(
+                self._format_order_update_result(
+                    result
+                )
+            )
+
+        # ---------------------------------
+        # 输出路径独立处理
+        # ---------------------------------
+        if order_output_dir is not None:
+            self.tools.set_context(
+                session_id=session_id,
+                order_output_dir=order_output_dir,
+            )
+
+        # 无论其中哪个字段失败，
+        # 已经成功更新的字段都保存
         self.save_working_context(session_id)
-        return order_message
+
+        return (
+            "\n\n".join(messages)
+            if messages
+            else None
+        )
 
     def send_message(
             self,
@@ -161,42 +208,110 @@ class ChatService:
         )
 
         intent = parse_user_intent(user_text)
+
+        ctx = self.tools.get_context(session_id)
+
+        context_messages: list[str] = []
+        context_has_error = False
+
+        # =========================================================
+        # 1. 独立处理群聊名称
+        # =========================================================
+        group_name = intent.get("group_name")
+
+        if group_name:
+            normalized_group_name = str(group_name).strip()
+
+            conflict_session = self._check_group_name_conflict(
+                session_id,
+                normalized_group_name,
+            )
+
+            if conflict_session is not None:
+                context_messages.append(
+                    "群聊名称重名。\n"
+                    f"“{normalized_group_name}”已经被其他对话使用，"
+                    "当前车的群聊名称未修改。"
+                )
+                context_has_error = True
+
+            else:
+                # 群名合法，立即更新。
+                # 不等待订单校验结果。
+                self.tools.set_context(
+                    session_id=session_id,
+                    group_name=normalized_group_name,
+                )
+
+                # 立即持久化，因此后面的订单失败也不会影响群名
+                self.save_working_context(session_id)
+
+                context_messages.append(
+                    f"群聊名称已更新：{normalized_group_name}"
+                )
+
+        # =========================================================
+        # 2. 独立处理订单
+        # =========================================================
         order_input = intent.get("order_input")
+
         if order_input:
             result = self._update_order_versions(
                 session_id,
                 order_input,
             )
-            order_message = self._format_order_update_result(result)
 
-            # 无效输入不能进入编排器，否则旧逻辑会把不存在的路径
-            # 写入当前工作上下文。
+            order_message = self._format_order_update_result(
+                result
+            )
+
+            context_messages.append(order_message)
+
             if not result.success:
-                self.save_working_context(session_id)
-                add_message(
-                    session_id=session_id,
-                    role="assistant",
-                    content=order_message,
-                )
-                return order_message
+                context_has_error = True
 
-            # 单独设置订单时直接返回四个版本；若同一句还要求查成员、
-            # 均摊或大货，则继续执行该业务，并使用刚更新的新订单。
-            if intent.get("intent") == "set_context":
-                self.tools.update_context_from_intent(
-                    self.tools.get_context(session_id),
-                    {
-                        **intent,
-                        "order_input": None,
-                    },
+        # =========================================================
+        # 3. 如果本句话只是录入上下文，统一返回结果
+        # =========================================================
+        if intent.get("intent") == "set_context":
+
+            # 输出目录同样独立更新
+            if intent.get("order_output_dir"):
+                self.tools.set_context(
+                    session_id=session_id,
+                    order_output_dir=intent["order_output_dir"],
                 )
                 self.save_working_context(session_id)
-                add_message(
-                    session_id=session_id,
-                    role="assistant",
-                    content=order_message,
-                )
-                return order_message
+
+            reply = "\n\n".join(context_messages)
+
+            if not reply:
+                reply = "当前信息没有发生变化。"
+
+            add_message(
+                session_id=session_id,
+                role="assistant",
+                content=reply,
+            )
+
+            return reply
+
+        # =========================================================
+        # 4. 如果还包含“查成员/算均摊/算大货”等操作
+        #    但本轮明确输入的基础信息有错误，就先停止后续业务
+        # =========================================================
+        if context_has_error:
+            self.save_working_context(session_id)
+
+            reply = "\n\n".join(context_messages)
+
+            add_message(
+                session_id=session_id,
+                role="assistant",
+                content=reply,
+            )
+
+            return reply
 
         try:
             tool_result = self.tools.handle(
@@ -259,6 +374,24 @@ class ChatService:
         for session_id in list(self.tools.contexts):
             if session_id not in existing_ids:
                 self.tools.remove_context(session_id)
+
+    def _check_group_name_conflict(
+            self,
+            session_id: int,
+            group_name: str | None,
+    ) -> dict[str, Any] | None:
+
+        normalized_group_name = str(
+            group_name or ""
+        ).strip()
+
+        if not normalized_group_name:
+            return None
+
+        return find_session_by_group_name(
+            normalized_group_name,
+            exclude_session_id=session_id,
+        )
 
     def _update_order_versions(
         self,

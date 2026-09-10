@@ -285,6 +285,47 @@ def get_order_versions(session_id: int) -> dict[str, str]:
     return {field: row[field] or "" for field in ORDER_VERSION_FIELDS}
 
 
+def find_session_by_group_name(
+    group_name: str,
+    *,
+    exclude_session_id: int | None = None,
+) -> dict[str, Any] | None:
+    normalized_group_name = str(group_name).strip()
+
+    # 空群名允许重复
+    if not normalized_group_name:
+        return None
+
+    with get_conn() as conn:
+        if exclude_session_id is None:
+            row = conn.execute(
+                """
+                SELECT id, title, group_name, created_at, updated_at
+                FROM sessions
+                WHERE TRIM(group_name) = ?
+                LIMIT 1
+                """,
+                (normalized_group_name,),
+            ).fetchone()
+
+        else:
+            row = conn.execute(
+                """
+                SELECT id, title, group_name, created_at, updated_at
+                FROM sessions
+                WHERE TRIM(group_name) = ?
+                  AND id != ?
+                LIMIT 1
+                """,
+                (
+                    normalized_group_name,
+                    exclude_session_id,
+                ),
+            ).fetchone()
+
+    return dict(row) if row is not None else None
+
+
 def update_order_versions(
     session_id: int,
     *,

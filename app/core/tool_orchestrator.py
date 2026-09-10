@@ -415,69 +415,47 @@ class ToolOrchestrator:
         self.contexts.pop(session_id, None)
 
     def set_context(
-        self,
-        session_id: int,
-        group_name: str | None = None,
-        order_output_dir: str | Path | None = None,
+            self,
+            session_id: int,
+            group_name: str | None = None,
+            order_output_dir: str | Path | None = None,
     ) -> None:
+
         ctx = self.contexts.setdefault(session_id, SessionToolContext())
 
         if group_name is not None:
-            new_group_name = str(group_name).strip()
-
-            if (
-                    ctx.group_name is not None
-                    and ctx.group_name != new_group_name
-            ):
-                ctx.special_members.clear()
-                ctx.member_checked = False
-                ctx.member_check_result = None
-                ctx.parsed_order_file = None
-                ctx.share_config_file = None
-                ctx.product_configs = None
-                reset_bulk_goods_context(ctx)
-
-            ctx.group_name = new_group_name
+            ctx.group_name = str(group_name).strip()
 
         if order_output_dir is not None:
             ctx.order_output_dir = normalize_output_dir(order_output_dir)
         elif ctx.order_output_dir is None:
             ctx.order_output_dir = str(DEFAULT_ORDER_OUTPUT_DIR)
 
-
     def update_context_from_intent(
-        self,
-        ctx: SessionToolContext,
-        intent: dict[str, Any],
+            self,
+            ctx: SessionToolContext,
+            intent: dict[str, Any],
     ) -> None:
         """
-        从用户当前这句话中更新群聊、订单文件、输出目录。
-        只更新本轮明确提到的字段。
+        从用户当前输入中更新当前车的基础信息。
+
+        group_name 只是当前车的属性。
+        修改群名不得重置任何其他业务状态。
         """
+
         if intent.get("group_name"):
-            new_group_name = intent["group_name"]
-
-            group_changed = (
-                    ctx.group_name is not None
-                    and ctx.group_name != new_group_name
-            )
-
-            if group_changed:
-                ctx.special_members.clear()
-
-                ctx.member_checked = False
-                ctx.member_check_result = None
-                ctx.parsed_order_file = None
-                ctx.share_config_file = None
-                ctx.product_configs = None
-
-            ctx.group_name = new_group_name
-            reset_bulk_goods_context(ctx)
+            ctx.group_name = str(
+                intent["group_name"]
+            ).strip()
 
         if intent.get("order_output_dir"):
-            ctx.order_output_dir = normalize_output_dir(intent["order_output_dir"])
+            ctx.order_output_dir = normalize_output_dir(
+                intent["order_output_dir"]
+            )
         elif ctx.order_output_dir is None:
-            ctx.order_output_dir = str(DEFAULT_ORDER_OUTPUT_DIR)
+            ctx.order_output_dir = str(
+                DEFAULT_ORDER_OUTPUT_DIR
+            )
 
     def update_share_request_from_intent(
             self,
