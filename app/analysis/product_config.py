@@ -7,7 +7,7 @@ from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from typing import Any
 
-from app.config import CSV_OUTPUT_DIR, ensure_dirs
+from app.config import CSV_OUTPUT_DIR
 from app.analysis.order_validator import (
     default_include_share,
     is_special_member_product,
@@ -217,13 +217,6 @@ def load_product_share_config_file(
                 row_idx=row_idx,
             )
         )
-
-        if not include_share:
-            product_share_amount = (
-                normalize_zero_or_blank_money(
-                    product_share_amount
-                )
-            )
 
         configs.append(
             {
@@ -519,14 +512,14 @@ def update_product_share_config_file(
 
     _write_product_config_rows(config_file,rows)
 
-    summary = summarize_product_share_config(config_file)
+    # summary = summarize_product_share_config(config_file)
 
     return {
         "ok": True,
         "config_file": str(config_file.resolve()),
         "updated_items": updated_items,
         "unmatched_updates": unmatched_updates,
-        "summary": summary,
+        # "summary": summary,
     }
 
 
@@ -1125,16 +1118,3 @@ def parse_optional_money_ceil(
     )
 
     return f"{amount:.2f}"
-
-
-def normalize_zero_or_blank_money(value: str) -> str:
-    """
-    不计入均摊的商品，商品均摊可以为空，也可以是 0.00。
-
-    如果用户填了非 0 金额，这里不强制报错，先保留。
-    如果你希望严格禁止，可以改成非 0 时报错。
-    """
-    if value == "":
-        return ""
-
-    return value

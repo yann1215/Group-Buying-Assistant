@@ -209,8 +209,6 @@ class ChatService:
 
         intent = parse_user_intent(user_text)
 
-        ctx = self.tools.get_context(session_id)
-
         context_messages: list[str] = []
         context_has_error = False
 

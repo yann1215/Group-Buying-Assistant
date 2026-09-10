@@ -38,7 +38,6 @@ from app.analysis.product_config import (
 )
 from app.analysis.bulk_calculator import (
     create_bulk_receivable_orders,
-    find_only_non_share_orders,
 )
 from app.core.intent_parser import (
     has_affirmative_words,
@@ -532,6 +531,10 @@ class ToolOrchestrator:
             if has_negative_words(user_text):
                 ctx.bulk_request.pending_confirmation = False
                 ctx.bulk_request.confirmed = False
+
+                # 清除可能遗留的强制计算状态
+                ctx.share_request.force = False
+
                 return (
                     "已取消本次大货计算。\n"
                     "请修改或同步订单信息后，重新输入“查大货”或“算大货”。"
@@ -762,13 +765,6 @@ class ToolOrchestrator:
         #    商品大货总价
         # ---------------------------------
 
-        bulk_config_result = (
-            update_product_config_before_bulk(
-                config_file=ctx.share_config_file,
-                original_order_file=ctx.new_order_file,
-            )
-        )
-
         ctx.product_configs = (
             load_product_share_config_file(
                 ctx.share_config_file
@@ -899,16 +895,19 @@ class ToolOrchestrator:
         # 防止两次消息之间订单文件被修改。
         check_result = self.ensure_member_checked(
             ctx,
-            force=True,
+            force_refresh=True,
             progress_callback=progress_callback,
         )
 
         if not check_result.get("ok"):
             ctx.bulk_request.pending_confirmation = False
-            return format_member_check_result(check_result)
+            return format_member_check_result(
+                check_result
+            )
 
-        blocking_issues = get_blocking_member_issues(
-            check_result
+        blocking_issues = (
+                check_result.get("blocking_issues")
+                or []
         )
 
         if blocking_issues:
@@ -917,7 +916,9 @@ class ToolOrchestrator:
             return (
                     "确认时重新检查发现群成员或订单已发生变化，"
                     "本次大货计算已停止。\n\n"
-                    + format_member_check_result(check_result)
+                    + format_member_check_result(
+                check_result
+            )
             )
 
         parsed_order_file = (
@@ -929,37 +930,20 @@ class ToolOrchestrator:
             ctx.bulk_request.pending_confirmation = False
             return "没有找到订单的简化文件。"
 
-        ctx.share_config_file = ensure_product_config_file(
-            parsed_order_file=parsed_order_file,
-            output_dir=ctx.order_output_dir,
-        )
-        bulk_config_result = update_product_config_before_bulk(
+        if not ctx.share_config_file:
+            ctx.bulk_request.pending_confirmation = False
+            return "没有找到商品配置文件。"
+
+        update_product_config_before_bulk(
             config_file=ctx.share_config_file,
             original_order_file=ctx.new_order_file,
         )
+
         ctx.product_configs = (
             load_product_share_config_file(
                 ctx.share_config_file
             )
         )
-
-        abnormal_orders = find_only_non_share_orders(
-            parsed_order_file
-        )
-
-        if abnormal_orders:
-            ctx.bulk_request.pending_confirmation = False
-
-            order_numbers = "、".join(
-                str(item.get("单号"))
-                for item in abnormal_orders
-            )
-
-            return (
-                "确认时重新检查发现订单异常，"
-                "本次大货计算已停止。\n"
-                f"只有不参摊商品的订单号：{order_numbers}"
-            )
 
         emit_progress(
             progress_callback,
@@ -973,6 +957,9 @@ class ToolOrchestrator:
 
         ctx.bulk_request.pending_confirmation = False
         ctx.bulk_request.confirmed = True
+
+        # 一个完整业务计算已经结束，清除可能残留的“先算”状态
+        ctx.share_request.force = False
 
         lines = [
             "大货应收订单已生成。",
@@ -1124,6 +1111,9 @@ class ToolOrchestrator:
         )
 
         if not result.get("ok"):
+            # 本次已经实际尝试计算，force 到此消费完毕
+            req.force = False
+
             if result.get("need_user_input"):
                 return format_share_need_user_input(
                     result
@@ -1155,6 +1145,9 @@ class ToolOrchestrator:
 
         # 让 result 里的配置也与最终文件一致
         result["product_configs"] = ctx.product_configs
+
+        # 本次均摊已经完成，“先算”只对本次计算有效
+        req.force = False
 
         return format_share_result(
             result=result,

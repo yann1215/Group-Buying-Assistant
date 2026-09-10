@@ -11,8 +11,6 @@ from typing import Any
 from app.config import CSV_OUTPUT_DIR, ensure_dirs
 from app.analysis.order_validator import (
     default_include_share,
-    find_orders_with_only_non_share_products,
-    format_only_non_share_orders_message,
 )
 from app.analysis.product_config import (
     make_share_type,
@@ -147,13 +145,6 @@ def calculate_share(
         for order_no in (excluded_order_nos or set())
     }
 
-    excluded_order_rows = [
-        row
-        for row in order_rows
-        if normalize_order_no_for_compare(row.order_no)
-           in excluded_order_no_set
-    ]
-
     order_rows = [
         row
         for row in order_rows
@@ -173,33 +164,6 @@ def calculate_share(
         global_share_mode=share_mode,
         calculation_scope=calculation_scope,
     )
-
-    # -------------------------------------------------
-    # 个数摊计算前检查：
-    # 是否存在只购买了不参摊商品的订单
-    # -------------------------------------------------
-    if share_mode == "quantity":
-        abnormal_orders = find_orders_with_only_non_share_products(
-            order_rows=order_rows,
-            product_configs=configs,
-        )
-
-        if abnormal_orders:
-            return {
-                "ok": False,
-                "need_user_input": False,
-                "error_code": "orders_only_non_share_products",
-                "message": format_only_non_share_orders_message(
-                    abnormal_orders=abnormal_orders,
-                    operation_name="个数摊计算",
-                ),
-                "abnormal_order_nos": [
-                    order["单号"]
-                    for order in abnormal_orders
-                ],
-                "abnormal_orders": abnormal_orders,
-                "product_configs": product_configs_to_dicts(configs),
-            }
 
     active_configs = [
         cfg for cfg in configs
@@ -229,7 +193,6 @@ def calculate_share(
     # 个数摊时，用于保存“单个商品均摊金额”
     # 其他均摊模式下保持为 None。
     unit_share_cents: int | None = None
-    total_share_quantity: int | None = None
     if calculation_scope == "flat":
         if total_amount is None:
             return {
@@ -298,11 +261,6 @@ def calculate_share(
     total_collected_cents = sum(item.share_cents for item in charged_results)
     over_collected_cents = total_collected_cents - total_original_cents
 
-    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # output_path = (
-    #     output_dir_path
-    #     / f"{parsed_order_file.stem}_share_{share_mode}_{calculation_scope}_{timestamp}.csv"
-    # )
     output_path = (
             output_dir_path
             / f"{parsed_order_file.stem}_share_{share_mode}_{calculation_scope}.csv"
@@ -999,16 +957,6 @@ def optional_money_to_decimal_allow_zero(value: Any) -> Decimal | None:
         raise ShareCalculateError(f"金额不能为负数：{value!r}")
 
     return amount
-
-
-def optional_amount_to_decimal(value: Any) -> Decimal | None:
-    if value is None:
-        return None
-
-    if str(value).strip() == "":
-        return None
-
-    return amount_to_decimal(value)
 
 
 def decimal_yuan_to_cents(value: Decimal) -> int:

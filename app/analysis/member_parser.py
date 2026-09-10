@@ -3,15 +3,9 @@ from __future__ import annotations
 
 import csv
 import re
-import sys
 from pathlib import Path
 from typing import Any, Callable
 
-
-# 让直接运行 python app/analysis/member_parser.py 时，也能正常导入项目根目录下的 integrations / app
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from integrations.wechatmsg_lite_client import get_wechat_group_members
 from app.analysis.order_parser import parse_order_file
@@ -250,6 +244,14 @@ def parse_group_member_orders(
         - group_serials
     )
 
+    blocking_issues = build_member_order_blocking_issues(
+        members_without_serial=members_without_serial,
+        duplicate_member_serials=duplicate_member_serials,
+        serials_in_group_not_in_orders=serials_in_group_not_in_orders,
+        serials_in_orders_not_in_group=serials_in_orders_not_in_group,
+        only_non_share_orders=only_non_share_orders,
+    )
+
     return {
         "ok": True,
         "message": "群成员序号与订单单号比对完成",
@@ -276,7 +278,38 @@ def parse_group_member_orders(
 
         "serials_in_group_not_in_orders": serials_in_group_not_in_orders,
         "serials_in_orders_not_in_group": serials_in_orders_not_in_group,
+
+        "blocking_issues": blocking_issues,
+        "can_calculate": not blocking_issues,
     }
+
+
+def build_member_order_blocking_issues(
+    members_without_serial: list[dict[str, Any]],
+    duplicate_member_serials: list[dict[str, Any]],
+    serials_in_group_not_in_orders: list[str],
+    serials_in_orders_not_in_group: list[str],
+    only_non_share_orders: list[dict[str, Any]],
+) -> list[str]:
+
+    issues: list[str] = []
+
+    if members_without_serial:
+        issues.append("存在群昵称前没有数字的成员")
+
+    if duplicate_member_serials:
+        issues.append("群昵称中存在重复标注的序号")
+
+    if serials_in_group_not_in_orders:
+        issues.append("群昵称有、但是订单没有的序号")
+
+    if serials_in_orders_not_in_group:
+        issues.append("订单里有、但是群昵称没有的序号")
+
+    if only_non_share_orders:
+        issues.append("存在只购买不参摊商品的订单")
+
+    return issues
 
 
 def is_special_group_member(
