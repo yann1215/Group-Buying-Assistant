@@ -642,6 +642,15 @@ def _update_single_person_role(
             "请先清理重复配置。"
         )
 
+    # 明确的字段修改
+    if update.get("_修改字段"):
+        _apply_explicit_member_edit(
+            members=members,
+            update=update,
+            role_indexes=indexes,
+        )
+        return
+
     if not indexes:
         if not has_member_identity(update):
             raise SpecialMemberError(
@@ -745,25 +754,36 @@ def _apply_explicit_member_edit(
     role_indexes: list[int],
 ) -> None:
     """
-    根据旧身份信息定位成员，然后修改指定字段。
+    修改已有特殊成员的指定字段。
 
-    明确修改命令绝不自动新增成员。
+    支持两种情况：
+
+    1. 明确提供旧身份：
+        工具人 工具猫 的昵称改为 yann
+        单号12的工具人的昵称改为 yann
+
+    2. 不提供旧身份：
+        工具人昵称修改为 yann
+        车主昵称修改为 麦乐鸡侠
+
+       此时：
+       - 当前角色只有一人：直接修改
+       - 当前角色有多人：拒绝，要求明确指定
+       - 当前没有该角色：拒绝，不自动新增
     """
     role = update["角色"]
+
     match_field = normalize_text(
         update.get("_匹配字段")
     )
+
     match_value = normalize_text(
         update.get("_匹配值")
     )
+
     target_field = normalize_text(
         update.get("_修改字段")
     )
-
-    if not match_value:
-        raise SpecialMemberError(
-            f"修改{role}时没有提供用于定位成员的信息。"
-        )
 
     if target_field not in IDENTITY_FIELDS:
         raise SpecialMemberError(
@@ -772,73 +792,129 @@ def _apply_explicit_member_edit(
 
     matched_indexes: list[int] = []
 
-    for index in role_indexes:
-        member = members[index]
+    # --------------------------------------------------
+    # 1. 没有提供旧身份信息
+    #
+    # 例如：
+    #   工具人昵称修改为 yann
+    #   车主昵称修改为 麦乐鸡侠
+    # --------------------------------------------------
+    if not match_value:
 
-        if match_field:
-            fields_to_check = (match_field,)
-        else:
-            # 未指定检索字段时，昵称、群昵称、单号都检查。
-            fields_to_check = IDENTITY_FIELDS
-
-        matched = False
-
-        for field in fields_to_check:
-            current_value = normalize_text(
-                member.get(field)
+        if not role_indexes:
+            raise SpecialMemberError(
+                f"当前还没有设置{role}，"
+                "因此无法进行修改。"
             )
-            expected_value = match_value
 
-            if field == "单号":
-                current_value = normalize_serial(
+        if len(role_indexes) > 1:
+            raise SpecialMemberError(
+                f"当前有多名{role}，"
+                f"无法确定需要修改哪一名{role}。"
+                "请使用昵称、群昵称或单号指定成员。"
+            )
+
+        # 只有唯一一个该角色，可以直接定位。
+        matched_indexes = [
+            role_indexes[0]
+        ]
+
+    # --------------------------------------------------
+    # 2. 提供了旧身份信息
+    #
+    # 例如：
+    #   工具人 工具猫 的昵称改为 yann
+    #   单号12的工具人的昵称改为 yann
+    # --------------------------------------------------
+    else:
+
+        for index in role_indexes:
+            member = members[index]
+
+            if match_field:
+                fields_to_check = (
+                    match_field,
+                )
+            else:
+                # 未明确指定匹配字段时，
+                # 昵称、群昵称、单号全部检查。
+                fields_to_check = IDENTITY_FIELDS
+
+            matched = False
+
+            for field in fields_to_check:
+
+                current_value = normalize_text(
+                    member.get(field)
+                )
+
+                expected_value = match_value
+
+                if field == "单号":
+                    current_value = normalize_serial(
+                        current_value
+                    )
+
+                    expected_value = normalize_serial(
+                        expected_value
+                    )
+
+                if (
                     current_value
+                    and expected_value
+                    and current_value == expected_value
+                ):
+                    matched = True
+                    break
+
+            if matched:
+                matched_indexes.append(
+                    index
                 )
-                expected_value = normalize_serial(
-                    expected_value
-                )
 
-            if (
-                current_value
-                and expected_value
-                and current_value == expected_value
-            ):
-                matched = True
-                break
+        # 一个都没找到
+        if not matched_indexes:
 
-        if matched:
-            matched_indexes.append(index)
+            field_text = (
+                f"{match_field}为“{match_value}”"
+                if match_field
+                else f"身份信息为“{match_value}”"
+            )
 
-    if not matched_indexes:
-        field_text = (
-            f"{match_field}为“{match_value}”"
-            if match_field
-            else f"身份信息为“{match_value}”"
-        )
+            raise SpecialMemberError(
+                f"没有找到{field_text}的{role}，"
+                "因此没有进行修改。"
+            )
 
-        raise SpecialMemberError(
-            f"没有找到{field_text}的{role}，"
-            "因此没有进行修改。"
-        )
+        # 找到了多个
+        if len(matched_indexes) > 1:
 
-    if len(matched_indexes) > 1:
-        field_text = (
-            f"{match_field}“{match_value}”"
-            if match_field
-            else f"“{match_value}”"
-        )
+            field_text = (
+                f"{match_field}“{match_value}”"
+                if match_field
+                else f"“{match_value}”"
+            )
 
-        raise SpecialMemberError(
-            f"{field_text}匹配到了多名{role}，"
-            "请明确写出昵称、群昵称或单号进行检索。"
-        )
+            raise SpecialMemberError(
+                f"{field_text}匹配到了多名{role}，"
+                "请明确写出昵称、群昵称或单号进行检索。"
+            )
 
-    target = members[matched_indexes[0]]
+    # --------------------------------------------------
+    # 3. 修改目标成员
+    # --------------------------------------------------
+    target = members[
+        matched_indexes[0]
+    ]
+
     new_value = normalize_text(
         update.get(target_field)
     )
 
     if target_field == "单号":
-        new_value = normalize_serial(new_value)
+        new_value = normalize_serial(
+            new_value
+        )
 
         if not new_value:
             raise SpecialMemberError(

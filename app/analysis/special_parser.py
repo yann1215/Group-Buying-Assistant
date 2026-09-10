@@ -228,19 +228,46 @@ def parse_special_member_updates(
     if edit_update is not None:
         return [edit_update]
 
-    # 处理角色在后的表达
-    reversed_update = parse_reversed_special_member(normalized)
-
-    if reversed_update is not None:
-        return [reversed_update]
-
-    # 剩余情况按“角色在前”解析
-    role_matches = list(
-        ROLE_PATTERN.finditer(normalized)
-    )
-
+    # --------------------------------------------------
+    # 一句话中存在多个角色时，
+    # 优先判断是否属于“角色在前”的连续设置。
+    #
+    # 例如：
+    #   车主 番茄，工具人 鸡蛋
+    #
+    # 避免被 parse_reversed_special_member() 错误识别成：
+    #   “车主 番茄”这个人是工具人
+    # --------------------------------------------------
+    role_matches = list(ROLE_PATTERN.finditer(normalized))
     if not role_matches:
         return []
+
+    first_role_prefix = normalized[
+                        :role_matches[0].start()
+                        ].strip()
+
+    role_first_prefixes = {
+        "",
+        "设置",
+        "请设置",
+        "设定",
+        "请设定",
+    }
+
+    prefer_role_first = (
+            len(role_matches) >= 2
+            and first_role_prefix in role_first_prefixes
+    )
+
+    if not prefer_role_first:
+        # 单角色，或者明显不是多个“角色在前”设置，
+        # 再尝试“成员身份 + 角色”语法。
+        reversed_update = parse_reversed_special_member(
+            normalized
+        )
+
+        if reversed_update is not None:
+            return [reversed_update]
 
     updates: list[dict[str, Any]] = []
 
@@ -361,7 +388,7 @@ def parse_special_member_edit(
         role_first_pattern = re.compile(
             rf"^\s*"
             rf"(?:请\s*)?"
-            rf"(?:把|修改)\s*"
+            rf"(?:(?:把|修改)\s*)?"
             rf"(?P<role>{_ROLE_PATTERN_TEXT})"
             rf"\s*"
             rf"(?P<selector>.+?)"
@@ -520,9 +547,87 @@ def parse_reversed_special_member(
     if not normalized:
         return None
 
+    # ----------------------------------------------------------
+    # 0. 只有角色，没有旧身份定位信息
+    # ----------------------------------------------------------
+    #
+    # 支持：
+    #   工具人昵称修改为 yann
+    #   工具人的昵称改为 yann
+    #   车主群昵称修改为 001 麦乐鸡
+    #   画师单号改为 12
+    #
+    role_only_pattern = re.compile(
+        rf"^\s*"
+        rf"(?:请\s*)?"
+        rf"(?:把|修改)?\s*"
+        rf"(?P<role>{_ROLE_PATTERN_TEXT})"
+        rf"\s*的?\s*"
+        rf"(?P<target_field>{_EDITABLE_FIELD_PATTERN})"
+        rf"\s*"
+        rf"(?:修改为|改为|改成|修改成|设为|设置为)"
+        rf"\s*"
+        rf"(?P<new_value>.+?)"
+        rf"\s*$"
+    )
+
+    role_only_match = role_only_pattern.fullmatch(
+        normalized
+    )
+
+    if role_only_match:
+        role = normalize_special_member_role(
+            role_only_match.group("role")
+        )
+
+        target_field = EDITABLE_FIELD_ALIASES[
+            role_only_match.group("target_field")
+        ]
+
+        new_value = normalize_text(
+            role_only_match.group("new_value")
+        ).strip(
+            " ，,。；;：:"
+        )
+
+        if not new_value:
+            return None
+
+        if target_field == "单号":
+            new_value = normalize_order_no(
+                new_value
+            )
+
+            if not new_value:
+                return {
+                    "角色": role,
+                    "_修改错误": (
+                        "修改后的单号必须是正整数。"
+                    ),
+                }
+
+        update = {
+            "角色": role,
+            "昵称": "",
+            "群昵称": "",
+            "单号": "",
+            "参摊": None,
+
+            # 没有指定旧成员身份，
+            # 后续根据该角色当前人数决定是否可以修改。
+            "_匹配字段": "",
+            "_匹配值": "",
+            "_修改字段": target_field,
+        }
+
+        update[target_field] = new_value
+
+        return update
+
     # --------------------------------------------------
     # 1. 优先处理有明确连接词的表达
     #
+
     # Yann是画师
     # 把Yann设为画师
     # 单号12是画师
