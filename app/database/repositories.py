@@ -9,7 +9,7 @@ from typing import Any
 from app.database.db import get_conn
 
 
-MAX_SESSION_COUNT = 20
+MAX_SESSION_COUNT = 30
 
 ORDER_VERSION_FIELDS = (
     "new_order_file",
@@ -81,7 +81,7 @@ def list_sessions(limit: int = MAX_SESSION_COUNT) -> list[dict[str, Any]]:
             """
             SELECT id, title, group_name, created_at, updated_at
             FROM sessions
-            ORDER BY updated_at DESC, id DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
             (limit,),
@@ -387,7 +387,7 @@ def _prune_old_sessions(
         WHERE id IN (
             SELECT id
             FROM sessions
-            ORDER BY updated_at DESC, id DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT -1 OFFSET ?
         )
         """,

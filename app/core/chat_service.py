@@ -22,7 +22,7 @@ from app.database.repositories import (
     list_sessions,
     load_session_context,
     save_session_context,
-    touch_session,
+    # touch_session,
     update_order_versions,
     update_session,
 )
@@ -79,7 +79,7 @@ class ChatService:
         context_data = load_session_context(session_id)
         self.tools.load_context(session_id, context_data)
         self._sync_new_order_to_tools(session_id, context_data)
-        touch_session(session_id)
+        # touch_session(session_id)
         return get_messages(session_id)
 
     def delete_conversation(self, session_id: int) -> bool:

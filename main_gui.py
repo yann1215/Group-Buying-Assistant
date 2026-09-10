@@ -459,7 +459,12 @@ class ChatWindow(QMainWindow):
             self.session_list.blockSignals(False)
             self._updating_session_list = False
 
-    def load_session(self, session_id: int) -> None:
+    def load_session(
+            self,
+            session_id: int,
+            *,
+            refresh_sidebar: bool = True,
+    ) -> None:
         messages = self.chat_service.load_conversation(session_id)
         self.session_id = session_id
         self.chat_view.clear()
@@ -473,7 +478,9 @@ class ChatWindow(QMainWindow):
         else:
             self.append_message("assistant", self._welcome_text())
 
-        self.refresh_session_list(session_id)
+        if refresh_sidebar:
+            self.refresh_session_list(session_id)
+
         self.input_box.setFocus()
 
     @Slot(object, object)
@@ -494,7 +501,10 @@ class ChatWindow(QMainWindow):
             return
 
         try:
-            self.load_session(int(selected_id))
+            self.load_session(
+                int(selected_id),
+                refresh_sidebar=False,
+            )
         except Exception as exc:
             QMessageBox.critical(
                 self,
