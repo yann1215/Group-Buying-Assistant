@@ -765,6 +765,12 @@ class ToolOrchestrator:
         #    商品大货总价
         # ---------------------------------
 
+        update_product_config_before_bulk(
+            config_file=ctx.share_config_file,
+            original_order_file=ctx.new_order_file,
+        )
+
+        # 更新完成后重新读取商品配置
         ctx.product_configs = (
             load_product_share_config_file(
                 ctx.share_config_file
@@ -895,7 +901,7 @@ class ToolOrchestrator:
         # 防止两次消息之间订单文件被修改。
         check_result = self.ensure_member_checked(
             ctx,
-            force_refresh=True,
+            force=True,
             progress_callback=progress_callback,
         )
 
