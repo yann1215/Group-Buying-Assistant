@@ -12,6 +12,9 @@ from app.core.order_version_manager import (
     shift_order_versions,
 )
 from app.core.tool_orchestrator import ToolOrchestrator
+from app.analysis.product_config import (
+    delete_product_config_file,
+)
 
 from app.database.repositories import (
     add_message,
@@ -84,10 +87,35 @@ class ChatService:
         # touch_session(session_id)
         return get_messages(session_id)
 
-    def delete_conversation(self, session_id: int) -> bool:
-        deleted = delete_session(session_id)
+    def delete_conversation(
+            self,
+            session_id: int,
+            *,
+            delete_product_config: bool = False,
+    ) -> bool:
+        self._ensure_context_loaded(session_id)
+
+        ctx = self.tools.get_context(
+            session_id
+        )
+
+        config_file = ctx.share_config_file
+
+        # 用户明确要求时才删除商品配置
+        if delete_product_config:
+            delete_product_config_file(
+                config_file
+            )
+
+        deleted = delete_session(
+            session_id
+        )
+
         if deleted:
-            self.tools.remove_context(session_id)
+            self.tools.remove_context(
+                session_id
+            )
+
         return deleted
 
     def save_working_context(self, session_id: int) -> None:

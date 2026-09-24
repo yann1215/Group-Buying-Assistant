@@ -6,6 +6,7 @@ import csv
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from typing import Any
+import re
 
 from app.config import CSV_OUTPUT_DIR
 from app.analysis.order_validator import (
@@ -237,8 +238,58 @@ def load_product_share_config_file(
     return configs
 
 
+def sanitize_group_name_for_filename(
+    group_name: str,
+) -> str:
+    name = str(group_name or "").strip()
+
+    if not name:
+        raise ShareConfigError(
+            "群聊名称为空，无法生成商品配置文件名。"
+        )
+
+    name = re.sub(
+        r'[\\/:*?"<>|]',
+        "_",
+        name,
+    )
+
+    # Windows 文件名不能以空格或句点结尾
+    name = name.rstrip(" .")
+
+    if not name:
+        raise ShareConfigError(
+            "群聊名称无法转换为有效文件名。"
+        )
+
+    return name
+
+
+def get_product_config_file_path(
+    group_name: str,
+    output_dir: str | Path | None = None,
+) -> Path:
+    output_dir_path = (
+        Path(output_dir)
+        if output_dir
+        else CSV_OUTPUT_DIR
+    )
+
+    safe_group_name = (
+        sanitize_group_name_for_filename(
+            group_name
+        )
+    )
+
+    return (
+        output_dir_path
+        / f"{safe_group_name}_parsed_product_config.csv"
+    )
+
+
 def ensure_product_config_file(
     parsed_order_file: str | Path,
+    group_name: str,
     output_dir: str | Path | None = None,
 ) -> str:
     """
@@ -266,38 +317,10 @@ def ensure_product_config_file(
     返回：
         parsed_product_config.csv 的绝对路径
     """
-    parsed_order_file = Path(parsed_order_file)
 
-    if not parsed_order_file.exists():
-        raise FileNotFoundError(
-            f"简化订单文件不存在：{parsed_order_file}"
-        )
-
-    output_dir_path = (
-        Path(output_dir)
-        if output_dir
-        else CSV_OUTPUT_DIR
-    )
-
-    output_dir_path.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # ---------------------------------
-    # 生成配置文件路径
-    # ---------------------------------
-
-    base_name = parsed_order_file.stem
-
-    if base_name.endswith("_parsed_orders"):
-        base_name = base_name.removesuffix(
-            "_parsed_orders"
-        )
-
-    output_path = (
-        output_dir_path
-        / f"{base_name}_parsed_product_config.csv"
+    output_path = get_product_config_file_path(
+        group_name=group_name,
+        output_dir=output_dir,
     )
 
     # ---------------------------------
@@ -414,6 +437,57 @@ def ensure_product_config_file(
     return str(
         output_path.resolve()
     )
+
+
+def rename_product_config_file(
+    current_config_file: str | Path | None,
+    new_group_name: str,
+    output_dir: str | Path | None = None,
+) -> str | None:
+    if not current_config_file:
+        return None
+
+    old_path = Path(current_config_file)
+
+    if not old_path.exists():
+        return None
+
+    new_path = get_product_config_file_path(
+        group_name=new_group_name,
+        output_dir=output_dir,
+    )
+
+    old_path = old_path.resolve()
+    new_path = new_path.resolve()
+
+    if old_path == new_path:
+        return str(new_path)
+
+    if new_path.exists():
+        raise ShareConfigError(
+            "修改群聊名称失败："
+            f"目标商品配置文件已经存在：{new_path}"
+        )
+
+    old_path.rename(new_path)
+
+    return str(new_path)
+
+
+def delete_product_config_file(
+    config_file: str | Path | None,
+) -> bool:
+    if not config_file:
+        return False
+
+    path = Path(config_file)
+
+    if not path.exists():
+        return False
+
+    path.unlink()
+
+    return True
 
 
 def make_share_type(

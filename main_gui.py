@@ -533,29 +533,69 @@ class ChatWindow(QMainWindow):
         if self.is_processing:
             return
 
-        answer = QMessageBox.question(
-            self,
-            "删除对话",
-            "确定删除当前对话及其聊天记录吗？\n"
-            "已经生成的 Excel、CSV 等文件不会被删除。",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+        box = QMessageBox(self)
+        box.setWindowTitle("删除对话")
+
+        box.setText(
+            "确定删除当前对话及其聊天记录吗？"
         )
-        if answer != QMessageBox.Yes:
+
+        box.setInformativeText(
+            "你可以选择是否同时删除该对话对应的商品配置文件。\n"
+            "订单、计算结果等其他文件不会被删除。"
+        )
+
+        delete_all_button = box.addButton(
+            "删除对话和商品配置",
+            QMessageBox.DestructiveRole,
+        )
+
+        delete_chat_button = box.addButton(
+            "仅删除对话",
+            QMessageBox.AcceptRole,
+        )
+
+        cancel_button = box.addButton(
+            "取消",
+            QMessageBox.RejectRole,
+        )
+
+        box.exec()
+
+        clicked = box.clickedButton()
+
+        if clicked == cancel_button:
             return
 
+        delete_product_config = (
+                clicked == delete_all_button
+        )
+
         try:
-            self.chat_service.delete_conversation(self.session_id)
-            sessions = self.chat_service.list_conversations()
+            self.chat_service.delete_conversation(
+                self.session_id,
+                delete_product_config=(
+                    delete_product_config
+                ),
+            )
+
+            sessions = (
+                self.chat_service.list_conversations()
+            )
 
             if sessions:
-                next_session_id = int(sessions[0]["id"])
+                next_session_id = int(
+                    sessions[0]["id"]
+                )
             else:
                 next_session_id = (
                     self.chat_service.create_conversation()
                 )
 
-            self.load_session(next_session_id)
+            self.load_session(
+                next_session_id
+            )
+
         except Exception as exc:
             QMessageBox.critical(
                 self,

@@ -413,6 +413,48 @@ class ToolOrchestrator:
     def remove_context(self, session_id: int) -> None:
         self.contexts.pop(session_id, None)
 
+    def update_group_name(
+            self,
+            ctx: SessionToolContext,
+            new_group_name: str,
+    ) -> None:
+        from app.analysis.product_config import (
+            rename_product_config_file,
+        )
+
+        new_group_name = str(
+            new_group_name or ""
+        ).strip()
+
+        if not new_group_name:
+            return
+
+        old_group_name = str(
+            ctx.group_name or ""
+        ).strip()
+
+        if old_group_name == new_group_name:
+            return
+
+        # 已经有商品配置时，同步改名
+        if ctx.share_config_file:
+            new_config_file = (
+                rename_product_config_file(
+                    current_config_file=(
+                        ctx.share_config_file
+                    ),
+                    new_group_name=new_group_name,
+                    output_dir=ctx.order_output_dir,
+                )
+            )
+
+            if new_config_file:
+                ctx.share_config_file = (
+                    new_config_file
+                )
+
+        ctx.group_name = new_group_name
+
     def set_context(
             self,
             session_id: int,
@@ -423,7 +465,7 @@ class ToolOrchestrator:
         ctx = self.contexts.setdefault(session_id, SessionToolContext())
 
         if group_name is not None:
-            ctx.group_name = str(group_name).strip()
+            self.update_group_name(ctx, group_name)
 
         if order_output_dir is not None:
             ctx.order_output_dir = normalize_output_dir(order_output_dir)
@@ -443,9 +485,7 @@ class ToolOrchestrator:
         """
 
         if intent.get("group_name"):
-            ctx.group_name = str(
-                intent["group_name"]
-            ).strip()
+            self.update_group_name(ctx, intent=["group_name"])
 
         if intent.get("order_output_dir"):
             ctx.order_output_dir = normalize_output_dir(
@@ -756,6 +796,7 @@ class ToolOrchestrator:
 
         ctx.share_config_file = ensure_product_config_file(
             parsed_order_file=parsed_order_file,
+            group_name=ctx.group_name,
             output_dir=ctx.order_output_dir,
         )
 
@@ -994,6 +1035,7 @@ class ToolOrchestrator:
         """
         ctx.share_config_file = ensure_product_config_file(
             parsed_order_file=parsed_order_file,
+            group_name=ctx.group_name,
             output_dir=ctx.order_output_dir,
         )
 

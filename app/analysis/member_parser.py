@@ -160,6 +160,7 @@ def parse_group_member_orders(
     # 7. 同步商品配置文件
     share_config_file = ensure_product_config_file(
         parsed_order_file=parsed_order_file,
+        group_name=group_name,
         output_dir=order_output_dir,
     )
 

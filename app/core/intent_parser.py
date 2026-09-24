@@ -70,6 +70,8 @@ RESERVED_PRODUCT_NAMES = {
     "总均摊",
     "总均摊金额",
     "均摊金额",
+    "均",
+    "摊",
     "费用",
     "邮费",
     "手续费",
@@ -518,6 +520,54 @@ def parse_calculation_scope(text: str) -> str | None:
 # ----------------------------------------------------------------------
 # 总均摊金额
 # ----------------------------------------------------------------------
+def parse_total_share_amount_clause(
+    text: str,
+) -> str | None:
+    """
+    解析一个完整片段中的总均摊金额。
+
+    支持：
+        均摊100
+        均摊 100
+        均摊：100
+        摊100
+        摊：100
+        总均摊100
+        总均摊金额100
+        均摊金额100
+
+    注意：
+        必须整段匹配，因此：
+        小猫徽章摊10
+        小猫徽章均摊10
+        不会被识别为总均摊。
+    """
+    normalized = str(text or "").strip()
+
+    if not normalized:
+        return None
+
+    match = re.fullmatch(
+        r"(?:"
+        r"总均摊金额|"
+        r"总均摊|"
+        r"均摊总额|"
+        r"均摊金额|"
+        r"均摊|"
+        r"摊"
+        r")"
+        r"\s*(?:是|为|=|：|:)?\s*"
+        r"[￥¥]?\s*"
+        r"(\d+(?:\.\d{1,4})?)"
+        r"\s*(?:元)?",
+        normalized,
+    )
+
+    if not match:
+        return None
+
+    return match.group(1)
+
 
 def parse_amount(
     text: str,
@@ -550,6 +600,15 @@ def parse_amount(
     中的10元误识别为总均摊。
     """
     text = text.strip()
+
+    # 优先识别“均摊100 / 摊100”等明确总均摊片段
+    for clause in split_input_clauses(text):
+        total_share_amount = (
+            parse_total_share_amount_clause(clause)
+        )
+
+        if total_share_amount is not None:
+            return total_share_amount
 
     explicit_patterns = [
         (
@@ -649,6 +708,12 @@ def is_global_share_amount_command(text: str) -> bool:
         独立个数 100
         独立个数摊 100
     """
+
+    # 判断是否属于总均摊金额命令。
+    # “均摊100”“摊100”等纯总金额片段
+    if parse_total_share_amount_clause(text) is not None:
+        return True
+
     normalized = re.sub(
         r"\s+",
         "",
@@ -981,6 +1046,129 @@ def has_negative_words(text: str) -> bool:
 # 群聊和文件路径
 # ----------------------------------------------------------------------
 
+# 所有可以作为“下一个上下文字段”的关键词。
+#
+# 解析：
+#   群聊 临时喵喵 订单 miao2 输出目录 output
+#
+# 时：
+#   群聊 -> 临时喵喵
+#   订单 -> miao2
+#   输出目录 -> output
+#
+# 字段值允许包含空格，只有检测到下一个字段关键词、
+# 标点分隔符或文本结束时才停止。
+CONTEXT_FIELD_KEYWORDS = [
+    # 群聊
+    "群聊名称",
+    "当前群聊",
+    "群聊",
+    "群名",
+
+    # 订单
+    "当前订单文件",
+    "当前订单",
+    "订单文件",
+    "订单表",
+    "订单路径",
+    "订单目录",
+    "订单",
+    "输入文件",
+    "输入目录",
+
+    # 输出目录
+    "输出目录",
+    "保存目录",
+    "结果目录",
+]
+
+
+def parse_context_field_value(
+    text: str,
+    field_keywords: list[str],
+) -> str | None:
+    """
+    从一句话中提取指定字段的值。
+
+    例如：
+        text:
+            群聊 临时喵喵 订单 miao2 输出目录 output
+
+        field_keywords:
+            ["群聊名称", "当前群聊", "群聊", "群名"]
+
+        返回：
+            临时喵喵
+
+    解析规则：
+    1. 找到指定字段关键词；
+    2. 跳过“是 / 为 / = / ： / :”等连接符；
+    3. 一直读取到：
+       - 下一个上下文字段关键词
+       - 常见标点
+       - 换行
+       - 文本结束
+    """
+
+    text = str(text or "").strip()
+
+    if not text:
+        return None
+
+    # 长关键词优先，避免：
+    # “群聊名称”先被“群聊”匹配。
+    field_keywords = sorted(
+        field_keywords,
+        key=len,
+        reverse=True,
+    )
+
+    all_context_keywords = sorted(
+        CONTEXT_FIELD_KEYWORDS,
+        key=len,
+        reverse=True,
+    )
+
+    field_pattern = "|".join(
+        re.escape(keyword)
+        for keyword in field_keywords
+    )
+
+    stop_field_pattern = "|".join(
+        re.escape(keyword)
+        for keyword in all_context_keywords
+    )
+
+    pattern = (
+        rf"(?:{field_pattern})"
+        rf"\s*"
+        rf"(?:是|为|=|：|:)?"
+        rf"\s*"
+        rf"(.+?)"
+        rf"(?="
+        rf"\s+(?:{stop_field_pattern})"
+        rf"\s*(?:是|为|=|：|:)?"
+        rf"|[，,。；;\n]"
+        rf"|$"
+        rf")"
+    )
+
+    match = re.search(pattern, text)
+
+    if not match:
+        return None
+
+    value = match.group(1).strip()
+
+    # 去掉用户可能加上的引号
+    value = value.strip('"').strip("'").strip()
+
+    if not value:
+        return None
+
+    return value
+
+
 def parse_group_name(text: str) -> str | None:
     """
     支持：
@@ -988,25 +1176,25 @@ def parse_group_name(text: str) -> str | None:
         群名：xxx
         群聊名称是xxx
         当前群聊 xxx
+
+        群聊 临时喵喵 订单 miao2
+        群名 我的 测试 群 订单 test
+
+    示例：
+        群聊 临时喵喵 订单 miao2
+
+    返回：
+        临时喵喵
     """
-    patterns = [
-        (
-            r"(?:群聊名称|当前群聊|群聊|群名)"
-            r"\s*(?:是|为|=|：|:)?\s*"
-            r"([^，,。；;\n]+)"
-        ),
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text)
-
-        if match:
-            value = match.group(1).strip().strip('"').strip("'")
-
-            if value:
-                return value
-
-    return None
+    return parse_context_field_value(
+        text=text,
+        field_keywords=[
+            "群聊名称",
+            "当前群聊",
+            "群聊",
+            "群名",
+        ],
+    )
 
 
 def parse_order_input(text: str) -> str | None:
@@ -1019,27 +1207,33 @@ def parse_order_input(text: str) -> str | None:
         订单路径：D:\\orders\\订单1.xlsx
         输入文件：订单1.xlsx
         输入目录：D:\\orders
-        订单目录：D:\\orders
+
+        群聊 临时喵喵 订单 miao2
+        订单 miao2 输出目录 output
+
+    注意：
+        “大货订单”仍由其他逻辑单独处理。
     """
-    patterns = [
-        (
-            r"(?:(?<!大货)(?:当前订单文件|当前订单|订单文件|订单表|"
-            r"订单路径|订单|订单目录)|输入文件|输入目录)"
-            r"\s*(?:是|为|=|：|:)?\s*"
-            r"([^，,。；;\n]+)"
-        ),
-    ]
 
-    for pattern in patterns:
-        match = re.search(pattern, text)
+    value = parse_context_field_value(
+        text=text,
+        field_keywords=[
+            "当前订单文件",
+            "当前订单",
+            "订单文件",
+            "订单表",
+            "订单路径",
+            "订单目录",
+            "输入文件",
+            "输入目录",
+            "订单",
+        ],
+    )
 
-        if match:
-            value = match.group(1).strip().strip('"').strip("'")
+    if not value:
+        return None
 
-            if value:
-                return value
-
-    return None
+    return value
 
 
 def parse_order_output_dir(text: str) -> str | None:
@@ -1048,22 +1242,14 @@ def parse_order_output_dir(text: str) -> str | None:
         输出目录：D:\\orders\\output
         保存目录：D:\\orders\\output
         结果目录：D:\\orders\\output
+
+        订单 test 输出目录 D:\\orders\\output
     """
-    patterns = [
-        (
-            r"(?:输出目录|保存目录|结果目录)"
-            r"\s*(?:是|为|=|：|:)?\s*"
-            r"([^，,。；;\n]+)"
-        ),
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text)
-
-        if match:
-            value = match.group(1).strip().strip('"').strip("'")
-
-            if value:
-                return value
-
-    return None
+    return parse_context_field_value(
+        text=text,
+        field_keywords=[
+            "输出目录",
+            "保存目录",
+            "结果目录",
+        ],
+    )
