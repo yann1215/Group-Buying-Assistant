@@ -11,12 +11,12 @@ from app.core.order_version_manager import (
     OrderVersionUpdateResult,
     shift_order_versions,
 )
-from app.core.tool_orchestrator import ToolOrchestrator
-from app.analysis.product_config import (
-    delete_product_config_file,
-)
+from app.core.tool_orchestrator import ToolOrchestrator, invalidate_share_confirmation
+from app.core.archive_manager import archive_conversation_files
+from app.core.path_manager import sanitize_filename, format_order_path
 
 from app.database.repositories import (
+    MAX_SESSION_COUNT,
     add_message,
     create_session,
     delete_session,
@@ -59,6 +59,13 @@ class ChatService:
         title: str = "新对话",
         group_name: str | None = None,
     ) -> int:
+        if group_name:
+            if self._check_group_name_conflict(-1, group_name) is not None:
+                raise ValueError(f"群聊名称已被其他对话使用：{group_name}")
+        # 保持最多 30 个对话，但淘汰旧对话也必须走完整归档流程。
+        sessions = list_sessions(limit=None)
+        for session in reversed(sessions[MAX_SESSION_COUNT - 1:]):
+            self.delete_conversation(int(session["id"]))
         session_id = create_session(
             title=title,
             group_name=group_name,
@@ -84,39 +91,29 @@ class ChatService:
         context_data = load_session_context(session_id)
         self.tools.load_context(session_id, context_data)
         self._sync_new_order_to_tools(session_id, context_data)
+        if not context_data.get("config_owner_id"):
+            # 首次迁移必须立即保存归属，避免再次打开旧对话时生成另一标识。
+            self.save_working_context(session_id)
         # touch_session(session_id)
         return get_messages(session_id)
 
     def delete_conversation(
             self,
             session_id: int,
-            *,
-            delete_product_config: bool = False,
     ) -> bool:
-        self._ensure_context_loaded(session_id)
-
-        ctx = self.tools.get_context(
-            session_id
-        )
-
-        config_file = ctx.share_config_file
-
-        # 用户明确要求时才删除商品配置
-        if delete_product_config:
-            delete_product_config_file(
-                config_file
-            )
-
-        deleted = delete_session(
-            session_id
-        )
-
-        if deleted:
-            self.tools.remove_context(
-                session_id
-            )
-
-        return deleted
+        session = get_session(session_id)
+        if session is None:
+            raise ValueError(f"会话不存在：{session_id}")
+        context = load_session_context(session_id)
+        if session_id in self.tools.contexts:
+            context.update(self.tools.get_context_data(session_id))
+        context.update(get_order_versions(session_id))
+        group_name = context.get("group_name") or session.get("group_name")
+        with archive_conversation_files(session_id, group_name, context):
+            if not delete_session(session_id):
+                raise RuntimeError(f"删除会话记录失败：{session_id}")
+        self.tools.remove_context(session_id)
+        return True
 
     def save_working_context(self, session_id: int) -> None:
         session = get_session(session_id)
@@ -146,7 +143,6 @@ class ChatService:
             session_id: int,
             group_name: str | None = None,
             order_input: str | Path | None = None,
-            order_output_dir: str | Path | None = None,
     ) -> str | None:
 
         self._ensure_context_loaded(session_id)
@@ -200,15 +196,6 @@ class ChatService:
                 self._format_order_update_result(
                     result
                 )
-            )
-
-        # ---------------------------------
-        # 输出路径独立处理
-        # ---------------------------------
-        if order_output_dir is not None:
-            self.tools.set_context(
-                session_id=session_id,
-                order_output_dir=order_output_dir,
             )
 
         # 无论其中哪个字段失败，
@@ -301,14 +288,6 @@ class ChatService:
         # =========================================================
         if intent.get("intent") == "set_context":
 
-            # 输出目录同样独立更新
-            if intent.get("order_output_dir"):
-                self.tools.set_context(
-                    session_id=session_id,
-                    order_output_dir=intent["order_output_dir"],
-                )
-                self.save_working_context(session_id)
-
             reply = "\n\n".join(context_messages)
 
             if not reply:
@@ -391,6 +370,9 @@ class ChatService:
         )
         self._sync_new_order_to_tools(session_id, context_data)
 
+        if not context_data.get("config_owner_id"):
+            self.save_working_context(session_id)
+
     def _discard_deleted_contexts(self) -> None:
         existing_ids = {
             int(session["id"])
@@ -414,10 +396,19 @@ class ChatService:
         if not normalized_group_name:
             return None
 
-        return find_session_by_group_name(
+        conflict = find_session_by_group_name(
             normalized_group_name,
             exclude_session_id=session_id,
         )
+        if conflict is not None:
+            return conflict
+        # Windows 大小写及非法字符替换后也不能让两车共用文件名。
+        safe_name = sanitize_filename(normalized_group_name).casefold()
+        for session in list_sessions(limit=None):
+            if session["id"] != session_id and session.get("group_name"):
+                if sanitize_filename(session["group_name"]).casefold() == safe_name:
+                    return session
+        return None
 
     def _update_order_versions(
         self,
@@ -463,10 +454,11 @@ class ChatService:
             setattr(ctx, field_name, value or None)
 
         if old_new_order != str(ctx.new_order_file or ""):
+            invalidate_share_confirmation(ctx)
             ctx.member_checked = False
             ctx.member_check_result = None
             ctx.parsed_order_file = None
-            ctx.share_config_file = None
+            # 配置属于当前车的持久文件，换订单后仍保留其路径和手工设置。
             ctx.product_configs = None
             ctx.bulk_request.pending_confirmation = False
             ctx.bulk_request.confirmed = False
@@ -486,7 +478,7 @@ class ChatService:
             lines.extend(
                 [
                     f"订单输入错误：{result.error}。",
-                    f"已检查：{result.input_path or '未提供有效路径'}",
+                    f"已检查：{format_order_path(result.input_path, empty='未提供有效路径')}",
                     "现有有效订单版本没有移动。",
                 ]
             )
@@ -500,13 +492,13 @@ class ChatService:
                     removed.file_field,
                 )
                 lines.append(
-                    f"- {label}：{removed.file_path}（{removed.reason}）"
+                    f"- {label}：{format_order_path(removed.file_path)}（{removed.reason}）"
                 )
 
         lines.append("")
         for field_name, label in ORDER_SLOT_LABELS.items():
             lines.append(
-                f"{label}：{result.versions.get(field_name) or '未设置'}"
+                f"{label}：{format_order_path(result.versions.get(field_name))}"
             )
 
         if result.success:

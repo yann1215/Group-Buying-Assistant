@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 
-cd /d D:\1_PychamProjects\Group-Buying-Assistant
+cd /d "%~dp0"
 
 echo ================================
 echo 进入项目目录
@@ -63,6 +63,10 @@ echo 创建运行目录
 echo ================================
 if not exist "dist\GroupBuyingAssistant\orders" mkdir "dist\GroupBuyingAssistant\orders"
 if not exist "dist\GroupBuyingAssistant\orders\output" mkdir "dist\GroupBuyingAssistant\orders\output"
+if not exist "dist\GroupBuyingAssistant\orders\input" mkdir "dist\GroupBuyingAssistant\orders\input"
+if not exist "dist\GroupBuyingAssistant\orders\config" mkdir "dist\GroupBuyingAssistant\orders\config"
+if not exist "dist\GroupBuyingAssistant\orders\archive" mkdir "dist\GroupBuyingAssistant\orders\archive"
+if not exist "dist\GroupBuyingAssistant\workspace" mkdir "dist\GroupBuyingAssistant\workspace"
 if not exist "dist\GroupBuyingAssistant\temp" mkdir "dist\GroupBuyingAssistant\temp"
 if not exist "dist\GroupBuyingAssistant\logs" mkdir "dist\GroupBuyingAssistant\logs"
 if not exist "dist\GroupBuyingAssistant\data" mkdir "dist\GroupBuyingAssistant\data"

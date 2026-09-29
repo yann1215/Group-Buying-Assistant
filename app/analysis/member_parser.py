@@ -1,11 +1,9 @@
 # app/analysis/member_parser.py
 from __future__ import annotations
 
-import csv
 import re
 from pathlib import Path
 from typing import Any, Callable
-
 
 from integrations.wechatmsg_lite_client import get_wechat_group_members
 from app.analysis.order_parser import parse_order_file
@@ -20,12 +18,13 @@ from app.analysis.product_config import (
     ensure_product_config_file,
     load_product_share_config_file,
 )
+from app.utils.csv_utils import read_csv_dict_rows
 
 
 def parse_group_member_orders(
     group_name: str,
     order_input: str | Path | dict[str, Any],
-    order_output_dir: str | Path | None = None,
+    parsed_output_path: str | Path,
     special_members: list[dict[str, Any]] | None = None,
     key_input_func: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
@@ -141,7 +140,7 @@ def parse_group_member_orders(
     # 4. 调用 order_parser.py 简化订单表
     parsed_order_file = parse_order_file(
         order_input=order_input,
-        output_dir=order_output_dir,
+        output_path=parsed_output_path,
     )
 
     # 5. 读取订单成员
@@ -161,7 +160,6 @@ def parse_group_member_orders(
     share_config_file = ensure_product_config_file(
         parsed_order_file=parsed_order_file,
         group_name=group_name,
-        output_dir=order_output_dir,
     )
 
     product_configs = load_product_share_config_file(share_config_file)
@@ -381,15 +379,6 @@ def read_order_members(
 ) -> list[dict[str, str]]:
     """
     从简化后的订单 CSV 中读取订单成员信息。
-
-    返回：
-        [
-            {
-                "单号": "1",
-                "昵称": "Yann",
-            },
-            ...
-        ]
     """
     csv_path = Path(csv_path)
 
@@ -398,44 +387,45 @@ def read_order_members(
             f"订单 CSV 文件不存在：{csv_path}"
         )
 
-    order_members: list[dict[str, str]] = []
+    order_members: list[
+        dict[str, str]
+    ] = []
 
-    with csv_path.open(
-        "r",
-        encoding="utf-8-sig",
-        newline="",
-    ) as file:
-        reader = csv.DictReader(file)
+    rows, fieldnames = read_csv_dict_rows(
+        csv_path
+    )
 
-        if not reader.fieldnames:
-            return order_members
+    if not fieldnames:
+        return order_members
 
-        if "单号" not in reader.fieldnames:
+    if "单号" not in fieldnames:
+        raise ValueError(
+            "简化订单 CSV 中没有找到“单号”列。"
+        )
+
+    for row_index, row in enumerate(
+        rows,
+        start=2,
+    ):
+        raw_order_no = row.get("单号")
+        order_no = normalize_serial(
+            raw_order_no
+        )
+
+        if not order_no:
             raise ValueError(
-                "简化订单 CSV 中没有找到“单号”列。"
+                f"订单 CSV 第 {row_index} 行的单号"
+                f"不是有效正整数：{raw_order_no!r}"
             )
 
-        for row_index, row in enumerate(
-            reader,
-            start=2,
-        ):
-            raw_order_no = row.get("单号")
-            order_no = normalize_serial(raw_order_no)
-
-            if not order_no:
-                raise ValueError(
-                    f"订单 CSV 第 {row_index} 行的单号"
-                    f"不是有效正整数：{raw_order_no!r}"
-                )
-
-            order_members.append(
-                {
-                    "单号": order_no,
-                    "昵称": str(
-                        row.get("昵称") or ""
-                    ).strip(),
-                }
-            )
+        order_members.append(
+            {
+                "单号": order_no,
+                "昵称": str(
+                    row.get("昵称") or ""
+                ).strip(),
+            }
+        )
 
     return order_members
 

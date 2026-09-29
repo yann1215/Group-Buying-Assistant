@@ -3,9 +3,9 @@
 """
 
 1. 判断当前 session 有没有群聊名称和订单文件
-2. 如果没核对过，先调用 parse_group_member_orders()
-3. 如果名单有严重问题，先返回问题，不计算
-4. 如果可以计算，再调用 calculate_share()
+2. 录入均摊只保存参数；计算前先展示商品配置并等待确认
+3. 确认后调用 parse_group_member_orders()，名单有问题则暂停
+4. 校验配置未变化后计算；查看均摊只读取当前有效结果
 
 """
 
@@ -15,6 +15,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from decimal import Decimal
+import hashlib
+import json
+from uuid import uuid4
 
 from app.analysis.order_parser import parse_order_file
 from app.analysis.special_member import (
@@ -26,15 +29,17 @@ from app.analysis.member_parser import parse_group_member_orders
 from app.analysis.special_member import (
     get_non_share_order_nos,
 )
-from app.analysis.share_calculator import calculate_share
+from app.analysis.share_calculator import calculate_share, normalize_share_type
 from app.analysis.product_config import (
     ensure_product_config_file,
     load_product_share_config_file,
-    summarize_product_share_config,
     update_product_share_config_file,
     update_product_config_before_share,
     update_product_config_after_share,
     update_product_config_before_bulk,
+    claim_product_config,
+    owns_product_config,
+    reset_product_share_fields,
 )
 from app.analysis.bulk_calculator import (
     create_bulk_receivable_orders,
@@ -42,11 +47,12 @@ from app.analysis.bulk_calculator import (
 from app.core.intent_parser import (
     has_affirmative_words,
     has_negative_words,
+    has_share_confirmation_words,
     parse_user_intent,
 )
+from app.core.path_manager import get_parsed_orders_path, get_product_config_path, format_order_path
+from app.core.archive_manager import rename_conversation_files
 
-
-DEFAULT_ORDER_OUTPUT_DIR = Path("./orders/output")
 
 def emit_progress(
     callback: Callable[[str], None] | None,
@@ -209,6 +215,8 @@ class ShareRequestState:
 
     pending_config_confirmation: bool = False
     config_confirmed: bool = False
+    confirmation_signature: str | None = None
+    reset_product_amounts: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -218,6 +226,8 @@ class ShareRequestState:
             "force": self.force,
             "pending_config_confirmation": self.pending_config_confirmation,
             "config_confirmed": self.config_confirmed,
+            "confirmation_signature": self.confirmation_signature,
+            "reset_product_amounts": self.reset_product_amounts,
         }
 
     @classmethod
@@ -236,6 +246,8 @@ class ShareRequestState:
                 data.get("pending_config_confirmation") is True
             ),
             config_confirmed=data.get("config_confirmed") is True,
+            confirmation_signature=data.get("confirmation_signature"),
+            reset_product_amounts=data.get("reset_product_amounts") is True,
         )
 
 
@@ -265,6 +277,13 @@ class BulkGoodsRequestState:
 
 @dataclass
 class SessionToolContext:
+    # 仅由编排层设置，不从旧 JSON 信任或恢复。
+    session_id: int | None = None
+    config_owner_id: str = field(default_factory=lambda: uuid4().hex)
+    last_share_result: dict[str, Any] | None = None
+    last_share_signature: str | None = None
+    share_results_invalidated: bool = False
+    legacy_share_signature: str | None = None
     group_name: str | None = None
 
     special_members: list[dict[str, Any]] = field(
@@ -280,8 +299,6 @@ class SessionToolContext:
     order_cache_1_updated_at: str | None = None
     order_cache_2_file: str | None = None
     order_cache_2_updated_at: str | None = None
-
-    order_output_dir: str | Path | None = None
 
     # 新订单核对缓存
     member_checked: bool = False
@@ -308,6 +325,11 @@ class SessionToolContext:
         """
         return {
             "context_version": 1,
+            "config_owner_id": self.config_owner_id,
+            "last_share_result": _to_json_safe(self.last_share_result),
+            "last_share_signature": self.last_share_signature,
+            "share_results_invalidated": self.share_results_invalidated,
+            "legacy_share_signature": self.legacy_share_signature,
             "group_name": self.group_name,
             "special_members": _to_json_safe(self.special_members),
             "new_order_file": self.new_order_file,
@@ -318,7 +340,6 @@ class SessionToolContext:
             "order_cache_1_updated_at": self.order_cache_1_updated_at,
             "order_cache_2_file": self.order_cache_2_file,
             "order_cache_2_updated_at": self.order_cache_2_updated_at,
-            "order_output_dir": _to_json_safe(self.order_output_dir),
             "share_config_file": self.share_config_file,
             "product_configs": _to_json_safe(self.product_configs),
             "share_request": self.share_request.to_dict(),
@@ -334,6 +355,11 @@ class SessionToolContext:
         product_configs = data.get("product_configs")
 
         return cls(
+            config_owner_id=str(data.get("config_owner_id") or uuid4().hex),
+            last_share_result=data.get("last_share_result") if isinstance(data.get("last_share_result"), dict) else None,
+            last_share_signature=data.get("last_share_signature"),
+            share_results_invalidated=data.get("share_results_invalidated") is True,
+            legacy_share_signature=data.get("legacy_share_signature"),
             group_name=_optional_string(data.get("group_name")),
             special_members=_dict_list_or_empty(special_members),
             new_order_file=_optional_string(data.get("new_order_file")),
@@ -355,9 +381,6 @@ class SessionToolContext:
             ),
             order_cache_2_updated_at=_optional_string(
                 data.get("order_cache_2_updated_at")
-            ),
-            order_output_dir=_optional_string(
-                data.get("order_output_dir")
             ),
 
             # 核对状态始终使用默认值 False/None，避免恢复过期结果。
@@ -395,7 +418,7 @@ class ToolOrchestrator:
     def get_context(self, session_id: int) -> SessionToolContext:
         return self.contexts.setdefault(
             session_id,
-            SessionToolContext(),
+            SessionToolContext(session_id=session_id),
         )
 
     def get_context_data(self, session_id: int) -> dict[str, Any]:
@@ -407,6 +430,18 @@ class ToolOrchestrator:
         context_data: dict[str, Any] | None,
     ) -> SessionToolContext:
         ctx = SessionToolContext.from_dict(context_data)
+        ctx.session_id = session_id
+        # 旧上下文明确记录的配置文件迁入固定目录，保留手工修改。
+        if ctx.group_name and ctx.share_config_file:
+            ctx.share_config_file = rename_conversation_files(
+                None, ctx.group_name, ctx.share_config_file,
+            ) or str(get_product_config_path(ctx.group_name))
+            claim_product_config(
+                ctx.share_config_file, ctx.config_owner_id,
+                adopt_legacy=not bool((context_data or {}).get("config_owner_id")),
+            )
+        if not ctx.last_share_result and not ctx.share_results_invalidated and not ctx.legacy_share_signature:
+            ctx.legacy_share_signature = share_signature(ctx, include_members=True)
         self.contexts[session_id] = ctx
         return ctx
 
@@ -418,10 +453,6 @@ class ToolOrchestrator:
             ctx: SessionToolContext,
             new_group_name: str,
     ) -> None:
-        from app.analysis.product_config import (
-            rename_product_config_file,
-        )
-
         new_group_name = str(
             new_group_name or ""
         ).strip()
@@ -436,41 +467,24 @@ class ToolOrchestrator:
         if old_group_name == new_group_name:
             return
 
-        # 已经有商品配置时，同步改名
-        if ctx.share_config_file:
-            new_config_file = (
-                rename_product_config_file(
-                    current_config_file=(
-                        ctx.share_config_file
-                    ),
-                    new_group_name=new_group_name,
-                    output_dir=ctx.order_output_dir,
-                )
-            )
-
-            if new_config_file:
-                ctx.share_config_file = (
-                    new_config_file
-                )
-
+        ctx.share_config_file = rename_conversation_files(
+            old_group_name, new_group_name, ctx.share_config_file,
+        )
         ctx.group_name = new_group_name
+        # 成员缓存包含配置路径和群成员，改名后重新检查。
+        ctx.member_checked = False
+        ctx.member_check_result = None
 
     def set_context(
             self,
             session_id: int,
             group_name: str | None = None,
-            order_output_dir: str | Path | None = None,
     ) -> None:
 
-        ctx = self.contexts.setdefault(session_id, SessionToolContext())
+        ctx = self.get_context(session_id)
 
         if group_name is not None:
             self.update_group_name(ctx, group_name)
-
-        if order_output_dir is not None:
-            ctx.order_output_dir = normalize_output_dir(order_output_dir)
-        elif ctx.order_output_dir is None:
-            ctx.order_output_dir = str(DEFAULT_ORDER_OUTPUT_DIR)
 
     def update_context_from_intent(
             self,
@@ -485,16 +499,7 @@ class ToolOrchestrator:
         """
 
         if intent.get("group_name"):
-            self.update_group_name(ctx, intent=["group_name"])
-
-        if intent.get("order_output_dir"):
-            ctx.order_output_dir = normalize_output_dir(
-                intent["order_output_dir"]
-            )
-        elif ctx.order_output_dir is None:
-            ctx.order_output_dir = str(
-                DEFAULT_ORDER_OUTPUT_DIR
-            )
+            self.update_group_name(ctx, intent["group_name"])
 
     def update_share_request_from_intent(
             self,
@@ -508,36 +513,29 @@ class ToolOrchestrator:
         原有商品配置确认状态失效。
         """
         req = ctx.share_request
-
-        new_share_mode = intent.get("share_mode")
-
-        if new_share_mode:
-            if new_share_mode != req.share_mode:
-                req.pending_config_confirmation = False
-                req.config_confirmed = False
-
-            req.share_mode = new_share_mode
-
-        new_scope = intent.get("calculation_scope")
-
-        if new_scope:
-            if new_scope != req.calculation_scope:
-                req.pending_config_confirmation = False
-                req.config_confirmed = False
-
-            req.calculation_scope = new_scope
-
+        new_mode = intent.get("share_mode") or req.share_mode
+        new_scope = intent.get("calculation_scope") or req.calculation_scope or "flat"
+        changed = new_mode != req.share_mode or new_scope != (req.calculation_scope or "flat")
+        # 独立模式未显式输入总额时，完整的商品金额合计也是当前总均摊。
+        if changed and req.calculation_scope == "independent" and req.amount is None:
+            if ctx.share_config_file and owns_product_config(ctx.share_config_file, ctx.config_owner_id):
+                configs = load_product_share_config_file(ctx.share_config_file)
+                active = [c for c in configs if c.get("计入均摊")]
+                if active and all(c.get("商品均摊") not in (None, "") for c in active):
+                    req.amount = f"{sum((Decimal(c['商品均摊']) for c in active), Decimal(0)):.2f}"
+        if changed:
+            req.reset_product_amounts = True
+            invalidate_share_confirmation(ctx)
         new_amount = intent.get("amount")
-
-        if new_amount:
-            if new_amount != req.amount:
-                # 总均摊变化后，旧确认结果失效。
-                req.config_confirmed = False
-
+        intent["share_parameters_changed"] = changed or (new_amount is not None and new_amount != req.amount)
+        if new_amount is not None and new_amount != req.amount:
+            invalidate_share_confirmation(ctx)
+        req.share_mode = new_mode
+        req.calculation_scope = new_scope
+        if new_amount is not None:
             req.amount = new_amount
-
-        if intent.get("force"):
-            req.force = True
+        # force 只由本轮继续指令消费，不能遗留给后续计算。
+        req.force = bool(intent.get("force"))
 
     def handle(
             self,
@@ -555,7 +553,7 @@ class ToolOrchestrator:
 
         ctx = self.contexts.setdefault(
             session_id,
-            SessionToolContext(),
+            SessionToolContext(session_id=session_id),
         )
 
         # print("share_request BEFORE:", ctx.share_request)
@@ -580,6 +578,16 @@ class ToolOrchestrator:
                     "请修改或同步订单信息后，重新输入“查大货”或“算大货”。"
                 )
 
+        if (
+            ctx.share_request.pending_config_confirmation
+            and intent["intent"] in {"chat", "calculate_share", "update_share_config", "confirm_share_config"}
+            and has_share_confirmation_words(user_text)
+        ):
+            intent["intent"] = "confirm_share_config"
+            # 普通确认不能继承“继续算”解析出的忽略名单标记。
+            intent["force"] = False
+            ctx.share_request.force = False
+
         if intent["intent"] == "chat":
             return None
 
@@ -595,6 +603,15 @@ class ToolOrchestrator:
         if intent["intent"] == "show_special_members":
             return format_special_members(ctx.special_members)
 
+        if intent["intent"] == "show_share":
+            return self.handle_show_share(ctx)
+
+        if intent["intent"] == "cancel_share":
+            if ctx.share_request.pending_config_confirmation or ctx.share_request.config_confirmed:
+                invalidate_share_confirmation(ctx)
+                return '已取消本次均摊计算；修改配置后请重新输入“算均摊”。'
+            return None
+
         if intent["intent"] == "member_check":
             check_result = self.ensure_member_checked(
                 ctx,
@@ -605,10 +622,14 @@ class ToolOrchestrator:
 
         if intent["intent"] == "calculate_share":
             self.update_share_request_from_intent(ctx, intent)
-
-            # print("ENTER: calculate_share")
-            # print("share_request AFTER:", ctx.share_request)
-
+            if intent.get("product_share_amounts") or any(
+                intent.get(key) is not None for key in ("share_mode", "calculation_scope", "amount")
+            ):
+                reply = self.handle_update_share_config(ctx, intent)
+                if not intent.get("config_saved"):
+                    return reply
+            if intent.get("force") and ctx.share_request.config_confirmed:
+                return self.execute_confirmed_share(ctx, progress_callback)
             return self.handle_calculate_share(
                 ctx,
                 intent,
@@ -623,7 +644,13 @@ class ToolOrchestrator:
             return self.handle_update_share_config(ctx, intent)
 
         if intent["intent"] == "confirm_share_config":
-            return self.handle_confirm_share_config(ctx, intent)
+            if any(intent.get(key) is not None for key in ("share_mode", "calculation_scope", "amount")) or intent.get("product_share_amounts"):
+                self.update_share_request_from_intent(ctx, intent)
+                reply = self.handle_update_share_config(ctx, intent)
+                if not intent.get("config_saved"):
+                    return reply
+                return self.handle_calculate_share(ctx, intent, progress_callback)
+            return self.handle_confirm_share_config(ctx, intent, progress_callback)
 
         return None
 
@@ -657,6 +684,7 @@ class ToolOrchestrator:
         ctx.member_checked = False
         ctx.member_check_result = None
         ctx.parsed_order_file = None
+        invalidate_share_confirmation(ctx)
 
         return (
                 "特殊成员信息已更新。\n\n"
@@ -703,6 +731,8 @@ class ToolOrchestrator:
         if (
                 ctx.member_checked
                 and ctx.member_check_result
+                and ctx.parsed_order_file
+                and Path(ctx.parsed_order_file).is_file()
                 and not force
         ):
             return ctx.member_check_result
@@ -719,11 +749,13 @@ class ToolOrchestrator:
                 "message": "缺少订单文件。",
             }
 
+        self.ensure_config_ownership(ctx)
+
         # 普通订单输出
         result = parse_group_member_orders(
             group_name=ctx.group_name,
             order_input=ctx.new_order_file,
-            order_output_dir=ctx.order_output_dir,
+            parsed_output_path=get_parsed_orders_path(ctx.session_id),
             special_members=ctx.special_members,
             key_input_func=self.key_input_func,
         )
@@ -785,7 +817,7 @@ class ToolOrchestrator:
 
         parsed_order_file = parse_order_file(
             order_input=ctx.new_order_file,
-            output_dir=ctx.order_output_dir,
+            output_path=get_parsed_orders_path(ctx.session_id),
         )
 
         ctx.parsed_order_file = parsed_order_file
@@ -794,10 +826,10 @@ class ToolOrchestrator:
         # 2. 同步基础商品配置
         # ---------------------------------
 
+        self.ensure_config_ownership(ctx)
         ctx.share_config_file = ensure_product_config_file(
             parsed_order_file=parsed_order_file,
             group_name=ctx.group_name,
-            output_dir=ctx.order_output_dir,
         )
 
         # ---------------------------------
@@ -999,7 +1031,7 @@ class ToolOrchestrator:
 
         result = create_bulk_receivable_orders(
             parsed_order_file=parsed_order_file,
-            output_dir=ctx.order_output_dir,
+            group_name=ctx.group_name,
         )
 
         ctx.bulk_request.pending_confirmation = False
@@ -1033,281 +1065,360 @@ class ToolOrchestrator:
             3. 保留已有阶段字段；
             4. 重新读取配置到 ctx.product_configs。
         """
+        self.ensure_config_ownership(ctx)
         ctx.share_config_file = ensure_product_config_file(
             parsed_order_file=parsed_order_file,
             group_name=ctx.group_name,
-            output_dir=ctx.order_output_dir,
         )
 
         ctx.product_configs = load_product_share_config_file(
             ctx.share_config_file
         )
 
-    def handle_calculate_share(
-            self,
-            ctx: SessionToolContext,
-            intent: dict[str, Any],
-            progress_callback: Callable[[str], None] | None = None,
-    ) -> str:
-
-        req = ctx.share_request
-
+    def ensure_config_ownership(self, ctx: SessionToolContext) -> None:
         if not ctx.group_name:
-            return (
-                "需要先设置待处理的群聊名称。\n"
-                "例如：群聊名称：xxx"
-            )
+            return
+        path = str(get_product_config_path(ctx.group_name))
+        if claim_product_config(path, ctx.config_owner_id):
+            ctx.product_configs = None
+            ctx.last_share_signature = None
+            invalidate_share_confirmation(ctx)
+        ctx.share_config_file = path
 
-        if not ctx.new_order_file:
-            return (
-                "需要先设置订单。\n"
-                "例如：订单 D:\\xxx\\订单.xlsx"
-            )
-
-        if not req.share_mode:
-            return (
-                "请说明均摊方式：\n"
-                "1. 人头摊：例如“按人头”或“人头摊”\n"
-                "2. 个数摊：例如“按个数”或“按件数”"
-            )
-
-        calculation_scope = req.calculation_scope or "flat"
-
-        if calculation_scope == "flat" and not req.amount:
-            return (
-                "请补充需要均摊的总金额。\n"
-                "例如：金额120\n"
-                "也可以直接说：拉通人头，金额120"
-            )
-
-        check_result = self.ensure_member_checked(
-            ctx,
-            progress_callback=progress_callback,
-        )
-
-        if not check_result.get("ok"):
-            return format_member_check_result(check_result)
-
-        blocking_issues = get_blocking_member_issues(check_result)
-
-        if blocking_issues and not req.force:
-            return (
-                    "计算均摊前发现名单核对问题，暂不计算。\n\n"
-                    + format_member_check_result(check_result)
-                    + "\n\n如果确认要忽略这些问题继续计算，可以输入：忽略名单问题，继续计算。"
-            )
-
-        parsed_order_file = check_result.get("parsed_order_file") or ctx.parsed_order_file
-
-        if not parsed_order_file:
-            return "没有找到简化后的订单文件，无法计算均摊。"
-
-        self.ensure_share_config_loaded(ctx, parsed_order_file)
-
-        if calculation_scope == "independent" and req.pending_config_confirmation:
-            return (
-                "商品独立均摊配置还未确认。\n"
-                "确认无误后请输入：确认计算"
-            )
-
-        # ---------------------------------
-        # 正式计算前更新商品均摊配置
-        # ---------------------------------
-
-        # 拉通模式必须写入：
-        #     均摊类型
-        #     商品均摊 = 总均摊
-        #
-        # 独立模式如果尚未确认，则同步本次均摊类型。
-        #
-        # 独立模式确认后这里不重复更新，
-        # 因为 handle_update_share_config() 已经完成过阶段更新。
-        if (
-                calculation_scope == "flat"
-                or not req.config_confirmed
-        ):
-            update_product_config_before_share(
-                config_file=ctx.share_config_file,
-                share_mode=req.share_mode,
-                calculation_scope=calculation_scope,
-                total_amount=req.amount,
-            )
-
-            # 配置文件发生变化后重新读取
-            ctx.product_configs = (
-                load_product_share_config_file(
-                    ctx.share_config_file
-                )
-            )
-
-        # 所有前置检查通过，真正开始计算
-        emit_progress(
-            progress_callback,
-            "正在计算均摊……",
-        )
-
-        result = calculate_share(
-            parsed_order_file=parsed_order_file,
-            total_amount=req.amount,
-            share_mode=req.share_mode,
-            calculation_scope=calculation_scope,
-            product_configs=ctx.product_configs,
-            output_dir=ctx.order_output_dir,
-            excluded_order_nos=get_non_share_order_nos(
-                ctx.special_members
-            ),
-        )
-
-        if not result.get("ok"):
-            # 本次已经实际尝试计算，force 到此消费完毕
-            req.force = False
-
-            if result.get("need_user_input"):
-                return format_share_need_user_input(
-                    result
-                )
-
-            return str(
-                result.get("message")
-                or "均摊计算失败。"
-            )
-
-        # ---------------------------------
-        # 均摊成功后，只更新“单份均摊”
-        # ---------------------------------
-
-        update_product_config_after_share(
-            config_file=ctx.share_config_file,
-            calculated_configs=(
-                    result.get("product_configs")
-                    or []
-            ),
-        )
-
-        # 保存最新配置到会话
-        ctx.product_configs = (
-            load_product_share_config_file(
-                ctx.share_config_file
-            )
-        )
-
-        # 让 result 里的配置也与最终文件一致
-        result["product_configs"] = ctx.product_configs
-
-        # 本次均摊已经完成，“先算”只对本次计算有效
-        req.force = False
-
-        return format_share_result(
-            result=result,
-            group_name=ctx.group_name,
-            member_check_result=check_result,
-            special_members=ctx.special_members,
-        )
-
-
-    def handle_update_share_config(
-        self,
-        ctx: SessionToolContext,
-        intent: dict[str, Any],
-    ) -> str:
-        req = ctx.share_request
-
+    def prepare_share_config(self, ctx: SessionToolContext) -> str | None:
+        """只解析本地订单、保存配置；不读取微信群成员。"""
         if not ctx.group_name:
-            return "需要先设置待处理的群聊名称。例如：群聊名称：xxx"
-
+            return "需要先设置群聊名称。"
         if not ctx.new_order_file:
-            return "需要先设置订单。例如：订单 订单1.xlsx"
-
-        calculation_scope = req.calculation_scope or intent.get("calculation_scope")
-
-        if calculation_scope != "independent":
-            return (
-                "检测到你输入了各商品均摊金额，但当前不是独立均摊模式。\n"
-                "请先输入：按人头独立 或 按个数独立。"
-            )
-
-        if not req.share_mode:
-            return (
-                "请先说明独立均摊方式：\n"
-                "1. 按人头独立\n"
-                "2. 按个数独立"
-            )
-
-        check_result = self.ensure_member_checked(ctx)
-
-        if not check_result.get("ok"):
-            return format_member_check_result(check_result)
-
-        parsed_order_file = check_result.get("parsed_order_file") or ctx.parsed_order_file
-
-        if not parsed_order_file:
-            return "没有找到简化后的订单文件，无法写入商品均摊配置表。"
-
-        self.ensure_share_config_loaded(ctx, parsed_order_file)
-
-        update_result = update_product_share_config_file(
-            config_file=ctx.share_config_file,
-            updates=intent.get("product_share_amounts") or [],
+            return "需要先设置订单文件。"
+        self.ensure_config_ownership(ctx)
+        ctx.parsed_order_file = parse_order_file(
+            order_input=ctx.new_order_file,
+            output_path=get_parsed_orders_path(ctx.session_id),
         )
-        # 独立均摊配置阶段：
-        # 只同步本次均摊类型，不覆盖各商品均摊。
-        update_product_config_before_share(
-            config_file=ctx.share_config_file,
-            share_mode=req.share_mode,
-            calculation_scope="independent",
-            total_amount=req.amount,
-        )
-
+        self.ensure_share_config_loaded(ctx, ctx.parsed_order_file)
+        req = ctx.share_request
+        if req.reset_product_amounts:
+            reset_product_share_fields(
+                ctx.share_config_file, share_mode=req.share_mode,
+                calculation_scope=req.calculation_scope or "flat",
+            )
+            req.reset_product_amounts = False
+        if req.share_mode:
+            if req.calculation_scope == "independent" or req.amount is not None:
+                update_product_config_before_share(
+                    config_file=ctx.share_config_file, share_mode=req.share_mode,
+                    calculation_scope=req.calculation_scope or "flat", total_amount=req.amount,
+                )
         ctx.product_configs = load_product_share_config_file(ctx.share_config_file)
+        return None
 
-        summary = summarize_product_share_config(
-            config_file=ctx.share_config_file,
-            total_amount=req.amount,
-        )
-
-        req.pending_config_confirmation = True
-        req.config_confirmed = False
-
-        return format_product_share_config_confirmation(
-            summary=summary,
-            updated_items=update_result.get("updated_items") or [],
-            unmatched_updates=update_result.get("unmatched_updates") or [],
-        )
-
-
-    def handle_confirm_share_config(
-        self,
-        ctx: SessionToolContext,
-        intent: dict[str, Any],
-    ) -> str:
+    def share_config_errors(self, ctx: SessionToolContext) -> list[str]:
         req = ctx.share_request
+        errors = []
+        if not req.share_mode:
+            errors.append("请说明均摊方式：人头摊或个数摊。")
+        active = [c for c in ctx.product_configs or [] if c.get("计入均摊")]
+        if not active:
+            errors.append("没有可参摊商品，请检查商品配置。")
+        if req.calculation_scope == "independent":
+            missing = [c["商品名称"] for c in active if c.get("商品均摊") in (None, "")]
+            if missing:
+                errors.append("请补充各商品独立均摊金额：" + "、".join(missing))
+            elif req.amount is not None:
+                total = sum((Decimal(str(c["商品均摊"])) for c in active), Decimal(0))
+                if total != Decimal(req.amount):
+                    errors.append(f"各商品均摊合计 {total:.2f} 元与总均摊 {req.amount} 元不一致。")
+        elif req.amount is None:
+            errors.append("请补充总均摊金额，例如：金额120。")
+        elif Decimal(req.amount) <= 0:
+            errors.append("拉通总均摊金额必须大于 0。")
+        return errors
 
-        if not req.pending_config_confirmation:
-            return "当前没有待确认的商品独立均摊配置。"
-
-        if not ctx.share_config_file:
-            return "没有找到商品均摊配置表，无法确认。"
-
-        summary = summarize_product_share_config(
-            config_file=ctx.share_config_file,
-            total_amount=req.amount,
-        )
-
-        if summary.get("matched") is False:
-            return (
-                "各商品均摊合计与用户输入的总均摊不一致，暂不计算。\n\n"
-                + format_product_share_config_confirmation(
-                    summary=summary,
-                    updated_items=[],
-                    unmatched_updates=[],
-                )
-                + "\n\n请修改各商品均摊，或重新输入正确的总均摊。"
+    def handle_update_share_config(self, ctx: SessionToolContext, intent: dict[str, Any]) -> str:
+        error = self.prepare_share_config(ctx)
+        if error:
+            return "均摊参数已保存。" + error
+        req = ctx.share_request
+        updates = intent.get("product_share_amounts") or []
+        if updates and req.calculation_scope != "independent":
+            return "商品独立金额未写入，请先设置独立模式：独立人头摊或独立个数摊。"
+        unmatched = []
+        changed = bool(intent.get("share_parameters_changed"))
+        if updates:
+            before = ctx.product_configs
+            result = update_product_share_config_file(config_file=ctx.share_config_file, updates=updates)
+            unmatched = result.get("unmatched_updates") or []
+            changed = changed or before != load_product_share_config_file(ctx.share_config_file)
+        if changed or unmatched:
+            invalidate_share_confirmation(ctx)
+            reset_product_share_fields(
+                ctx.share_config_file, share_mode=req.share_mode,
+                calculation_scope=req.calculation_scope or "flat", clear_amounts=False,
             )
+        ctx.product_configs = load_product_share_config_file(ctx.share_config_file)
+        intent["config_saved"] = not unmatched
+        lines = ["均摊配置已保存，本次未执行计算。", format_pending_share_summary(ctx)]
+        if unmatched:
+            lines.append("以下商品未匹配，未写入：" + str(unmatched))
+        lines.extend(self.share_config_errors(ctx))
+        lines.append('配置完整后请输入“算均摊”，确认商品配置后才会查成员并计算。')
+        return "\n".join(lines)
 
-        req.config_confirmed = True
+    def handle_calculate_share(self, ctx: SessionToolContext, intent: dict[str, Any],
+                               progress_callback: Callable[[str], None] | None = None) -> str:
+        invalidate_share_confirmation(ctx)
+        error = self.prepare_share_config(ctx)
+        if error:
+            return error
+        errors = self.share_config_errors(ctx)
+        if errors:
+            return "暂不计算，也未查成员。\n" + "\n".join(errors) + "\n\n" + format_pending_share_summary(ctx)
+        ctx.bulk_request.pending_confirmation = False
+        req = ctx.share_request
+        req.pending_config_confirmation = True
+        req.confirmation_signature = share_signature(ctx)
+        lines = ["计算均摊前，请确认商品配置：", format_pending_share_summary(ctx), "", "商品参摊情况："]
+        for c in ctx.product_configs or []:
+            state = "参与均摊" if c.get("计入均摊") else "不参与均摊"
+            lines.append(f"- {c['商品序号']}号 {c['商品名称']}：{state}；订单数量 {c['商品数量']}")
+        lines.extend([f"配置文件：{ctx.share_config_file}", '确认无误后可输入“计算”“算”“无误”或“下一步”；需修改时请修改配置后重新输入“算均摊”。'])
+        return "\n".join(lines)
+
+    def handle_confirm_share_config(self, ctx: SessionToolContext, intent: dict[str, Any],
+                                    progress_callback: Callable[[str], None] | None = None) -> str:
+        req = ctx.share_request
+        if not req.pending_config_confirmation:
+            return '当前没有待确认的商品均摊配置，请先输入“算均摊”。'
+        if not req.confirmation_signature or req.confirmation_signature != share_signature(ctx):
+            return "商品配置或订单已变化，请重新确认。\n\n" + self.handle_calculate_share(ctx, {})
         req.pending_config_confirmation = False
+        req.config_confirmed = True
+        return self.execute_confirmed_share(ctx, progress_callback)
 
-        return self.handle_calculate_share(ctx, intent)
+    def execute_confirmed_share(self, ctx: SessionToolContext,
+                                progress_callback: Callable[[str], None] | None = None) -> str:
+        req = ctx.share_request
+        force = req.force
+        req.force = False
+        if not req.config_confirmed or not req.confirmation_signature or req.confirmation_signature != share_signature(ctx):
+            return self.handle_calculate_share(ctx, {}, progress_callback)
+        # 重新查成员，不能沿用配置或订单变更前的核对缓存。
+        check_result = self.ensure_member_checked(ctx, force=True, progress_callback=progress_callback)
+        if not check_result.get("ok"):
+            return format_member_check_result(check_result)
+        if req.confirmation_signature != share_signature(ctx):
+            return "成员核对期间商品配置或订单发生变化，暂不计算。\n\n" + self.handle_calculate_share(ctx, {})
+        if get_blocking_member_issues(check_result) and not force:
+            return ("计算均摊前发现名单核对问题，暂不计算。\n\n"
+                    + format_member_check_result(check_result)
+                    + "\n\n如需忽略名单问题，可输入：忽略名单问题，继续计算。")
+        ctx.product_configs = load_product_share_config_file(ctx.share_config_file)
+        errors = self.share_config_errors(ctx)
+        if errors:
+            invalidate_share_confirmation(ctx)
+            return "\n".join(errors)
+        emit_progress(progress_callback, "正在计算均摊……")
+        result = calculate_share(
+            parsed_order_file=ctx.parsed_order_file, total_amount=req.amount,
+            share_mode=req.share_mode, calculation_scope=req.calculation_scope or "flat",
+            product_configs=ctx.product_configs, group_name=ctx.group_name,
+            excluded_order_nos=get_non_share_order_nos(ctx.special_members),
+        )
+        invalidate_share_confirmation(ctx)
+        if not result.get("ok"):
+            return format_share_need_user_input(result) if result.get("need_user_input") else str(result.get("message") or "均摊计算失败。")
+        update_product_config_after_share(ctx.share_config_file, result.get("product_configs") or [])
+        ctx.product_configs = load_product_share_config_file(ctx.share_config_file)
+        result["product_configs"] = ctx.product_configs
+        ctx.last_share_result = result
+        ctx.share_results_invalidated = False
+        ctx.last_share_signature = share_signature(ctx, include_members=True)
+        return format_share_result(result, ctx.group_name, check_result, ctx.special_members)
+
+    def handle_show_share(self, ctx: SessionToolContext) -> str:
+        # 只读：不准备订单、不写配置、不检查成员、不生成结果文件。
+        signature = share_signature(ctx, include_members=True)
+        if ctx.last_share_result and signature and signature == ctx.last_share_signature:
+            return format_share_summary(ctx.last_share_result)
+        configs = []
+        if ctx.share_config_file and owns_product_config(ctx.share_config_file, ctx.config_owner_id):
+            if Path(ctx.share_config_file).is_file():
+                configs = load_product_share_config_file(ctx.share_config_file)
+        legacy_changed = bool(ctx.legacy_share_signature and ctx.legacy_share_signature != signature)
+        if not ctx.last_share_result and not ctx.share_results_invalidated and not legacy_changed:
+            historical = format_legacy_share_summary(configs)
+            if historical:
+                return historical
+        stale = bool(ctx.last_share_result or legacy_changed or (
+            ctx.share_results_invalidated and any(c.get("单份均摊") not in (None, "") for c in configs)))
+        status = "原计算结果已失效，请重新计算。" if stale else "尚未计算均摊。"
+        return status + "\n" + format_pending_share_summary(ctx, configs)
+
+
+def invalidate_share_confirmation(ctx: SessionToolContext) -> None:
+    req = ctx.share_request
+    req.pending_config_confirmation = False
+    req.config_confirmed = False
+    req.confirmation_signature = None
+    req.force = False
+    ctx.last_share_signature = None
+    ctx.share_results_invalidated = True
+
+
+def share_signature(ctx: SessionToolContext, *, include_members: bool = False) -> str | None:
+    """校验实际文件内容，发现手工改表、原路径覆盖订单以及特殊成员变化。"""
+    if not ctx.new_order_file or not ctx.share_config_file:
+        return None
+    if not owns_product_config(ctx.share_config_file, ctx.config_owner_id):
+        return None
+    try:
+        configs = load_product_share_config_file(ctx.share_config_file)
+        fields = ["商品序号", "商品名称", "商品数量", "计入均摊", "均摊类型", "商品均摊"]
+        if include_members:
+            fields.append("单份均摊")
+        data = {
+            "order": hashlib.sha256(Path(ctx.new_order_file).read_bytes()).hexdigest(),
+            "order_path": str(Path(ctx.new_order_file).resolve()),
+            "owner": ctx.config_owner_id,
+            "group": ctx.group_name,
+            "configs": [{k: c.get(k) for k in fields} for c in configs],
+            "mode": ctx.share_request.share_mode,
+            "scope": ctx.share_request.calculation_scope,
+            "amount": ctx.share_request.amount,
+            "reset_pending": ctx.share_request.reset_product_amounts,
+        }
+        if include_members:
+            data["members"] = ctx.special_members
+        return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def format_share_money(value: Any) -> str:
+    return f"{Decimal(str(value)):.2f}" if value not in (None, "") else "未填写"
+
+
+def format_legacy_share_summary(configs: list[dict[str, Any]]) -> str | None:
+    """只展示 CSV 确实保存的历史字段，不从取整金额倒推人数或数量。"""
+    active = [c for c in configs if c.get("计入均摊")]
+    if not any(c.get("单份均摊") not in (None, "") for c in active):
+        return None
+    types = set()
+    for c in active:
+        try:
+            types.add(normalize_share_type(c.get("均摊类型") or ""))
+        except RuntimeError:
+            types.add("unknown")
+    lines = ["历史配置记录，尚未校验是否适用于当前订单。", ""]
+    if len(types) != 1 or "unknown" in types:
+        lines.extend(["均摊类型：历史配置不完整或存在不同类型", "计算方式：见商品明细",
+                      "总均摊：无法确定", "参摊人数／个数：历史记录未保存"])
+        for c in active:
+            lines.append(f"- {c['商品名称']}：{c.get('均摊类型') or '未填写'}；"
+                         f"商品均摊：{format_share_money(c.get('商品均摊'))}；"
+                         f"单份均摊：{format_share_money(c.get('单份均摊'))}")
+        return "\n".join(lines)
+    share_type = next(iter(types))
+    mode, scope = share_type.split("_", 1)
+    lines.extend([f"均摊类型：{'人头摊' if mode == 'head' else '个数摊'}",
+                  f"计算方式：{'独立' if scope == 'independent' else '拉通'}"])
+    amounts = [c.get("商品均摊") for c in active]
+    if all(a not in (None, "") for a in amounts):
+        if scope == "independent":
+            total = format_share_money(sum((Decimal(a) for a in amounts), Decimal(0)))
+        else:
+            total = format_share_money(amounts[0]) if len(set(amounts)) == 1 else "历史配置金额不一致"
+    else:
+        total = "历史记录不完整"
+    lines.append(f"总均摊：{total}")
+    if scope == "independent":
+        lines.extend(f"- {c['商品名称']}独立均摊：{format_share_money(c.get('商品均摊'))}" for c in active)
+    lines.append("参摊人数：历史记录未保存" if mode == "head" else "参摊个数：历史记录未保存")
+    if mode == "quantity" or scope == "independent":
+        for c in configs:
+            lines.append(f"- {c['商品名称']}：历史记录未保存" if c.get("计入均摊")
+                         else f"- {c['商品名称']}：不参摊")
+    label = "单人均摊" if mode == "head" else "单个商品均摊"
+    units = [c.get("单份均摊") for c in active]
+    if scope == "flat" and len(set(units)) == 1 and units[0] not in (None, ""):
+        lines.append(f"{label}：{format_share_money(units[0])}")
+    else:
+        lines.append(f"各商品{label}：")
+        for c in active:
+            value = c.get("单份均摊")
+            lines.append(f"- {c['商品名称']}：{format_share_money(value) if value not in (None, '') else '历史记录未保存'}")
+    return "\n".join(lines)
+
+
+def format_share_summary(result: dict[str, Any]) -> str:
+    """查询和计算完成共享同一摘要，统计由计算器提供。"""
+    mode = result.get("share_mode")
+    scope = result.get("calculation_scope")
+    lines = [f"均摊类型：{'人头摊' if mode == 'head' else '个数摊'}",
+             f"计算方式：{'独立' if scope == 'independent' else '拉通'}",
+             f"总均摊：{result['total_amount']}"]
+    products = result.get("product_statistics") or []
+    if scope == "independent":
+        for c in products:
+            if c["included"]:
+                lines.append(f"- {c['product_name']}独立均摊：{c['amount']}")
+    if mode == "head":
+        lines.append(f"参摊人数：{result['participant_count']} 人")
+        if scope == "independent":
+            lines.extend(f"- {c['product_name']}：{c['participant_count']} 人" for c in products if c["included"])
+    else:
+        lines.append(f"参摊个数：{result['total_share_quantity']} 个")
+        for c in products:
+            suffix = "" if c["included"] else "（不参摊）"
+            lines.append(f"- {c['product_name']}：{c['quantity']} 个{suffix}")
+    if scope == "independent":
+        lines.append("各商品单人均摊：" if mode == "head" else "各商品单个均摊：")
+        for c in products:
+            if c["included"]:
+                value = c['unit_amount']
+                lines.append(f"- {c['product_name']}：{value}" if value is not None else f"- {c['product_name']}：无参摊订单")
+    else:
+        label = "单人均摊" if mode == "head" else "单个商品均摊"
+        lines.append(f"{label}：{result['unit_share_amount']}")
+    return "\n".join(lines)
+
+
+def format_pending_share_summary(ctx: SessionToolContext, configs: list[dict[str, Any]] | None = None) -> str:
+    if configs is None:
+        configs = ctx.product_configs or []
+    req = ctx.share_request
+    active = [c for c in configs if c.get("计入均摊")]
+    share_mode = req.share_mode
+    calculation_scope = req.calculation_scope
+    # 旧对话可能只在 CSV 保存过方式；只读补全展示，不写回会话参数。
+    if not share_mode or not calculation_scope:
+        try:
+            types = {normalize_share_type(c.get("均摊类型") or "") for c in active}
+            if len(types) == 1:
+                saved_mode, saved_scope = next(iter(types)).split("_", 1)
+                share_mode = share_mode or saved_mode
+                calculation_scope = calculation_scope or saved_scope
+        except RuntimeError:
+            pass
+    mode = {"head": "人头摊", "quantity": "个数摊"}.get(share_mode, "未设置")
+    scope = "独立" if calculation_scope == "independent" else "拉通"
+    total = req.amount
+    if scope == "独立" and total is None and active and all(c.get("商品均摊") not in (None, "") for c in active):
+        total = f"{sum((Decimal(str(c['商品均摊'])) for c in active), Decimal(0)):.2f}"
+    if scope == "拉通" and total is None and active:
+        amounts = {c.get("商品均摊") for c in active}
+        if len(amounts) == 1 and next(iter(amounts)) not in (None, ""):
+            total = next(iter(amounts))
+    lines = [f"均摊类型：{mode}", f"计算方式：{scope}",
+             f"总均摊：{format_share_money(total)}"]
+    if scope == "独立":
+        lines.extend(f"- {c['商品名称']}独立均摊：{c.get('商品均摊') or '未填写'}" for c in active)
+    lines.append("参摊人数：待计算" if share_mode == "head" else "参摊个数：待计算")
+    if share_mode == "quantity":
+        lines.extend(f"- {c['商品名称']}：{'待计算' if c.get('计入均摊') else '0 个（不参摊）'}" for c in configs)
+    lines.append("单人均摊：待计算" if share_mode == "head" else "单个商品均摊：待计算")
+    return "\n".join(lines)
 
 
 def format_special_members(
@@ -1624,46 +1735,7 @@ def format_share_result(
     lines.append(format_member_check_summary_for_share(member_check_result))
     lines.append("")
 
-    lines.append(f"均摊方式：{result['share_mode_text']}")
-    lines.append(f"计算方式：{result['calculation_scope_text']}")
-    lines.append(f"原始均摊金额：{result['total_amount']}")
-
-    if result.get("share_mode") == "quantity":
-        total_share_quantity = result.get("total_share_quantity")
-
-        if total_share_quantity is not None:
-            lines.append(f"总参摊个数：{total_share_quantity}")
-        else:
-            lines.append("总参摊个数：未统计")
-
-    lines.append(f"参与人数：{result['participant_count']}")
-
-    lines.append(
-        "不参摊说明："
-        + format_non_share_special_member_note(special_members or [])
-    )
-
-    # 拉通个数摊：显示单个参摊商品需均摊。
-    if (
-        result.get("share_mode") == "quantity"
-        and result.get("calculation_scope") == "flat"
-        and result.get("unit_share_amount") is not None
-    ):
-        lines.append(
-            "单个参摊商品需均摊："
-            f"{result['unit_share_amount']} 元"
-        )
-
-    # 拉通人头摊：可显示单人需均摊。
-    if (
-        result.get("share_mode") == "head"
-        and result.get("calculation_scope") == "flat"
-        and result.get("unit_share_amount") is not None
-    ):
-        lines.append(
-            "单人需均摊："
-            f"{result['unit_share_amount']} 元"
-        )
+    lines.append(format_share_summary(result))
 
     lines.append(f"实际总收款：{result['total_collected']}")
     lines.append(f"向上取整多收：{result['over_collected']}")
@@ -1741,75 +1813,6 @@ def format_share_need_user_input(result: dict) -> str:
     return "\n".join(lines)
 
 
-def format_product_share_config_confirmation(
-    summary: dict[str, Any],
-    updated_items: list[dict[str, Any]],
-    unmatched_updates: list[dict[str, Any]],
-) -> str:
-    lines: list[str] = []
-
-    lines.append("已写入商品独立均摊配置，请确认。")
-    lines.append(f"配置文件：{summary.get('config_file')}")
-
-    if updated_items:
-        lines.append("")
-        lines.append("本次写入：")
-        for item in updated_items:
-            lines.append(
-                f"- {item.get('商品序号')}｜"
-                f"{item.get('商品名称')}｜"
-                f"商品数量：{item.get('商品数量')}｜"
-                f"计入均摊：{item.get('计入均摊')}｜"
-                f"均摊类型：{item.get('均摊类型')}｜"
-                f"商品均摊：{item.get('商品均摊')}"
-            )
-
-    if unmatched_updates:
-        lines.append("")
-        lines.append("以下输入未匹配到配置表商品：")
-        for item in unmatched_updates:
-            lines.append(f"- {item}")
-
-    items = summary.get("items") or []
-
-    included_items = [
-        item for item in items
-        if item.get("计入均摊") and item.get("商品均摊")
-    ]
-
-    if included_items:
-        lines.append("")
-        lines.append("当前各商品均摊：")
-        for item in included_items:
-            lines.append(
-                f"- {item.get('商品序号')}｜"
-                f"{item.get('商品名称')}｜"
-                f"商品均摊：{item.get('商品均摊')}"
-            )
-
-    lines.append("")
-    lines.append(f"各商品均摊合计：{summary.get('config_total')}")
-
-    expected_total = summary.get("expected_total")
-    matched = summary.get("matched")
-
-    if expected_total:
-        lines.append(f"用户输入总均摊：{expected_total}")
-        lines.append(f"差额：{summary.get('diff')}")
-
-        if matched:
-            lines.append("校验结果：各商品均摊合计与总均摊一致。")
-        else:
-            lines.append("校验结果：各商品均摊合计与总均摊不一致，请检查。")
-    else:
-        lines.append("用户未输入总均摊，将以各商品均摊合计作为总均摊。")
-
-    lines.append("")
-    lines.append("确认无误后请输入：确认计算")
-
-    return "\n".join(lines)
-
-
 def _to_json_safe(value: Any) -> Any:
     """递归转换 Path 等对象，保证结果可以交给 json.dumps。"""
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -1863,26 +1866,9 @@ def format_context_update_result(ctx: SessionToolContext) -> str:
     lines = ["已更新当前处理上下文。"]
 
     lines.append(f"群聊名称：{ctx.group_name or '未设置'}")
-    lines.append(f"新订单：{ctx.new_order_file or '未设置'}")
-    lines.append(f"旧订单：{ctx.old_order_file or '未设置'}")
-    lines.append(f"缓存1：{ctx.order_cache_1_file or '未设置'}")
-    lines.append(f"缓存2：{ctx.order_cache_2_file or '未设置'}")
-    lines.append(f"输出目录：{ctx.order_output_dir or '未设置'}")
+    lines.append(f"新订单：{format_order_path(ctx.new_order_file)}")
+    lines.append(f"旧订单：{format_order_path(ctx.old_order_file)}")
+    lines.append(f"缓存1：{format_order_path(ctx.order_cache_1_file)}")
+    lines.append(f"缓存2：{format_order_path(ctx.order_cache_2_file)}")
 
     return "\n".join(lines)
-
-
-def normalize_output_dir(value: str | Path | None) -> str:
-    """
-    规范化输出目录。
-
-    规则：
-        1. 用户没填 → ./orders/output
-        2. 用户填了绝对路径 → 原样返回
-        3. 用户填了相对路径 → 原样作为相对路径使用
-    """
-    if value is None or str(value).strip() == "":
-        return str(DEFAULT_ORDER_OUTPUT_DIR)
-
-    path = Path(str(value).strip().strip('"').strip("'"))
-    return str(path)

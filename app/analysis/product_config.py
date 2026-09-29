@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import csv
+import json
+import shutil
+from uuid import uuid4
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from typing import Any
-import re
 
-from app.config import CSV_OUTPUT_DIR
+from app.core.path_manager import get_product_config_path, sanitize_filename
 from app.analysis.order_validator import (
     default_include_share,
     is_special_member_product,
@@ -16,6 +18,51 @@ from app.analysis.order_validator import (
 from app.analysis.order_parser import (
     read_product_unit_prices,
 )
+from app.utils.csv_utils import read_csv_dict_rows
+
+
+def product_config_owner_path(config_file: str | Path) -> Path:
+    return Path(config_file).with_suffix(".owner.json")
+
+
+def owns_product_config(config_file: str | Path, owner_id: str) -> bool:
+    try:
+        return json.loads(product_config_owner_path(config_file).read_text(encoding="utf-8")).get("owner_id") == owner_id
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def claim_product_config(config_file: str | Path, owner_id: str, *, adopt_legacy: bool = False) -> bool:
+    """绑定会话；来源不明的旧文件先完整备份，再移出活动位置。返回是否隔离旧配置。"""
+    from app.core import path_manager
+
+    path = Path(config_file)
+    marker = product_config_owner_path(path)
+    if owns_product_config(path, owner_id):
+        return False
+    isolated = False
+    if path.exists() and not (adopt_legacy and not marker.exists()):
+        backup = path_manager.ORDER_ARCHIVE_DIR / "unclaimed" / uuid4().hex
+        backup.mkdir(parents=True, exist_ok=False)
+        shutil.copy2(path, backup / path.name)
+        if marker.exists():
+            shutil.copy2(marker, backup / marker.name)
+        path.unlink()
+        isolated = True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"owner_id": owner_id}), encoding="utf-8")
+    return isolated
+
+
+def reset_product_share_fields(config_file: str | Path, *, share_mode: str | None,
+                               calculation_scope: str, clear_amounts: bool = True) -> None:
+    rows = _read_product_config_rows(config_file)
+    for row in rows:
+        row["均摊类型"] = make_share_type(share_mode, calculation_scope) if share_mode else ""
+        if clear_amounts:
+            row["商品均摊"] = ""
+        row["单份均摊"] = ""
+    _write_product_config_rows(Path(config_file), rows)
 
 ORDER_METADATA_COLUMNS = {"单号", "昵称", "总金额"}
 
@@ -46,6 +93,10 @@ def _read_product_config_rows(
     1. 文件是否存在
     2. 是否存在表头
     3. 是否包含全部 CONFIG_FIELDNAMES
+
+    支持：
+    - UTF-8 / UTF-8 BOM
+    - GBK / GB18030
     """
     config_file = Path(config_file)
 
@@ -54,19 +105,28 @@ def _read_product_config_rows(
             f"商品配置文件不存在：{config_file}"
         )
 
-    with config_file.open(
-        "r",
-        encoding="utf-8-sig",
-        newline="",
-    ) as f:
-        reader = csv.DictReader(f)
+    rows, fieldnames = read_csv_dict_rows(
+        config_file
+    )
 
-        if not reader.fieldnames:
-            raise ShareConfigError(
-                "商品配置文件没有表头。"
-            )
+    if not fieldnames:
+        raise ShareConfigError(
+            "商品配置文件没有表头。"
+        )
 
-        return list(reader)
+    missing_fields = [
+        field
+        for field in CONFIG_FIELDNAMES
+        if field not in fieldnames
+    ]
+
+    if missing_fields:
+        raise ShareConfigError(
+            "商品配置文件缺少字段："
+            + "、".join(missing_fields)
+        )
+
+    return rows
 
 
 def _write_product_config_rows(
@@ -99,50 +159,74 @@ def read_product_summary_from_order_file(
     """
     从简化订单宽表中读取商品名称，并统计每个商品总数量。
     """
-    parsed_order_file = Path(parsed_order_file)
+    parsed_order_file = Path(
+        parsed_order_file
+    )
 
-    with parsed_order_file.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
+    rows, fieldnames = read_csv_dict_rows(
+        parsed_order_file
+    )
 
-        if not reader.fieldnames:
-            raise ShareConfigError("简化订单文件没有表头。")
+    if not fieldnames:
+        raise ShareConfigError(
+            "简化订单文件没有表头。"
+        )
 
-        if "单号" not in reader.fieldnames or "昵称" not in reader.fieldnames:
-            raise ShareConfigError("简化订单文件必须包含“单号”和“昵称”列。")
+    if (
+        "单号" not in fieldnames
+        or "昵称" not in fieldnames
+    ):
+        raise ShareConfigError(
+            "简化订单文件必须包含“单号”和“昵称”列。"
+        )
 
-        product_names = [
-            name
-            for name in reader.fieldnames
-            if name not in ORDER_METADATA_COLUMNS
-        ]
+    product_names = [
+        name
+        for name in fieldnames
+        if name not in ORDER_METADATA_COLUMNS
+    ]
 
-        product_quantity_map = {
-            product_name: 0
-            for product_name in product_names
-        }
+    product_quantity_map = {
+        product_name: 0
+        for product_name in product_names
+    }
 
-        for row_idx, row in enumerate(reader, start=2):
-            for product_name in product_names:
-                value = str(row.get(product_name, "") or "").strip()
+    for row_idx, row in enumerate(
+        rows,
+        start=2,
+    ):
+        for product_name in product_names:
+            value = str(
+                row.get(
+                    product_name,
+                    "",
+                )
+                or ""
+            ).strip()
 
-                if value == "":
-                    continue
+            if value == "":
+                continue
 
-                if not value.isdigit():
-                    raise ShareConfigError(
-                        f"第 {row_idx} 行商品“{product_name}”数量必须是非负整数：{value!r}"
-                    )
+            if not value.isdigit():
+                raise ShareConfigError(
+                    f"第 {row_idx} 行商品"
+                    f"“{product_name}”数量必须是"
+                    f"非负整数：{value!r}"
+                )
 
-                quantity = int(value)
+            quantity = int(value)
 
-                product_quantity_map[product_name] += quantity
+            product_quantity_map[
+                product_name
+            ] += quantity
 
     return [
         {
             "商品名称": product_name,
             "商品数量": quantity,
         }
-        for product_name, quantity in product_quantity_map.items()
+        for product_name, quantity
+        in product_quantity_map.items()
     ]
 
 
@@ -241,56 +325,18 @@ def load_product_share_config_file(
 def sanitize_group_name_for_filename(
     group_name: str,
 ) -> str:
-    name = str(group_name or "").strip()
-
-    if not name:
-        raise ShareConfigError(
-            "群聊名称为空，无法生成商品配置文件名。"
-        )
-
-    name = re.sub(
-        r'[\\/:*?"<>|]',
-        "_",
-        name,
-    )
-
-    # Windows 文件名不能以空格或句点结尾
-    name = name.rstrip(" .")
-
-    if not name:
-        raise ShareConfigError(
-            "群聊名称无法转换为有效文件名。"
-        )
-
-    return name
+    return sanitize_filename(group_name)
 
 
 def get_product_config_file_path(
     group_name: str,
-    output_dir: str | Path | None = None,
 ) -> Path:
-    output_dir_path = (
-        Path(output_dir)
-        if output_dir
-        else CSV_OUTPUT_DIR
-    )
-
-    safe_group_name = (
-        sanitize_group_name_for_filename(
-            group_name
-        )
-    )
-
-    return (
-        output_dir_path
-        / f"{safe_group_name}_parsed_product_config.csv"
-    )
+    return get_product_config_path(group_name)
 
 
 def ensure_product_config_file(
     parsed_order_file: str | Path,
     group_name: str,
-    output_dir: str | Path | None = None,
 ) -> str:
     """
     确保商品配置文件存在，并同步当前订单中的基础商品信息。
@@ -315,12 +361,11 @@ def ensure_product_config_file(
         - 商品数量始终以当前 parsed_orders 为准
 
     返回：
-        parsed_product_config.csv 的绝对路径
+        商品配置 CSV 的绝对路径
     """
 
     output_path = get_product_config_file_path(
         group_name=group_name,
-        output_dir=output_dir,
     )
 
     # ---------------------------------
@@ -442,7 +487,6 @@ def ensure_product_config_file(
 def rename_product_config_file(
     current_config_file: str | Path | None,
     new_group_name: str,
-    output_dir: str | Path | None = None,
 ) -> str | None:
     if not current_config_file:
         return None
@@ -454,7 +498,6 @@ def rename_product_config_file(
 
     new_path = get_product_config_file_path(
         group_name=new_group_name,
-        output_dir=output_dir,
     )
 
     old_path = old_path.resolve()
@@ -472,22 +515,6 @@ def rename_product_config_file(
     old_path.rename(new_path)
 
     return str(new_path)
-
-
-def delete_product_config_file(
-    config_file: str | Path | None,
-) -> bool:
-    if not config_file:
-        return False
-
-    path = Path(config_file)
-
-    if not path.exists():
-        return False
-
-    path.unlink()
-
-    return True
 
 
 def make_share_type(

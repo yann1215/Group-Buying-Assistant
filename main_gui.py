@@ -541,17 +541,12 @@ class ChatWindow(QMainWindow):
         )
 
         box.setInformativeText(
-            "你可以选择是否同时删除该对话对应的商品配置文件。\n"
-            "订单、计算结果等其他文件不会被删除。"
-        )
-
-        delete_all_button = box.addButton(
-            "删除对话和商品配置",
-            QMessageBox.DestructiveRole,
+            "该对话相关的订单、商品配置和输出结果将自动归档，\n"
+            "不会删除用户文件。"
         )
 
         delete_chat_button = box.addButton(
-            "仅删除对话",
+            "删除对话",
             QMessageBox.AcceptRole,
         )
 
@@ -564,19 +559,12 @@ class ChatWindow(QMainWindow):
 
         clicked = box.clickedButton()
 
-        if clicked == cancel_button:
+        if clicked != delete_chat_button:
             return
-
-        delete_product_config = (
-                clicked == delete_all_button
-        )
 
         try:
             self.chat_service.delete_conversation(
                 self.session_id,
-                delete_product_config=(
-                    delete_product_config
-                ),
             )
 
             sessions = (
