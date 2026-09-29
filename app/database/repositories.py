@@ -54,7 +54,7 @@ def create_session(
         )
         session_id = int(cur.lastrowid)
 
-        _prune_old_sessions(conn, MAX_SESSION_COUNT)
+        # 上限淘汰由 ChatService 执行，确保先归档文件再删除记录。
         conn.commit()
         return session_id
 
@@ -72,8 +72,8 @@ def get_session(session_id: int) -> dict[str, Any] | None:
         return dict(row) if row is not None else None
 
 
-def list_sessions(limit: int = MAX_SESSION_COUNT) -> list[dict[str, Any]]:
-    if limit <= 0:
+def list_sessions(limit: int | None = MAX_SESSION_COUNT) -> list[dict[str, Any]]:
+    if limit is not None and limit <= 0:
         return []
 
     with get_conn() as conn:
@@ -84,7 +84,7 @@ def list_sessions(limit: int = MAX_SESSION_COUNT) -> list[dict[str, Any]]:
             ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
-            (limit,),
+            (-1 if limit is None else limit,),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -147,13 +147,6 @@ def delete_session(session_id: int) -> bool:
         )
         conn.commit()
         return cur.rowcount > 0
-
-
-def prune_old_sessions(max_count: int = MAX_SESSION_COUNT) -> int:
-    with get_conn() as conn:
-        deleted_count = _prune_old_sessions(conn, max_count)
-        conn.commit()
-        return deleted_count
 
 
 def add_message(session_id: int, role: str, content: str) -> int:
@@ -413,28 +406,6 @@ def _update_order_versions(
         """,
         normalized_values,
     )
-
-
-def _prune_old_sessions(
-    conn: sqlite3.Connection,
-    max_count: int,
-) -> int:
-    if max_count < 1:
-        raise ValueError("max_count 必须大于或等于 1")
-
-    cur = conn.execute(
-        """
-        DELETE FROM sessions
-        WHERE id IN (
-            SELECT id
-            FROM sessions
-            ORDER BY created_at DESC, id DESC
-            LIMIT -1 OFFSET ?
-        )
-        """,
-        (max_count,),
-    )
-    return cur.rowcount
 
 
 def _normalize_optional_text(value: str | None) -> str | None:

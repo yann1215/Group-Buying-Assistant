@@ -8,13 +8,15 @@ from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
-from app.config import CSV_OUTPUT_DIR, ensure_dirs
+from app.core.path_manager import get_share_output_path
 from app.analysis.order_validator import (
     default_include_share,
 )
 from app.analysis.product_config import (
     make_share_type,
 )
+from app.utils.csv_utils import read_csv_dict_rows
+
 
 ORDER_METADATA_COLUMNS = {"单号", "昵称", "总金额"}
 
@@ -72,7 +74,7 @@ def calculate_share(
     share_mode: str,
     calculation_scope: str = "flat",
     product_configs: list[dict[str, Any]] | None = None,
-    output_dir: str | Path | None = None,
+    group_name: str = "",
     excluded_order_nos: set[str] | None = None,
 ) -> dict[str, Any]:
     """
@@ -110,9 +112,7 @@ def calculate_share(
     share_mode = normalize_share_mode(share_mode)
     calculation_scope = normalize_calculation_scope(calculation_scope)
 
-    ensure_dirs()
-    output_dir_path = Path(output_dir) if output_dir else CSV_OUTPUT_DIR
-    output_dir_path.mkdir(parents=True, exist_ok=True)
+    output_path = get_share_output_path(group_name)
 
     order_rows, product_names = read_order_rows(parsed_order_file)
 
@@ -168,6 +168,7 @@ def calculate_share(
     active_configs = [
         cfg for cfg in configs
         if cfg.product_name and cfg.include_share
+        and not (share_mode == "quantity" and is_special_non_quantity_product(cfg.product_name))
     ]
 
     if not active_configs:
@@ -238,6 +239,12 @@ def calculate_share(
                 "product_configs": product_configs_to_dicts(configs),
             }
 
+        empty_products = [cfg.product_name for cfg in active_configs
+                          if cfg.product_share_amount > 0 and not any(
+                              row.quantities.get(cfg.product_name, 0) > 0 for row in order_rows)]
+        if empty_products:
+            return {"ok": False, "message": "以下商品有独立均摊金额但没有参摊订单：" + "、".join(empty_products)}
+
         total_original_cents = sum(
             decimal_yuan_to_cents(cfg.product_share_amount)
             for cfg in active_configs
@@ -261,17 +268,29 @@ def calculate_share(
     total_collected_cents = sum(item.share_cents for item in charged_results)
     over_collected_cents = total_collected_cents - total_original_cents
 
-    output_path = (
-            output_dir_path
-            / f"{parsed_order_file.stem}_share_{share_mode}_{calculation_scope}.csv"
-    )
-
     write_share_result_csv(
         output_path=output_path,
         results=charged_results,
         configs=active_configs,
         calculation_scope=calculation_scope,
     )
+
+    # 用实际参与计算的订单统计，不能用收费大于零的人数替代参摊人数。
+    eligible_names = {cfg.product_name for cfg in active_configs}
+    participant_nos = {row.order_no for row in order_rows if any(
+        row.quantities.get(name, 0) > 0 for name in eligible_names)}
+    product_statistics = []
+    for cfg in configs:
+        included = cfg.product_name in eligible_names
+        buyers = [row for row in order_rows if included and row.quantities.get(cfg.product_name, 0) > 0]
+        product_statistics.append({
+            "product_name": cfg.product_name,
+            "included": included,
+            "quantity": sum(row.quantities.get(cfg.product_name, 0) for row in buyers),
+            "participant_count": len({row.order_no for row in buyers}),
+            "amount": decimal_to_text_or_blank(cfg.product_share_amount),
+            "unit_amount": decimal_to_text_or_blank(cfg.unit_share_price) if cfg.unit_share_price is not None else None,
+        })
 
     return {
         "ok": True,
@@ -288,7 +307,8 @@ def calculate_share(
         ),
         "total_collected": cents_to_yuan_text(total_collected_cents),
         "over_collected": cents_to_yuan_text(over_collected_cents),
-        "participant_count": len(charged_results),
+        "participant_count": len(participant_nos),
+        "product_statistics": product_statistics,
         "result_file": str(output_path.resolve()),
         "product_configs": product_configs_to_dicts(configs),
         "items": [
@@ -316,58 +336,96 @@ def calculate_share(
     }
 
 
-def read_order_rows(parsed_order_file: Path) -> tuple[list[OrderRow], list[str]]:
-    with parsed_order_file.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
+def read_order_rows(
+    parsed_order_file: Path,
+) -> tuple[
+    list[OrderRow],
+    list[str],
+]:
+    raw_rows, fieldnames = (
+        read_csv_dict_rows(
+            parsed_order_file
+        )
+    )
 
-        if not reader.fieldnames:
-            raise ShareCalculateError("简化订单文件没有表头。")
+    if not fieldnames:
+        raise ShareCalculateError(
+            "简化订单文件没有表头。"
+        )
 
-        if "单号" not in reader.fieldnames or "昵称" not in reader.fieldnames:
-            raise ShareCalculateError("简化订单文件必须包含“单号”和“昵称”列。")
+    if (
+        "单号" not in fieldnames
+        or "昵称" not in fieldnames
+    ):
+        raise ShareCalculateError(
+            "简化订单文件必须包含"
+            "“单号”和“昵称”列。"
+        )
 
-        product_names = [
-            col
-            for col in reader.fieldnames
-            if col not in ORDER_METADATA_COLUMNS
-        ]
+    product_names = [
+        col
+        for col in fieldnames
+        if col not in ORDER_METADATA_COLUMNS
+    ]
 
-        rows: list[OrderRow] = []
+    rows: list[OrderRow] = []
 
-        for row_idx, row in enumerate(reader, start=2):
-            order_no = str(row.get("单号", "") or "").strip()
-            nickname = str(row.get("昵称", "") or "").strip()
+    for row_idx, row in enumerate(
+        raw_rows,
+        start=2,
+    ):
+        order_no = str(
+            row.get("单号", "")
+            or ""
+        ).strip()
 
-            if not order_no:
-                raise ShareCalculateError(f"第 {row_idx} 行缺少单号。")
+        nickname = str(
+            row.get("昵称", "")
+            or ""
+        ).strip()
 
-            quantities: dict[str, int] = {}
+        if not order_no:
+            raise ShareCalculateError(
+                f"第 {row_idx} 行缺少单号。"
+            )
 
-            for product_name in product_names:
-                value = str(row.get(product_name, "") or "").strip()
+        quantities: dict[str, int] = {}
 
-                if value == "":
-                    continue
+        for product_name in product_names:
+            value = str(
+                row.get(
+                    product_name,
+                    "",
+                )
+                or ""
+            ).strip()
 
-                if not value.isdigit():
-                    raise ShareCalculateError(
-                        f"第 {row_idx} 行商品“{product_name}”数量必须是非负整数：{value!r}"
-                    )
+            if value == "":
+                continue
 
-                quantity = int(value)
-
-                quantities[product_name] = quantity
-
-            if quantities:
-                rows.append(
-                    OrderRow(
-                        order_no=order_no,
-                        nickname=nickname,
-                        quantities=quantities,
-                    )
+            if not value.isdigit():
+                raise ShareCalculateError(
+                    f"第 {row_idx} 行商品"
+                    f"“{product_name}”数量必须是"
+                    f"非负整数：{value!r}"
                 )
 
-        return rows, product_names
+            quantity = int(value)
+
+            quantities[
+                product_name
+            ] = quantity
+
+        if quantities:
+            rows.append(
+                OrderRow(
+                    order_no=order_no,
+                    nickname=nickname,
+                    quantities=quantities,
+                )
+            )
+
+    return rows, product_names
 
 
 def normalize_order_no_for_compare(

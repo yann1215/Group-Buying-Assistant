@@ -11,7 +11,6 @@ from decimal import Decimal, InvalidOperation
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-from app.config import CSV_OUTPUT_DIR, ensure_dirs
 
 
 SHEET_INDEX = 1
@@ -48,7 +47,7 @@ class OrderParseError(RuntimeError):
 
 def parse_order_file(
     order_input: str | Path | dict[str, Any],
-    output_dir: str | Path | None = None,
+    output_path: str | Path,
     product_anchor_header: str | None = None,
 ) -> str:
     """
@@ -75,15 +74,13 @@ def parse_order_file(
     if not input_path.exists():
         raise FileNotFoundError(f"订单文件不存在：{input_path}")
 
-    if input_path.suffix.lower() not in {".xlsx", ".xlsm"}:
+    if input_path.suffix.lower() != ".xlsx":
         raise OrderParseError(
-            f"暂时只支持 .xlsx / .xlsm 文件。当前文件：{input_path.name}"
+            f"暂时只支持 .xlsx 文件。当前文件：{input_path.name}"
         )
 
-    ensure_dirs()
-
-    output_dir_path = Path(output_dir) if output_dir else CSV_OUTPUT_DIR
-    output_dir_path.mkdir(parents=True, exist_ok=True)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     wb = load_workbook(input_path, data_only=True)
 
@@ -133,11 +130,6 @@ def parse_order_file(
         )
 
     product_headers = _make_unique_headers(product_names)
-
-    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # # 考虑到前后的表格可能同名，并且在同一天进行处理，因此保留了h-m-s的后缀，用以保证区分文件
-    # output_path = output_dir_path / f"{input_path.stem}_parsed_orders_{timestamp}.csv"
-    output_path = output_dir_path / f"{input_path.stem}_parsed_orders.csv"
 
     fieldnames = ["单号", "昵称", "总金额"] + product_headers
 

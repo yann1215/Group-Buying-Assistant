@@ -152,6 +152,7 @@ tmp/
 temp/
 output/
 orders/
+workspace/
 
 # =========================
 # Large local data / models

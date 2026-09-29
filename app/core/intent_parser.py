@@ -141,7 +141,6 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
             ],
             "group_name": str | None,
             "order_input": str | None,
-            "order_output_dir": str | None,
             "force": bool,
             "confirm": bool,
         }
@@ -157,12 +156,20 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
         "product_share_amounts": [],
         "group_name": None,
         "order_input": None,
-        "order_output_dir": None,
         "force": False,
         "confirm": False,
     }
 
     if not text:
+        return result
+
+    if has_negative_words(text) or re.search(r"(?:不|不要|暂不|取消)(?:确认|计算|算).*均摊|(?:不|不要|暂不)确认计算", text):
+        result["intent"] = "cancel_share"
+        return result
+
+    # 查询必须先于宽泛的均摊关键词，且不提取或修改参数。
+    if re.search(r"(?:查看|看看|看下|看一下|查询|查查|查)(?:当前)?均摊|均摊(?:金额)?(?:是|有)?多少", text):
+        result["intent"] = "show_share"
         return result
 
     # 1. 查看特殊成员
@@ -203,7 +210,6 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
     # 4. 设置群聊信息、文件路径
     group_name = parse_group_name(text)
     order_input = parse_order_input(text)
-    order_output_dir = parse_order_output_dir(text)
 
     force = has_force_words(text)
     confirm = has_confirm_words(text)
@@ -217,27 +223,15 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
             "product_share_amounts": product_share_amounts,
             "group_name": group_name,
             "order_input": order_input,
-            "order_output_dir": order_output_dir,
             "force": force,
             "confirm": confirm,
         }
     )
 
-    # 意图优先级很重要。
-    #
-    # 1. 确认配置
-    # 2. 更新商品独立均摊配置
-    # 3. 核对成员
-    # 4. 发起/补充均摊参数，或强制继续计算均摊
-    # 5. 更新群聊、订单、输出目录
-    # 6. 普通聊天
+    # 查询、取消已优先处理；金额和方式本身不能触发计算。
 
     if confirm:
         result["intent"] = "confirm_share_config"
-        return result
-
-    if product_share_amounts:
-        result["intent"] = "update_share_config"
         return result
 
     if has_bulk_goods_words(text):
@@ -248,20 +242,22 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
         result["intent"] = "member_check"
         return result
 
-    # 即使没有重新输入金额和均摊方式，
-    # “先算”“继续算”“忽略名单问题”等 force 指令，
-    # 也应当进入当前会话已有的均摊任务。
+    # 只有明确的计算动作才开始计算准备；金额和方式输入只保存。
+    if re.search(r"(?:计算|重算|算一下|算)(?:一下)?均摊", text) or force:
+        result["intent"] = "calculate_share"
+        return result
+
     if (
         has_share_words(text)
         or share_mode is not None
         or calculation_scope is not None
         or amount is not None
-        or force
+        or product_share_amounts
     ):
-        result["intent"] = "calculate_share"
+        result["intent"] = "update_share_config"
         return result
 
-    if group_name or order_input or order_output_dir:
+    if group_name or order_input:
         result["intent"] = "set_context"
         return result
 
@@ -399,6 +395,20 @@ def has_confirm_words(text: str) -> bool:
     return any(re.search(pattern, normalized) for pattern in patterns)
 
 
+def has_share_confirmation_words(text: str) -> bool:
+    """仅在均摊等待确认时使用，按完整分句识别，避免普通问句误触发。"""
+    if has_negative_words(text):
+        return False
+    words = {
+        "算", "计算", "算吧", "算一下", "开始", "开始算", "开始计算",
+        "算均摊", "计算均摊", "算一下均摊", "确认", "确认计算", "无误",
+        "确认无误", "没问题", "没有问题", "可以", "可以计算", "好", "好的",
+        "下一步", "继续", "继续算", "继续计算", "按这个算", "按这个计算",
+    }
+    clauses = re.split(r"[，,。.!！;；\n]+", text)
+    return any(re.sub(r"\s+", "", clause) in words for clause in clauses)
+
+
 # ----------------------------------------------------------------------
 # 人头摊 / 个数摊
 # ----------------------------------------------------------------------
@@ -463,7 +473,7 @@ def parse_calculation_scope(text: str) -> str | None:
     规则：
     1. 明确出现“独立”时，返回 independent。
     2. 明确出现“拉通”时，返回 flat。
-    3. 只说“人头摊”或“个数摊”时，默认理解为拉通。
+    3. 未明确范围时保留已有范围，新任务由编排层默认拉通。
     4. 只说“按人头”或“按个数”时，不修改已有计算范围。
     """
 
@@ -500,17 +510,6 @@ def parse_calculation_scope(text: str) -> str | None:
         return "independent"
 
     if has_flat:
-        return "flat"
-
-    # “人头摊”“个数摊”作为拉通均摊的简写
-    default_flat_words = [
-        "人头摊",
-        "个数摊",
-        "数量摊",
-        "件数摊",
-    ]
-
-    if any(word in text for word in default_flat_words):
         return "flat"
 
     # 没有明确范围时不覆盖会话中的旧值
@@ -1027,6 +1026,14 @@ def has_affirmative_words(text: str) -> bool:
 def has_negative_words(text: str) -> bool:
     normalized = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
 
+    if re.search(
+        r"(?:不|未|没|别|取消|拒绝|暂缓).{0,3}确认"
+        r"|(?:不要|暂不|先不|不想|不必|别).{0,3}(?:计算|算)"
+        r"|(?:配置|商品).{0,3}(?:有问题|有误|不对)",
+        normalized,
+    ):
+        return True
+
     exact_words = {
         "否",
         "不是",
@@ -1034,6 +1041,8 @@ def has_negative_words(text: str) -> bool:
         "不要",
         "取消",
         "先不算",
+        "不算",
+        "不计算",
         "有问题",
         "还没确认",
         "暂不确认",
@@ -1234,22 +1243,3 @@ def parse_order_input(text: str) -> str | None:
         return None
 
     return value
-
-
-def parse_order_output_dir(text: str) -> str | None:
-    """
-    支持：
-        输出目录：D:\\orders\\output
-        保存目录：D:\\orders\\output
-        结果目录：D:\\orders\\output
-
-        订单 test 输出目录 D:\\orders\\output
-    """
-    return parse_context_field_value(
-        text=text,
-        field_keywords=[
-            "输出目录",
-            "保存目录",
-            "结果目录",
-        ],
-    )

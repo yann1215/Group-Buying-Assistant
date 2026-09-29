@@ -5,10 +5,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
+from app.core.path_manager import get_order_input_path
 
 
-DEFAULT_ORDER_DIR = Path("./orders")
-SUPPORTED_ORDER_SUFFIXES = {".xlsx", ".xlsm"}
+SUPPORTED_ORDER_SUFFIXES = {".xlsx"}
 
 ORDER_SLOTS = (
     ("new_order_file", "new_order_updated_at"),
@@ -50,7 +50,7 @@ def empty_order_versions() -> dict[str, str]:
 def normalize_order_path(
     value: str | Path,
     *,
-    default_order_dir: str | Path = DEFAULT_ORDER_DIR,
+    default_order_dir: str | Path | None = None,
 ) -> str:
     """
     规范化用户输入的订单路径，但不检查文件是否存在。
@@ -60,18 +60,7 @@ def normalize_order_path(
     - 只有文件名时放入 ``default_order_dir``；
     - 已含目录的相对路径和绝对路径保持原有形式。
     """
-    raw_value = str(value).strip().strip('"').strip("'")
-    if not raw_value:
-        return ""
-
-    path = Path(raw_value)
-    if not path.suffix:
-        path = path.with_suffix(".xlsx")
-
-    if path.parent == Path("."):
-        path = Path(default_order_dir) / path
-
-    return str(path)
+    return get_order_input_path(value, default_order_dir=default_order_dir)
 
 
 def validate_order_path(value: str | Path) -> tuple[bool, str]:
@@ -82,7 +71,7 @@ def validate_order_path(value: str | Path) -> tuple[bool, str]:
 
     path = Path(file_path).expanduser()
     if path.suffix.lower() not in SUPPORTED_ORDER_SUFFIXES:
-        return False, "订单文件仅支持 .xlsx 或 .xlsm"
+        return False, "订单文件仅支持 .xlsx"
     if not path.exists():
         return False, "找不到订单文件"
     if not path.is_file():
@@ -195,7 +184,7 @@ def shift_order_versions(
     new_order_path: str | Path,
     *,
     updated_at: str | None = None,
-    default_order_dir: str | Path = DEFAULT_ORDER_DIR,
+    default_order_dir: str | Path | None = None,
 ) -> OrderVersionUpdateResult:
     """
     清理现有版本并将有效的新订单写入首位。

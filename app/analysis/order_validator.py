@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from typing import Any, Iterable
-import csv
 import re
 from pathlib import Path
+
+from app.utils.csv_utils import read_csv_dict_rows
 
 
 # 强制参摊关键词优先级高于不参摊关键词。
@@ -93,117 +94,114 @@ def inspect_order_status(
     special_product_orders = []
     only_non_share_orders = []
 
-    with parsed_order_file.open(
-        "r",
-        encoding="utf-8-sig",
-        newline="",
-    ) as f:
-        reader = csv.DictReader(f)
+    rows, fieldnames = read_csv_dict_rows(
+        parsed_order_file
+    )
 
-        if not reader.fieldnames:
-            raise OrderValidationError(
-                "简化订单文件没有表头。"
+    if not fieldnames:
+        raise OrderValidationError(
+            "简化订单文件没有表头。"
+        )
+
+    product_fields = [
+        field
+        for field in fieldnames
+        if field not in {
+            "单号",
+            "昵称",
+            "总金额",
+        }
+    ]
+
+    for row in rows:
+        order_no = str(
+            row.get("单号") or ""
+        ).strip()
+
+        nickname = str(
+            row.get("昵称") or ""
+        ).strip()
+
+        purchased_products = []
+
+        for product_name in product_fields:
+            quantity = _to_positive_int_or_zero(
+                row.get(product_name)
             )
 
-        product_fields = [
-            field
-            for field in reader.fieldnames
-            if field not in {
-                "单号",
-                "昵称",
-                "总金额",
-            }
+            if quantity <= 0:
+                continue
+
+            purchased_products.append(
+                {
+                    "商品名称": product_name,
+                    "数量": quantity,
+                }
+            )
+
+        # 空订单不在这里处理
+        if not purchased_products:
+            continue
+
+        # =========================================
+        # 第一优先级：特殊商品
+        # =========================================
+
+        special_products = [
+            item
+            for item in purchased_products
+            if is_special_member_product(
+                item["商品名称"]
+            )
         ]
 
-        for row in reader:
-            order_no = str(
-                row.get("单号") or ""
-            ).strip()
-
-            nickname = str(
-                row.get("昵称") or ""
-            ).strip()
-
-            purchased_products = []
-
-            for product_name in product_fields:
-                quantity = _to_positive_int_or_zero(
-                    row.get(product_name)
-                )
-
-                if quantity <= 0:
-                    continue
-
-                purchased_products.append(
-                    {
-                        "商品名称": product_name,
-                        "数量": quantity,
-                    }
-                )
-
-            # 空订单不在这里处理
-            if not purchased_products:
-                continue
-
-            # =========================================
-            # 第一优先级：特殊商品
-            # =========================================
-
-            special_products = [
-                item
-                for item in purchased_products
-                if is_special_member_product(
-                    item["商品名称"]
-                )
-            ]
-
-            if special_products:
-                special_product_orders.append(
-                    {
-                        "单号": order_no,
-                        "昵称": nickname,
-                        "特殊商品": special_products,
-                    }
-                )
-
-                # 特殊商品订单不再进入下面的异常判断
-                continue
-
-            # =========================================
-            # 第二优先级：普通商品是否存在参摊商品
-            # =========================================
-
-            has_share_product = False
-            non_share_products = []
-
-            for item in purchased_products:
-                product_name = item["商品名称"]
-
-                include_share = include_share_map.get(
-                    product_name,
-                    default_include_share(
-                        product_name
-                    ),
-                )
-
-                if include_share:
-                    has_share_product = True
-                    break
-
-                non_share_products.append(item)
-
-            # 至少有一个参摊商品 → 正常
-            if has_share_product:
-                continue
-
-            # 没特殊商品，并且所有商品都不参摊
-            only_non_share_orders.append(
+        if special_products:
+            special_product_orders.append(
                 {
                     "单号": order_no,
                     "昵称": nickname,
-                    "不参摊商品": non_share_products,
+                    "特殊商品": special_products,
                 }
             )
+
+            # 特殊商品订单不再进入下面的异常判断
+            continue
+
+        # =========================================
+        # 第二优先级：普通商品是否存在参摊商品
+        # =========================================
+
+        has_share_product = False
+        non_share_products = []
+
+        for item in purchased_products:
+            product_name = item["商品名称"]
+
+            include_share = include_share_map.get(
+                product_name,
+                default_include_share(
+                    product_name
+                ),
+            )
+
+            if include_share:
+                has_share_product = True
+                break
+
+            non_share_products.append(item)
+
+        # 至少有一个参摊商品 → 正常
+        if has_share_product:
+            continue
+
+        # 没特殊商品，并且所有商品都不参摊
+        only_non_share_orders.append(
+            {
+                "单号": order_no,
+                "昵称": nickname,
+                "不参摊商品": non_share_products,
+            }
+        )
 
     return {
         "special_product_orders": (
