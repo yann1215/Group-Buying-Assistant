@@ -22,7 +22,7 @@ from uuid import uuid4
 from app.analysis.order_parser import parse_order_file
 from app.analysis.special_member import (
     SpecialMemberError,
-    update_special_member_cache,
+    update_special_members_with_preview,
     validate_special_member_cache,
 )
 from app.analysis.member_parser import parse_group_member_orders
@@ -286,6 +286,8 @@ class SessionToolContext:
     legacy_share_signature: str | None = None
     group_name: str | None = None
 
+    pending_participation: dict[str, Any] | None = None
+
     special_members: list[dict[str, Any]] = field(
         default_factory=list
     )
@@ -325,6 +327,7 @@ class SessionToolContext:
         """
         return {
             "context_version": 1,
+            "pending_participation": _to_json_safe(self.pending_participation),
             "config_owner_id": self.config_owner_id,
             "last_share_result": _to_json_safe(self.last_share_result),
             "last_share_signature": self.last_share_signature,
@@ -355,6 +358,7 @@ class SessionToolContext:
         product_configs = data.get("product_configs")
 
         return cls(
+            pending_participation=data.get("pending_participation") if isinstance(data.get("pending_participation"), dict) else None,
             config_owner_id=str(data.get("config_owner_id") or uuid4().hex),
             last_share_result=data.get("last_share_result") if isinstance(data.get("last_share_result"), dict) else None,
             last_share_signature=data.get("last_share_signature"),
@@ -558,6 +562,11 @@ class ToolOrchestrator:
 
         # print("share_request BEFORE:", ctx.share_request)
 
+        from app.core.participation_workflow import handle_participation
+        participation_reply = handle_participation(self, ctx, intent, user_text)
+        if participation_reply is not None:
+            return participation_reply
+
         self.update_context_from_intent(ctx, intent)
 
         # 只有处于“大货等待确认”状态时，
@@ -671,14 +680,14 @@ class ToolOrchestrator:
             )
 
         try:
-            ctx.special_members = (
-                update_special_member_cache(
-                    current_members=ctx.special_members,
-                    updates=updates,
-                )
-            )
+            members, previews = update_special_members_with_preview(ctx.special_members, updates)
         except SpecialMemberError as exc:
             return f"身份更新失败，原因：{exc}"
+
+        ctx.special_members = members
+        ctx.pending_participation = None
+        ctx.bulk_request.pending_confirmation = False
+        ctx.bulk_request.confirmed = False
 
         # 特殊成员发生变化后，旧名单检查结果必须失效。
         ctx.member_checked = False
@@ -686,12 +695,17 @@ class ToolOrchestrator:
         ctx.parsed_order_file = None
         invalidate_share_confirmation(ctx)
 
-        return (
-                "特殊成员信息已更新。\n\n"
-                + format_special_members(
-            ctx.special_members
-        )
-        )
+        action = next((item.get('_操作') for item in updates if item.get('_操作')), '')
+        message = {
+            '修改': '特殊成员信息已修改并保存；其他身份参数已清空，参摊设置保留，后续检查将重新匹配补全。',
+            '清空': '指定身份参数已清空并保存；无剩余身份参数的成员已移除。后续检查可能重新补全空字段。',
+            '删除': '指定特殊成员已移除并保存。',
+        }.get(action, '特殊成员设置已保存。')
+        lines = [message]
+        for removed, member in previews:
+            row = format_special_members([member]).split('\n', 1)[1]
+            lines.append(('已移除：' if removed else '') + row)
+        return '\n'.join(lines)
 
     def ensure_member_checked(
             self,
@@ -869,6 +883,7 @@ class ToolOrchestrator:
 
         lines = [
             "大货计算前请确认以下信息。",
+            format_complete_calculation_preview(ctx),
             "",
             "当前有效商品单价：",
         ]
@@ -1144,10 +1159,12 @@ class ToolOrchestrator:
         if updates and req.calculation_scope != "independent":
             return "商品独立金额未写入，请先设置独立模式：独立人头摊或独立个数摊。"
         unmatched = []
+        updated_items = []
         changed = bool(intent.get("share_parameters_changed"))
         if updates:
             before = ctx.product_configs
             result = update_product_share_config_file(config_file=ctx.share_config_file, updates=updates)
+            updated_items = result.get('updated_items') or []
             unmatched = result.get("unmatched_updates") or []
             changed = changed or before != load_product_share_config_file(ctx.share_config_file)
         if changed or unmatched:
@@ -1158,10 +1175,24 @@ class ToolOrchestrator:
             )
         ctx.product_configs = load_product_share_config_file(ctx.share_config_file)
         intent["config_saved"] = not unmatched
-        lines = ["均摊配置已保存，本次未执行计算。", format_pending_share_summary(ctx)]
+        lines = ["均摊配置已保存，本次未执行计算。"]
+        if updates and not intent.get('share_parameters_changed'):
+            from app.analysis.participation import product_preview
+            names = {item['商品名称'] for item in updated_items}
+            lines.extend(product_preview(item) for item in ctx.product_configs if item['商品名称'] in names)
+        else:
+            lines.append(format_pending_share_summary(ctx))
         if unmatched:
-            lines.append("以下商品未匹配，未写入：" + str(unmatched))
-        lines.extend(self.share_config_errors(ctx))
+            for item in unmatched:
+                name = item.get('商品名称') or item.get('商品序号')
+                candidates = item.get('候选商品') or []
+                if candidates:
+                    lines.append(f"“{name}”匹配到多个商品，本项金额未写入：" + '、'.join(candidates)
+                                 + '。请用完整商品名称或商品序号重新录入金额。')
+                else:
+                    lines.append(f"“{name}”未匹配到商品，本项金额未写入。")
+        if not updates or intent.get('share_parameters_changed'):
+            lines.extend(self.share_config_errors(ctx))
         lines.append('配置完整后请输入“算均摊”，确认商品配置后才会查成员并计算。')
         return "\n".join(lines)
 
@@ -1178,10 +1209,7 @@ class ToolOrchestrator:
         req = ctx.share_request
         req.pending_config_confirmation = True
         req.confirmation_signature = share_signature(ctx)
-        lines = ["计算均摊前，请确认商品配置：", format_pending_share_summary(ctx), "", "商品参摊情况："]
-        for c in ctx.product_configs or []:
-            state = "参与均摊" if c.get("计入均摊") else "不参与均摊"
-            lines.append(f"- {c['商品序号']}号 {c['商品名称']}：{state}；订单数量 {c['商品数量']}")
+        lines = ["计算均摊前，请确认商品配置：", format_complete_calculation_preview(ctx)]
         lines.extend([f"配置文件：{ctx.share_config_file}", '确认无误后可输入“计算”“算”“无误”或“下一步”；需修改时请修改配置后重新输入“算均摊”。'])
         return "\n".join(lines)
 
@@ -1419,6 +1447,17 @@ def format_pending_share_summary(ctx: SessionToolContext, configs: list[dict[str
         lines.extend(f"- {c['商品名称']}：{'待计算' if c.get('计入均摊') else '0 个（不参摊）'}" for c in configs)
     lines.append("单人均摊：待计算" if share_mode == "head" else "单个商品均摊：待计算")
     return "\n".join(lines)
+
+
+def format_complete_calculation_preview(ctx: SessionToolContext) -> str:
+    """计算确认统一展示当前配置、全部商品和全部特殊成员。"""
+    from app.analysis.participation import product_preview
+    lines = [f'群聊：{ctx.group_name or "未设置"}',
+             f'订单：{format_order_path(ctx.new_order_file)}',
+             format_pending_share_summary(ctx), '', '全部商品配置：']
+    lines.extend(product_preview(item) for item in ctx.product_configs or [])
+    lines.extend(['', format_special_members(ctx.special_members)])
+    return '\n'.join(lines)
 
 
 def format_special_members(

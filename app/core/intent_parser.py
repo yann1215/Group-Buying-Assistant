@@ -177,11 +177,22 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
         result["intent"] = "show_special_members"
         return result
 
-    # 2. 设置特殊成员
-    special_member_updates = (
-        parse_special_member_updates(text)
-    )
+    # 明确的身份操作优先，修改后的昵称即使包含“参摊”也应作为新值。
+    special_member_updates = parse_special_member_updates(text)
+    if any(item.get('_操作') or item.get('_修改字段') or item.get('_修改错误')
+           for item in special_member_updates):
+        result['intent'] = 'update_special_members'
+        result['special_member_updates'] = special_member_updates
+        return result
 
+    from app.analysis.participation import parse_participation
+    participation = parse_participation(text)
+    if participation:
+        result["intent"] = "update_participation"
+        result["participation"] = participation
+        return result
+
+    # 2. 设置特殊成员
     if special_member_updates:
         result["intent"] = "update_special_members"
         result["special_member_updates"] = (

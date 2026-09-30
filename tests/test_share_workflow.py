@@ -113,7 +113,7 @@ class ShareWorkflowTests(unittest.TestCase):
                 if '独立' in mode:
                     self.say('1号80元，2号40元')
                 preview = self.say('算均摊')
-                self.assertIn('底胚：不参与均摊', preview)
+                self.assertIn('底胚｜不参摊', preview)
                 self.members.assert_not_called()
                 reply = self.say('确认计算')
                 self.assertIn('实际总收款', reply)

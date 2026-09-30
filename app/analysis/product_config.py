@@ -13,7 +13,6 @@ from typing import Any
 from app.core.path_manager import get_product_config_path, sanitize_filename
 from app.analysis.order_validator import (
     default_include_share,
-    is_special_member_product,
 )
 from app.analysis.order_parser import (
     read_product_unit_prices,
@@ -445,9 +444,6 @@ def ensure_product_config_file(
             # 均摊类型、商品均摊、单份均摊、
             # 商品单价、商品大货总价均不修改。
 
-            # 特殊商品固定不参摊
-            if is_special_member_product(product_name):
-                row["计入均摊"] = False
 
         # =============================
         # 新商品
@@ -571,6 +567,13 @@ def update_product_share_config_file(
             row_idx=0,
         )
 
+        from app.analysis.participation import resolve_products
+        candidates = resolve_products(str(target_no) if target_no is not None else target_name, rows)
+        if len(candidates) != 1:
+            unmatched_updates.append({**update, "候选商品": [r["商品名称"] for r in candidates]})
+            continue
+        target_name = candidates[0]["商品名称"]
+        target_no = None
         matched = False
 
         for row in rows:

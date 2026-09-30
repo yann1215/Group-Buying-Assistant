@@ -316,6 +316,10 @@ def update_special_member_cache(
             raw_update.get("_修改字段")
         )
 
+        if update['角色'] in SINGLE_PERSON_ROLES and (raw_update.get('_操作') or update['_修改字段']):
+            _apply_single_person_operation(result, update, raw_update)
+            continue
+
         # 先检查这是不是对自动成员的身份覆盖
         promoted = _try_promote_auto_member(
             members=result,
@@ -1644,42 +1648,13 @@ def normalize_name_for_match(value: Any) -> str:
     目前只忽略空白和英文大小写；
     emoji、汉字和其他符号保留。
     """
-    text = normalize_text(value)
-
-    return re.sub(
-        r"\s+",
-        "",
-        text,
-    ).casefold()
+    from app.utils.name_matching import normalize_name
+    return normalize_name(value)
 
 
-def is_fuzzy_name_match(
-    query: Any,
-    candidate: Any,
-) -> bool:
-    """
-    判断昵称是否满足包含关系。
-
-    示例：
-        番茄      -> 番茄🍅
-        番茄      -> 001 番茄🍅
-        yann      -> Yann
-    """
-    query_text = normalize_name_for_match(query)
-    candidate_text = normalize_name_for_match(candidate)
-
-    if not query_text or not candidate_text:
-        return False
-
-    # 太短的检索词容易误匹配。
-    # 中文昵称建议至少输入两个字符。
-    if len(query_text) < 2:
-        return False
-
-    return (
-        query_text in candidate_text
-        or candidate_text in query_text
-    )
+def is_fuzzy_name_match(query: Any, candidate: Any) -> bool:
+    from app.utils.name_matching import fuzzy_name_match
+    return fuzzy_name_match(query, candidate)
 
 
 def _find_unique_fuzzy_member(
@@ -1737,3 +1712,84 @@ def _deduplicate_texts(
         seen.add(item)
 
     return result
+
+
+def update_special_members_with_preview(current_members, updates):
+    """在副本上完成整批更新，并返回本次涉及的记录（含删除记录）。"""
+    members = [normalize_special_member(item, default_include_share=True)
+               for item in current_members or []]
+    previews = []
+    for update in updates:
+        before = members
+        members = update_special_member_cache(before, [update])
+        added = [item for item in members if item not in before]
+        removed = [item for item in before if item not in members]
+        if added:
+            previews.extend((False, item) for item in added)
+        elif removed:
+            previews.extend((True, item) for item in removed)
+        else:
+            # 重复设置也展示目标的当前值，不能把同角色的其他人一并显示。
+            candidates = [item for item in members if item['角色'] == update['角色']]
+            selector = update.get('_匹配值')
+            if update['角色'] in SINGLE_PERSON_ROLES:
+                pass
+            elif selector:
+                fields = [update['_匹配字段']] if update.get('_匹配字段') else IDENTITY_FIELDS
+                candidates = [item for item in candidates if any(item.get(f) == selector for f in fields)]
+            elif any(update.get(f) for f in IDENTITY_FIELDS):
+                candidates = [item for item in candidates if all(
+                    not update.get(f) or item.get(f) == update[f] for f in IDENTITY_FIELDS)]
+            previews.extend((False, item) for item in candidates)
+    final_previews = []
+    for removed, item in previews:
+        if not removed and item not in members:
+            continue
+        if (removed, item) not in final_previews:
+            final_previews.append((removed, item))
+    return members, final_previews
+
+
+def _apply_single_person_operation(
+    members: list[dict[str, Any]],
+    update: dict[str, Any],
+    raw_update: dict[str, Any],
+) -> None:
+    """单人角色按角色定位；更正身份后丢弃旧身份关联。"""
+    role = update['角色']
+    matches = [member for member in members if member['角色'] == role]
+    if not matches:
+        raise SpecialMemberError(f'当前还没有设置{role}，无法修改或删除。')
+    if len(matches) != 1:
+        raise SpecialMemberError(f'缓存中已有多名{role}，请先清理重复配置。')
+    target = matches[0]
+    selector = update.get('_匹配值')
+    if selector:
+        match_field = update.get('_匹配字段')
+        if not match_field:
+            for label in ('微信昵称', '群昵称', '群名片', '群备注', '订单号', '昵称', '单号', '序号'):
+                if selector.startswith(label):
+                    match_field = {'微信昵称': '昵称', '群名片': '群昵称', '群备注': '群昵称',
+                                   '订单号': '单号', '序号': '单号'}.get(label, label)
+                    selector = selector[len(label):].lstrip('是为=：: ')
+                    break
+        fields = [match_field] if match_field else IDENTITY_FIELDS
+        if not any(target.get(field) == selector for field in fields):
+            raise SpecialMemberError(f'{role}的原身份与“{selector}”不匹配，因此没有进行修改。')
+    operation = raw_update.get('_操作', '修改')
+    fields = raw_update.get('_指定字段') or [update.get('_修改字段')]
+    if operation == '删除':
+        members.remove(target)
+        return
+    if not fields or any(field not in IDENTITY_FIELDS for field in fields):
+        raise SpecialMemberError('只能修改或清空昵称、群昵称和单号。')
+    if operation == '清空':
+        for field in fields:
+            target[field] = ''
+        if not has_member_identity(target):
+            members.remove(target)
+        return
+    if any(not update.get(field) for field in fields):
+        raise SpecialMemberError('修改后的参数不能为空。')
+    for field in IDENTITY_FIELDS:
+        target[field] = update[field] if field in fields else ''

@@ -8,6 +8,7 @@ from typing import Any
 from app.analysis.special_constants import (
     SPECIAL_MEMBER_ROLES,
     SPECIAL_MEMBER_ROLE_ALIASES,
+    SINGLE_PERSON_ROLES,
 )
 
 
@@ -221,11 +222,24 @@ def parse_special_member_updates(
     if has_show_special_member_words(normalized):
         return []
 
+    # 修改/清理命令先固定角色边界，禁止失败后将动作词作为昵称。
+    command_prefix = re.split(r"修改为|修改成|设置为|改为|改成|换成|换为|设为", normalized, maxsplit=1)[0]
+    if (re.match(r"^(?:(?:请|帮我)\s*)*(?:不要|别|先别|暂不|不必|怎么|如何|能否|是否|可不可以)", command_prefix)
+            or re.search(r"(?:不要|先别|别|暂不|不必|怎么|如何|能否|是否)\s*(?:删除|删掉|删去|移除|清空|清除|去掉|重置|修改|$)", command_prefix)
+            or re.search(r"[？?]|(?:吗|么)\s*$", normalized)):
+        return []
+    operation = parse_special_member_operation(normalized)
+    if operation is not None:
+        return [operation]
+
     # 必须优先解析明确修改语句。
     # 否则“修改AAABBB……”可能被普通设置语法识别。
     edit_update = parse_special_member_edit(normalized)
 
     if edit_update is not None:
+        if edit_update.get('角色') in SINGLE_PERSON_ROLES and edit_update.get('_修改字段'):
+            edit_update['_操作'] = '修改'
+            edit_update['_指定字段'] = [edit_update['_修改字段']]
         return [edit_update]
 
     # --------------------------------------------------
@@ -302,6 +316,69 @@ def parse_special_member_updates(
             updates.append(update)
 
     return updates
+
+
+_CHANGE_ACTION = r"修改为|修改成|设置为|改为|改成|换成|换为|设为"
+_CLEAR_ACTION = r"删除|删掉|删去|移除|清空|清除|去掉|重置"
+
+
+def parse_special_member_operation(text: str) -> dict[str, Any] | None:
+    """解析单人身份修改和清理，角色只匹配一次，不参与后续回溯。"""
+    value = re.sub(r"^(?:(?:请|帮我)\s*)+", "", text).strip()
+    value = re.sub(r"^把\s*", "", value)
+    leading = re.match(rf"^({_CLEAR_ACTION})\s*", value)
+    edit_prefix = False
+    if leading:
+        value = value[leading.end():]
+    else:
+        edit_prefix = value.startswith('修改')
+        value = re.sub(r"^修改\s*(?=" + _ROLE_PATTERN_TEXT + r")", "", value)
+    role_match = ROLE_PATTERN.match(value)
+    if not role_match:
+        return None
+    role = normalize_special_member_role(role_match['role'])
+    tail = value[role_match.end():].strip()
+    change = re.search(_CHANGE_ACTION + (r'|为|成' if edit_prefix else ''), tail)
+    clear = re.search(rf"({_CLEAR_ACTION})(?:掉)?(?:一下)?[。！!]*$", tail)
+    if not leading and not change and not clear and not edit_prefix:
+        return None
+    result = {'角色': role}
+    if role not in SINGLE_PERSON_ROLES:
+        if leading or clear:
+            return {**result, '_修改错误': '多人角色暂不支持此清理指令，请明确指定成员后处理。'}
+        return None
+    if edit_prefix and not change and not clear:
+        return {**result, '_修改错误': '请提供修改字段和新值，例如“车主昵称改为小李”。'}
+    if change and not leading:
+        head = tail[:change.start()].strip()
+        new_value = tail[change.end():].strip().strip('，,。；;')
+        field_match = re.search(rf"(?P<field>{_EDITABLE_FIELD_PATTERN})$", head)
+        if field_match:
+            field = EDITABLE_FIELD_ALIASES[field_match['field']]
+            selector = head[:field_match.start()].strip().removesuffix('的').strip()
+        elif not head or head == '的':
+            field, selector = '昵称', ''
+        else:
+            return {**result, '_修改错误': '无法识别修改字段，请使用昵称、群昵称或单号。'}
+        if not new_value:
+            return {**result, '_修改错误': '修改后的参数不能为空；如需清空，请使用清空指令。'}
+        # 按字段边界解析一次命令中的多个新值，数字昵称不推断为单号。
+        chunks = re.split(rf"[，,；;]\s*(?=(?:{_EDITABLE_FIELD_PATTERN}))", new_value)
+        fields = {field: chunks[0].strip()}
+        for chunk in chunks[1:]:
+            item = re.fullmatch(rf"(?P<field>{_EDITABLE_FIELD_PATTERN})\s*(?:{_CHANGE_ACTION}|=|：|:)\s*(?P<value>.+)", chunk)
+            if not item:
+                return {**result, '_修改错误': '附加字段请使用“字段=新值”的格式。'}
+            fields[EDITABLE_FIELD_ALIASES[item['field']]] = item['value'].strip()
+        return {**result, **fields, '_操作': '修改', '_指定字段': list(fields),
+                '_匹配值': selector}
+    target = tail if leading else tail[:clear.start()]
+    target = re.sub(r"(?:一下)?[。！!]*$", "", target).strip().removeprefix('的').strip()
+    if target in ('', '信息', '全部信息'):
+        return {**result, '_操作': '删除'}
+    if target in EDITABLE_FIELD_ALIASES:
+        return {**result, '_操作': '清空', '_指定字段': [EDITABLE_FIELD_ALIASES[target]]}
+    return {**result, '_修改错误': '无法识别要清空的字段，请使用昵称、群昵称或单号；移除成员请只指定角色。'}
 
 
 def parse_special_member_edit(

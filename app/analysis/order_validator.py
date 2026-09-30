@@ -9,7 +9,7 @@ from pathlib import Path
 from app.utils.csv_utils import read_csv_dict_rows
 
 
-# 强制参摊关键词优先级高于不参摊关键词。
+# 默认规则中，不参摊关键词优先。已保存的配置优先于默认规则。
 FORCE_INCLUDE_SHARE_KEYWORDS = (
     "本体",
 )
@@ -48,6 +48,15 @@ def is_special_member_product(
     return False
 
 
+def is_special_non_quantity_product(product_name: str) -> bool:
+    name = str(product_name or "").strip()
+    special_1 = name.startswith(("摊画师", "画师摊", "画师专", "画师各", "画师一", "画师二", "画师1", "画师2"))
+    special_2 = name.startswith(("摊供稿", "供稿", "摊章稿", "摊授权", "授权老师", "授权专"))
+    special_3 = name.endswith(("专拍"))
+    special_flag = special_1 or special_2 or special_3
+    return special_flag
+
+
 def default_include_share(product_name: str) -> bool:
     """
     默认参摊规则。
@@ -65,8 +74,8 @@ def default_include_share(product_name: str) -> bool:
 
     name = str(product_name or "").strip()
 
-    # 特殊成员商品固定不参摊
-    if is_special_member_product(name):
+    # 首次创建默认不参摊，用户可在配置中覆盖。
+    if is_special_member_product(name) or is_special_non_quantity_product(name):
         return False
 
     # 普通不参摊商品
@@ -152,7 +161,7 @@ def inspect_order_status(
             for item in purchased_products
             if is_special_member_product(
                 item["商品名称"]
-            )
+            ) and not include_share_map.get(item["商品名称"], False)
         ]
 
         if special_products:

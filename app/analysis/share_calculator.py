@@ -168,7 +168,6 @@ def calculate_share(
     active_configs = [
         cfg for cfg in configs
         if cfg.product_name and cfg.include_share
-        and not (share_mode == "quantity" and is_special_non_quantity_product(cfg.product_name))
     ]
 
     if not active_configs:
@@ -576,11 +575,6 @@ def calculate_flat_share(
                 if product_name not in eligible_product_names:
                     continue
 
-                # “摊画师……”和“摊供稿人……”
-                # 不计入个数摊数量权重。
-                if is_special_non_quantity_product(product_name):
-                    continue
-
                 quantity_weight += quantity
 
             if quantity_weight > 0:
@@ -625,11 +619,6 @@ def calculate_flat_share(
                 continue
 
             if not cfg.include_share:
-                continue
-
-            if is_special_non_quantity_product(
-                cfg.product_name
-            ):
                 continue
 
             cfg.unit_share_price = unit_share_price
@@ -726,10 +715,6 @@ def calculate_independent_share(
             )
 
         elif share_type == "quantity_independent":
-            # “摊画师……”和“摊供稿人……”不参与个数摊计算
-            if is_special_non_quantity_product(cfg.product_name):
-                continue
-
             calculate_one_product_quantity_independent(
                 order_rows=order_rows,
                 cfg=cfg,
@@ -810,9 +795,6 @@ def calculate_total_share_quantity_for_summary(
     for row in order_rows:
         for product_name, quantity in row.quantities.items():
             if product_name not in eligible_product_names:
-                continue
-
-            if is_special_non_quantity_product(product_name):
                 continue
 
             total_quantity += quantity
@@ -909,15 +891,6 @@ def product_configs_to_dicts(configs: list[ProductShareConfig]) -> list[dict[str
         )
 
     return result
-
-
-def is_special_non_quantity_product(product_name: str) -> bool:
-    name = str(product_name or "").strip()
-    special_1 = name.startswith(("摊画师", "画师摊", "画师专", "画师各", "画师一", "画师二", "画师1", "画师2"))
-    special_2 = name.startswith(("摊供稿", "供稿", "摊章稿", "摊授权", "授权老师", "授权专"))
-    special_3 = name.endswith(("专拍"))
-    special_flag = special_1 or special_2 or special_3
-    return special_flag
 
 
 def normalize_share_mode(value: str) -> str:
