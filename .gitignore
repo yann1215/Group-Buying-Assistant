@@ -137,9 +137,10 @@ app/outputs/cache/*
 # Logs
 # =========================
 *.log
-logs/
 log/
+logs/
 test/
+tests/
 
 # =========================
 # User uploaded / generated files
