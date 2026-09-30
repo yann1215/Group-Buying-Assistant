@@ -1213,10 +1213,10 @@ def enrich_special_members(
     1. 使用输入的昵称、群昵称定位微信群成员；
     2. 使用微信群成员的昵称、群昵称覆盖当前值；
     3. 优先从微信群昵称开头提取单号；
-    4. 没有数字时，使用微信昵称匹配订单昵称；
-    5. 仍未匹配时，使用最初输入的短昵称匹配订单昵称。
+    4. 缺少单号或微信身份信息时，继续定位订单；
+    5. 微信身份信息仍缺失时，用订单昵称精确、唯一定位微信群成员。
 
-    订单昵称只用于定位单号，不会写回特殊成员。
+    订单昵称只作为定位依据，不直接写回特殊成员。
     """
     result = [
         normalize_special_member(
@@ -1237,9 +1237,6 @@ def enrich_special_members(
     ]
 
     for member in result:
-        input_nickname = member["昵称"]
-        input_group_nickname = member["群昵称"]
-
         group_match = _find_special_group_member(
             special_member=member,
             group_members=normalized_group_members,
@@ -1257,10 +1254,9 @@ def enrich_special_members(
 
         if group_serial:
             member["单号"] = group_serial
-            continue
 
-        # 已经手动提供单号时保留，不再用昵称重新推断。
-        if member["单号"]:
+        # 已有单号仍可用于查询订单，补全缺失的微信身份信息。
+        if member["单号"] and member["昵称"] and member["群昵称"]:
             continue
 
         order_match = _find_special_order_member(
@@ -1272,6 +1268,16 @@ def enrich_special_members(
             special_member=member,
             order_member=order_match,
         )
+
+        if not member["昵称"] or not member["群昵称"]:
+            group_match = _find_group_member_by_order_nickname(
+                order_member=order_match,
+                group_members=normalized_group_members,
+            )
+            _fill_from_group_member(
+                special_member=member,
+                group_member=group_match,
+            )
 
     return result
 
@@ -1462,6 +1468,30 @@ def _find_special_order_member(
         )
 
     return None
+
+
+def _find_group_member_by_order_nickname(
+    *,
+    order_member: dict[str, str] | None,
+    group_members: list[dict[str, str]],
+) -> dict[str, str] | None:
+    """订单昵称仅用于精确定位微信昵称或群昵称，唯一命中才返回。
+
+    不检查备注或 wxid，不进行模糊匹配，也不直接写入特殊成员。
+    同一成员的两个字段同时命中只计一次；无匹配或多人匹配返回 None。
+    """
+    nickname = normalize_text((order_member or {}).get("昵称"))
+    if not nickname:
+        return None
+
+    return _unique_item([
+        member
+        for member in group_members
+        if any(
+            normalize_text(member.get(field)) == nickname
+            for field in ("昵称", "群昵称")
+        )
+    ])
 
 
 def _fill_from_group_member(
