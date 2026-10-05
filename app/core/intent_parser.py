@@ -163,6 +163,13 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
     if not text:
         return result
 
+    if re.fullmatch(r"(?:取消|不要|不)(?:比较|比对|对比)(?:订单)?", text):
+        result["intent"] = "cancel_orders"
+        return result
+    if re.fullmatch(r"确认(?:比较|比对|对比)(?:订单)?", text):
+        result["intent"] = "confirm_orders"
+        return result
+
     if has_negative_words(text) or re.search(r"(?:不|不要|暂不|取消)(?:确认|计算|算).*均摊|(?:不|不要|暂不)确认计算", text):
         result["intent"] = "cancel_share"
         return result
@@ -171,6 +178,16 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
     if re.search(r"(?:查看|看看|看下|看一下|查询|查查|查)(?:当前)?均摊|均摊(?:金额)?(?:是|有)?多少", text):
         result["intent"] = "show_share"
         return result
+
+    if re.search(r"(?:比较|比对|对比).*订单|订单.*(?:比较|比对|对比|有什么变化)", text):
+        result["intent"] = "compare_orders"
+        return result
+    if re.search(r"(?:查看|看看|看下|看一下|查询|查查|查).*订单|订单(?:名称)?(?:是|叫)什么|告诉我订单(?:名称)?", text):
+        result["intent"] = "show_orders"
+        return result
+    entries = parse_order_entries(text)
+    if entries:
+        result["order_entries"] = entries
 
     # 1. 查看特殊成员
     if has_show_special_member_words(text):
@@ -220,7 +237,8 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
 
     # 4. 设置群聊信息、文件路径
     group_name = parse_group_name(text)
-    order_input = parse_order_input(text)
+    unsupported_number = re.search(r"(?:^|[，,；;\n])\s*订单(?:[3-9]|[0-2]\d)", text)
+    order_input = None if entries or unsupported_number else parse_order_input(text)
 
     force = has_force_words(text)
     confirm = has_confirm_words(text)
@@ -268,7 +286,7 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
         result["intent"] = "update_share_config"
         return result
 
-    if group_name or order_input:
+    if group_name or order_input or entries:
         result["intent"] = "set_context"
         return result
 
@@ -1254,3 +1272,21 @@ def parse_order_input(text: str) -> str | None:
         return None
 
     return value
+
+
+def parse_order_entries(text: str) -> list[dict[str, Any]]:
+    """仅识别完整录入分句；双订单角色由版本管理层决定。"""
+    entries = []
+    for clause in re.split(r"[，,；;\n]+", text):
+        if re.match(r"\s*订单(?:文件|表|路径|目录)", clause):
+            continue
+        match = re.fullmatch(
+            r"\s*(新订单|旧订单|订单)(?:([0-2])(?!\d))?\s*(?:是|为|：|:|=)?\s*(.+?)\s*", clause)
+        if match:
+            label, number, value = match.groups()
+            # 未支持的序号不作为录入标签；数字开头的普通文件名需加空格。
+            if label == "订单" and number is None and re.match(r"订单(?:[3-9]|[0-2]\d)", clause.strip()):
+                continue
+            entries.append({"label": label, "number": int(number) if number else None,
+                            "value": value.strip().strip('"\'').strip()})
+    return entries

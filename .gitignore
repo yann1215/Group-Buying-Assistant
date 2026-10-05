@@ -140,7 +140,8 @@ app/outputs/cache/*
 log/
 logs/
 test/
-tests/
+tests/*
+!tests/test_order_comparison.py
 
 # =========================
 # User uploaded / generated files

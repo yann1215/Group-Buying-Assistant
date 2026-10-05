@@ -10,6 +10,7 @@ from app.core.order_version_manager import (
     ORDER_VERSION_FIELDS,
     OrderVersionUpdateResult,
     shift_order_versions,
+    update_order_entries,
 )
 from app.core.tool_orchestrator import ToolOrchestrator, invalidate_share_confirmation
 from app.core.archive_manager import archive_conversation_files
@@ -266,7 +267,7 @@ class ChatService:
         # =========================================================
         # 2. 独立处理订单
         # =========================================================
-        order_input = intent.get("order_input")
+        order_input = intent.get("order_entries") or intent.get("order_input")
 
         if order_input:
             result = self._update_order_versions(
@@ -413,12 +414,10 @@ class ChatService:
     def _update_order_versions(
         self,
         session_id: int,
-        order_input: str | Path,
+        order_input: str | Path | list[dict[str, Any]],
     ) -> OrderVersionUpdateResult:
-        result = shift_order_versions(
-            get_order_versions(session_id),
-            order_input,
-        )
+        updater = update_order_entries if isinstance(order_input, list) else shift_order_versions
+        result = updater(get_order_versions(session_id), order_input)
 
         # 即使新输入无效，也要保存本次发现的失效历史路径清理结果。
         if result.changed:

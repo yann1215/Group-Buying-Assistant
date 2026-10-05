@@ -273,3 +273,62 @@ def _path_identity(value: str | Path) -> str:
 
 def _current_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def update_order_entries(versions, entries, *, default_order_dir=None):
+    """验证整组输入后一次更新，失败时保留原版本。"""
+    original = _normalize_versions(versions)
+    if len(entries) not in (1, 2):
+        return OrderVersionUpdateResult(original, False, error="每次只支持一个或两个订单")
+    resolved = []
+    for entry in entries:
+        path = normalize_order_path(entry["value"], default_order_dir=default_order_dir)
+        attempted = [path]
+        valid, error = validate_order_path(path)
+        if not valid and error == "找不到订单文件" and entry.get("number") is not None:
+            candidate = Path(path).with_name(f"{entry['number']} {Path(path).name}")
+            path = str(candidate)
+            attempted.append(path)
+            valid, error = validate_order_path(path)
+        if not valid:
+            return OrderVersionUpdateResult(original, False, input_path="；".join(attempted), error=error)
+        resolved.append((entry, path))
+    if len(resolved) == 1:
+        entry, path = resolved[0]
+        if entry["label"] != "旧订单":
+            return shift_order_versions(original, path)
+        updated = dict(original)
+        if original["new_order_file"] and _path_identity(original["new_order_file"]) == _path_identity(path):
+            return OrderVersionUpdateResult(original, False, error="新旧订单不能是同一文件")
+        updated["old_order_file"] = path
+        updated["old_order_updated_at"] = _current_timestamp()
+        updated, _ = deduplicate_order_versions(updated)
+        return OrderVersionUpdateResult(updated, True, changed=updated != original)
+    if _path_identity(resolved[0][1]) == _path_identity(resolved[1][1]):
+        return OrderVersionUpdateResult(original, False, error="新旧订单不能是同一文件")
+    labels = [entry["label"] for entry, _ in resolved]
+    if any(label != "订单" for label in labels):
+        if labels.count("新订单") > 1 or labels.count("旧订单") > 1:
+            return OrderVersionUpdateResult(original, False, error="请指定不同的新旧订单标签")
+        new_index = labels.index("新订单") if "新订单" in labels else 1 - labels.index("旧订单")
+    elif all(entry.get("number") is not None for entry, _ in resolved):
+        if resolved[0][0]["number"] == resolved[1][0]["number"]:
+            return OrderVersionUpdateResult(original, False, error="订单编号重复")
+        new_index = int(resolved[1][0]["number"] > resolved[0][0]["number"])
+    else:
+        new_index = 1
+    updated = empty_order_versions()
+    now = _current_timestamp()
+    for slot, path in [("new", resolved[new_index][1]), ("old", resolved[1-new_index][1])]:
+        updated[f"{slot}_order_file"] = path
+        updated[f"{slot}_order_updated_at"] = now
+    seen = {_path_identity(path) for _, path in resolved}
+    history = []
+    for file_field, time_field in ORDER_SLOTS:
+        path = original[file_field]
+        if path and validate_order_path(path)[0] and _path_identity(path) not in seen:
+            history.append((path, original[time_field]))
+            seen.add(_path_identity(path))
+    for (file_field, time_field), (path, timestamp) in zip(ORDER_SLOTS[2:], history):
+        updated[file_field], updated[time_field] = path, timestamp
+    return OrderVersionUpdateResult(updated, True, changed=updated != original)

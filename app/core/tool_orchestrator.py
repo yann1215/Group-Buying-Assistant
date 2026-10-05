@@ -286,6 +286,7 @@ class SessionToolContext:
     legacy_share_signature: str | None = None
     group_name: str | None = None
 
+    pending_order_comparison: dict[str, Any] | None = None
     pending_participation: dict[str, Any] | None = None
 
     special_members: list[dict[str, Any]] = field(
@@ -327,6 +328,7 @@ class SessionToolContext:
         """
         return {
             "context_version": 1,
+            "pending_order_comparison": _to_json_safe(self.pending_order_comparison),
             "pending_participation": _to_json_safe(self.pending_participation),
             "config_owner_id": self.config_owner_id,
             "last_share_result": _to_json_safe(self.last_share_result),
@@ -358,6 +360,7 @@ class SessionToolContext:
         product_configs = data.get("product_configs")
 
         return cls(
+            pending_order_comparison=data.get("pending_order_comparison") if isinstance(data.get("pending_order_comparison"), dict) else None,
             pending_participation=data.get("pending_participation") if isinstance(data.get("pending_participation"), dict) else None,
             config_owner_id=str(data.get("config_owner_id") or uuid4().hex),
             last_share_result=data.get("last_share_result") if isinstance(data.get("last_share_result"), dict) else None,
@@ -563,6 +566,11 @@ class ToolOrchestrator:
         # print("share_request BEFORE:", ctx.share_request)
 
         from app.core.participation_workflow import handle_participation
+        from app.core.order_comparison_workflow import handle_order_comparison
+        comparison_reply = handle_order_comparison(ctx, intent, user_text)
+        if comparison_reply is not None:
+            return comparison_reply
+
         participation_reply = handle_participation(self, ctx, intent, user_text)
         if participation_reply is not None:
             return participation_reply
