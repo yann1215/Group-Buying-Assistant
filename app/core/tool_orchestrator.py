@@ -286,6 +286,10 @@ class SessionToolContext:
     legacy_share_signature: str | None = None
     group_name: str | None = None
 
+    merge_groups: list[str] = field(default_factory=list)
+    merge_title: str | None = None
+    conversation_title_override: str | None = None
+
     pending_order_comparison: dict[str, Any] | None = None
     pending_participation: dict[str, Any] | None = None
 
@@ -328,6 +332,9 @@ class SessionToolContext:
         """
         return {
             "context_version": 1,
+            "merge_groups": list(self.merge_groups),
+            "merge_title": self.merge_title,
+            "conversation_title_override": self.conversation_title_override,
             "pending_order_comparison": _to_json_safe(self.pending_order_comparison),
             "pending_participation": _to_json_safe(self.pending_participation),
             "config_owner_id": self.config_owner_id,
@@ -360,6 +367,9 @@ class SessionToolContext:
         product_configs = data.get("product_configs")
 
         return cls(
+            conversation_title_override=_optional_string(data.get("conversation_title_override")),
+            merge_title=_optional_string(data.get("merge_title")),
+            merge_groups=[name for name in data.get("merge_groups", []) if isinstance(name, str)] if isinstance(data.get("merge_groups"), list) else [],
             pending_order_comparison=data.get("pending_order_comparison") if isinstance(data.get("pending_order_comparison"), dict) else None,
             pending_participation=data.get("pending_participation") if isinstance(data.get("pending_participation"), dict) else None,
             config_owner_id=str(data.get("config_owner_id") or uuid4().hex),
@@ -564,6 +574,10 @@ class ToolOrchestrator:
         )
 
         # print("share_request BEFORE:", ctx.share_request)
+
+        if intent["intent"] in {"set_merge_groups", "merge_orders", "rename_conversation", "refresh_merge_mapping", "show_merge_groups"}:
+            from app.core.order_merge_workflow import handle_order_merge
+            return handle_order_merge(self, ctx, intent)
 
         from app.core.participation_workflow import handle_participation
         from app.core.order_comparison_workflow import handle_order_comparison

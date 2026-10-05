@@ -163,6 +163,37 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
     if not text:
         return result
 
+    # 同时支持“修改对话 新名称”和“对话改为新名称”，避免落入模型聊天。
+    rename_match = re.fullmatch(
+        r"(?:(?:修改|更改|设置|重命名)\s*(?:当前)?(?:会话|对话)(?:名称|名字|标题)?"
+        r"(?:\s*(?:改为|改成|为|成|[:：])\s*|\s+)"
+        r"|(?:把\s*)?(?:当前)?(?:会话|对话)(?:名称|名字|标题)?\s*"
+        r"(?:修改为|更改为|改为|改成|重命名为)\s*)([\s\S]*)", text)
+    if rename_match:
+        result["intent"] = "rename_conversation"
+        result["conversation_title"] = rename_match.group(1).strip()
+        return result
+    if re.fullmatch(r"(?:修改|更改|设置|重命名)\s*(?:当前)?(?:会话|对话)(?:名称|名字|标题)?", text):
+        result["intent"] = "rename_conversation"
+        result["conversation_title"] = ""
+        return result
+
+    # 合发参数中的所有文字均为车名，必须先于其他参数解析。
+    merge_match = re.match(r"^合发\s*[:：]([\s\S]*)$", text)
+    if merge_match:
+        result["intent"] = "set_merge_groups"
+        result["merge_groups"] = [name.strip() for name in re.split(r"[,，]", merge_match.group(1))]
+        return result
+    if text == "查看合发车名":
+        result["intent"] = "show_merge_groups"
+        return result
+    if text == "刷新合发映射":
+        result["intent"] = "refresh_merge_mapping"
+        return result
+    if re.fullmatch(r"(?:查询合发表|输出合发补邮|输出合发表|给我合发清单|合发补邮表格|订单合并|合并订单|输出合发清单)", text):
+        result["intent"] = "merge_orders"
+        return result
+
     if re.fullmatch(r"(?:取消|不要|不)(?:比较|比对|对比)(?:订单)?", text):
         result["intent"] = "cancel_orders"
         return result

@@ -127,6 +127,7 @@ class ChatService:
         save_session_context(session_id, context_data)
 
         group_name = context_data.get("group_name")
+        preferred_title = context_data.get("conversation_title_override") or context_data.get("merge_title")
         if group_name and (
             group_name != session.get("group_name")
             or session.get("title") == "新对话"
@@ -135,9 +136,11 @@ class ChatService:
             # 同一群之后可以单独修改 title，不会被每轮保存覆盖。
             update_session(
                 session_id,
-                title=str(group_name),
+                title=preferred_title or str(group_name),
                 group_name=str(group_name),
             )
+        elif preferred_title and preferred_title != session.get("title"):
+            update_session(session_id, title=preferred_title)
 
     def set_working_context(
             self,

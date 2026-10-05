@@ -149,6 +149,7 @@ def archive_conversation_files(
         collect(product_config_owner_path(context["share_config_file"]), "config", True)
     for output in paths.get_group_output_files(group_name):
         collect(output, "output", True)
+    collect(workspace / "order_identity_mapping.json", "config", True)
 
     for category in ("input", "config", "output"):
         directory = archive_dir / category
