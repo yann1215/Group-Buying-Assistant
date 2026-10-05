@@ -48,6 +48,7 @@ def get_runtime_dir() -> Path:
 
 
 from app.core.chat_service import ChatService
+from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, SESSION_TYPE_LABELS
 from app.database.db import init_db
 from integrations.wechatmsg_lite_client import (
     ensure_wechat_database_key,
@@ -243,10 +244,13 @@ class ChatWindow(QMainWindow):
         sidebar_layout.setContentsMargins(12, 16, 12, 16)
         sidebar_layout.setSpacing(10)
 
-        self.new_session_button = QPushButton("＋ 新对话")
+        self.new_session_button = QPushButton("＋ 单车会话")
         self.new_session_button.setObjectName("newSessionButton")
         self.new_session_button.clicked.connect(self.create_new_session)
         sidebar_layout.addWidget(self.new_session_button)
+        self.new_merge_session_button = QPushButton("＋ 合发会话")
+        self.new_merge_session_button.clicked.connect(lambda: self.create_new_session(MERGED_SHIPPING))
+        sidebar_layout.addWidget(self.new_merge_session_button)
 
         self.session_list = QListWidget()
         self.session_list.setObjectName("sessionList")
@@ -437,12 +441,14 @@ class ChatWindow(QMainWindow):
 
             for session in sessions:
                 title = str(session.get("title") or "新对话")
+                label = SESSION_TYPE_LABELS[session["session_type"]]
                 item = QListWidgetItem(title)
                 item.setData(
                     Qt.ItemDataRole.UserRole,
                     int(session["id"]),
                 )
                 item.setToolTip(
+                    f"类型：{label}\n"
                     f"群聊：{session.get('group_name') or '未设置'}\n"
                     f"更新时间：{session.get('updated_at') or ''}"
                 )
@@ -468,6 +474,12 @@ class ChatWindow(QMainWindow):
         messages = self.chat_service.load_conversation(session_id)
         self.session_id = session_id
         self.chat_view.clear()
+        ctx = self.chat_service.tools.get_context(session_id)
+        example = ("输入“合发：车1，车2”保存车序，或输入“给我合发清单”"
+                   if ctx.session_type == MERGED_SHIPPING else "订单：订单1；算均摊")
+        self.input_box.setPlaceholderText(f"{example}；Enter 发送，Shift+Enter 换行")
+        if ctx.migration_needs_review:
+            self.append_message("assistant", "此旧会话同时包含单车和合发数据，已迁移为合发会话。原始数据已保留在会话备份中，请核对来源单车配置。")
 
         if messages:
             for message in messages:
@@ -514,12 +526,14 @@ class ChatWindow(QMainWindow):
             self.refresh_session_list(self.session_id)
 
     @Slot()
-    def create_new_session(self) -> None:
+    def create_new_session(self, session_type: str = SINGLE_CAR) -> None:
+        if isinstance(session_type, bool):
+            session_type = SINGLE_CAR
         if self.is_processing:
             return
 
         try:
-            session_id = self.chat_service.create_conversation()
+            session_id = self.chat_service.create_conversation(session_type=session_type)
             self.load_session(session_id)
         except Exception as exc:
             QMessageBox.critical(
@@ -591,8 +605,11 @@ class ChatWindow(QMainWindow):
                 f"{type(exc).__name__}: {exc}",
             )
 
-    @staticmethod
-    def _welcome_text() -> str:
+    def _welcome_text(self) -> str:
+        if self.chat_service.tools.get_context(self.session_id).session_type == MERGED_SHIPPING:
+            return ("这是合发会话，请先在各单车会话登记群名和订单，再录入合发车序：\n"
+                    "  合发：车1，车2，车3\n\n"
+                    "支持以下指令：\n  查看合发车名 / 查看合发订单\n  给我合发清单\n  刷新合发映射\n  修改会话名称为新名称")
         return (
             "已启动。请先录入必填信息：\n"
             "  群聊名称 XXX\n"
@@ -683,6 +700,7 @@ class ChatWindow(QMainWindow):
         self.send_button.setEnabled(not processing)
         self.session_list.setEnabled(not processing)
         self.new_session_button.setEnabled(not processing)
+        self.new_merge_session_button.setEnabled(not processing)
         self.delete_session_button.setEnabled(not processing)
         self.send_button.setText("处理中…" if processing else "发送")
 

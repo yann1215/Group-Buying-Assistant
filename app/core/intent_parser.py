@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, SESSION_TYPE_LABELS, validate_session_type
+
 from app.analysis.special_parser import (
     has_show_special_member_words,
     parse_special_member_updates,
@@ -107,7 +109,98 @@ RESERVED_PRODUCT_NAMES = {
 }
 
 
-def parse_user_intent(user_text: str) -> dict[str, Any]:
+def parse_common_intent(user_text: str) -> dict[str, Any]:
+    text = normalize_text(user_text)
+    result: dict[str, Any] = {"intent": "chat"}
+    # 同时支持“修改对话 新名称”和“对话改为新名称”，避免落入模型聊天。
+    rename_match = re.fullmatch(
+        r"(?:(?:修改|更改|设置|重命名)\s*(?:当前)?(?:会话|对话)(?:名称|名字|标题)?"
+        r"(?:\s*(?:改为|改成|为|成|[:：])\s*|\s+)"
+        r"|(?:把\s*)?(?:当前)?(?:会话|对话)(?:名称|名字|标题)?\s*"
+        r"(?:修改为|更改为|改为|改成|重命名为)\s*)([\s\S]*)", text)
+    if rename_match:
+        result["intent"] = "rename_conversation"
+        result["conversation_title"] = rename_match.group(1).strip()
+        return result
+    if re.fullmatch(r"(?:修改|更改|设置|重命名)\s*(?:当前)?(?:会话|对话)(?:名称|名字|标题)?", text):
+        result["intent"] = "rename_conversation"
+        result["conversation_title"] = ""
+        return result
+
+    return result
+
+
+def parse_merged_shipping_intent(user_text: str) -> dict[str, Any]:
+    text = normalize_text(user_text)
+    result: dict[str, Any] = {"intent": "chat"}
+    # 合发参数中的所有文字均为车名，必须先于其他参数解析。
+    merge_match = re.match(r"^合发\s*[:：]([\s\S]*)$", text)
+    if merge_match:
+        result["intent"] = "set_merge_groups"
+        result["merge_groups"] = [name.strip() for name in re.split(r"[,，]", merge_match.group(1))]
+        return result
+    if text in {"查看合发车名", "查看合发订单"}:
+        result["intent"] = "show_merge_groups"
+        return result
+    if text == "刷新合发映射":
+        result["intent"] = "refresh_merge_mapping"
+        return result
+    if re.fullmatch(r"(?:查询合发表|输出合发补邮|输出合发表|给我合发清单|合发补邮表格|订单合并|合并订单|输出合发清单)", text):
+        result["intent"] = "merge_orders"
+        return result
+
+    return result
+
+
+COMMON_INTENTS = {"chat", "rename_conversation", "unsupported"}
+MERGE_INTENTS = {"set_merge_groups", "show_merge_groups", "refresh_merge_mapping", "merge_orders"}
+SINGLE_INTENTS = {
+    "set_context", "show_orders", "compare_orders", "confirm_orders", "cancel_orders",
+    "show_share", "calculate_share", "update_share_config", "confirm_share_config", "cancel_share",
+    "calculate_bulk_goods", "member_check", "show_special_members", "update_special_members", "update_participation",
+}
+
+
+def is_intent_allowed(intent: str, session_type: str) -> bool:
+    validate_session_type(session_type)
+    return intent in COMMON_INTENTS or intent in (SINGLE_INTENTS if session_type == SINGLE_CAR else MERGE_INTENTS)
+
+
+def unsupported_intent_reply(session_type: str) -> str:
+    current = SESSION_TYPE_LABELS[session_type]
+    target = SESSION_TYPE_LABELS[MERGED_SHIPPING if session_type == SINGLE_CAR else SINGLE_CAR]
+    return f"当前为{current}，不支持此指令。请进入{target}执行。"
+
+
+def parse_user_intent(user_text: str, session_type: str = SINGLE_CAR) -> dict[str, Any]:
+    """按会话类型解析；跨类型指令不携带任何可写入的参数。"""
+    validate_session_type(session_type)
+    common = parse_common_intent(user_text)
+    if common["intent"] != "chat":
+        return common
+    merged = parse_merged_shipping_intent(user_text)
+    if session_type == SINGLE_CAR:
+        merge_clauses = [parse_merged_shipping_intent(clause) for clause in re.split(r"[，,；;\n]+", user_text)]
+        if merged["intent"] != "chat" or any(item["intent"] != "chat" for item in merge_clauses):
+            return {"intent": "unsupported", "reply": unsupported_intent_reply(session_type)}
+        return parse_single_car_intent(user_text)
+    if merged["intent"] != "chat":
+        return merged
+    single = parse_single_car_intent(user_text)
+    # 合发没有单车等待确认状态，普通肯定/取消回复仍可聊天。
+    if single["intent"] not in {"chat", "confirm_share_config", "cancel_share"}:
+        return {"intent": "unsupported", "reply": unsupported_intent_reply(session_type)}
+    if single["intent"] in {"confirm_share_config", "cancel_share"} and (
+        re.search(r"均摊|大货", user_text) or any(single.get(key) for key in (
+            "group_name", "order_input", "order_entries", "share_mode", "calculation_scope",
+            "amount", "product_share_amounts", "special_member_updates"
+        ))
+    ):
+        return {"intent": "unsupported", "reply": unsupported_intent_reply(session_type)}
+    return {"intent": "chat"}
+
+
+def parse_single_car_intent(user_text: str) -> dict[str, Any]:
     """
     从用户当前这一句话中提取动作和参数槽位。
 
@@ -163,37 +256,6 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
     if not text:
         return result
 
-    # 同时支持“修改对话 新名称”和“对话改为新名称”，避免落入模型聊天。
-    rename_match = re.fullmatch(
-        r"(?:(?:修改|更改|设置|重命名)\s*(?:当前)?(?:会话|对话)(?:名称|名字|标题)?"
-        r"(?:\s*(?:改为|改成|为|成|[:：])\s*|\s+)"
-        r"|(?:把\s*)?(?:当前)?(?:会话|对话)(?:名称|名字|标题)?\s*"
-        r"(?:修改为|更改为|改为|改成|重命名为)\s*)([\s\S]*)", text)
-    if rename_match:
-        result["intent"] = "rename_conversation"
-        result["conversation_title"] = rename_match.group(1).strip()
-        return result
-    if re.fullmatch(r"(?:修改|更改|设置|重命名)\s*(?:当前)?(?:会话|对话)(?:名称|名字|标题)?", text):
-        result["intent"] = "rename_conversation"
-        result["conversation_title"] = ""
-        return result
-
-    # 合发参数中的所有文字均为车名，必须先于其他参数解析。
-    merge_match = re.match(r"^合发\s*[:：]([\s\S]*)$", text)
-    if merge_match:
-        result["intent"] = "set_merge_groups"
-        result["merge_groups"] = [name.strip() for name in re.split(r"[,，]", merge_match.group(1))]
-        return result
-    if text == "查看合发车名":
-        result["intent"] = "show_merge_groups"
-        return result
-    if text == "刷新合发映射":
-        result["intent"] = "refresh_merge_mapping"
-        return result
-    if re.fullmatch(r"(?:查询合发表|输出合发补邮|输出合发表|给我合发清单|合发补邮表格|订单合并|合并订单|输出合发清单)", text):
-        result["intent"] = "merge_orders"
-        return result
-
     if re.fullmatch(r"(?:取消|不要|不)(?:比较|比对|对比)(?:订单)?", text):
         result["intent"] = "cancel_orders"
         return result
@@ -201,7 +263,7 @@ def parse_user_intent(user_text: str) -> dict[str, Any]:
         result["intent"] = "confirm_orders"
         return result
 
-    if has_negative_words(text) or re.search(r"(?:不|不要|暂不|取消)(?:确认|计算|算).*均摊|(?:不|不要|暂不)确认计算", text):
+    if re.fullmatch(r"(?:取消|不要|不算|暂不计算)均摊", text) or has_negative_words(text) or re.search(r"(?:不|不要|暂不|取消)(?:确认|计算|算).*均摊|(?:不|不要|暂不)确认计算", text):
         result["intent"] = "cancel_share"
         return result
 

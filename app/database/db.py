@@ -8,7 +8,7 @@ from typing import Any
 from app.config import DB_PATH, ensure_dirs
 
 
-CURRENT_DB_VERSION = 2
+CURRENT_DB_VERSION = 3
 
 
 ORDER_VERSION_COLUMNS = {
@@ -65,6 +65,7 @@ def _migrate_database(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE sessions ADD COLUMN group_name TEXT")
 
     _migrate_order_version_columns(conn)
+    _migrate_session_types(conn)
 
     if _has_current_foreign_keys(conn):
         return
@@ -274,3 +275,46 @@ def _has_current_foreign_keys(conn: sqlite3.Connection) -> bool:
             return False
 
     return True
+
+
+def _migrate_session_types(conn: sqlite3.Connection) -> None:
+    """仅首次增加类型列时迁移；旧混合配置完整保存在 legacy_context。"""
+    from app.core.session_types import MergedShippingContext
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "session_type" in columns:
+        return
+    conn.execute("ALTER TABLE sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'single_car' "
+                 "CHECK (session_type IN ('single_car', 'merged_shipping'))")
+    rows = conn.execute("SELECT s.id, s.group_name, c.* FROM sessions s "
+                        "LEFT JOIN session_contexts c ON c.session_id = s.id").fetchall()
+    for row in rows:
+        try:
+            data = json.loads(row["context_json"] or "{}")
+        except (ValueError, TypeError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        groups = data.get("merge_groups")
+        if not (isinstance(groups, list) and len(groups) >= 2
+                and all(isinstance(g, str) and g.strip() for g in groups)
+                and len({g.strip() for g in groups}) == len(groups)):
+            continue
+        backup = dict(data)
+        backup["group_name"] = row["group_name"] or data.get("group_name")
+        for name in ORDER_VERSION_COLUMNS:
+            backup[name] = row[name] or data.get(name) or ""
+        mixed = bool(backup.get("group_name") or any(backup.get(name) for name in ORDER_VERSION_COLUMNS)
+                     or any(data.get(name) for name in ("special_members", "product_configs", "share_config_file",
+                                                        "last_share_result", "pending_order_comparison", "pending_participation")))
+        for key in ("share_request", "bulk_request"):
+            request = data.get(key)
+            if request and (not isinstance(request, dict) or any(request.values())):
+                mixed = True
+        ctx = MergedShippingContext.from_dict(data)
+        ctx.merge_groups = [g.strip() for g in groups]
+        ctx.legacy_context = backup
+        ctx.migration_needs_review = mixed
+        conn.execute("UPDATE sessions SET session_type = 'merged_shipping', group_name = NULL WHERE id = ?",
+                     (row["id"],))
+        conn.execute("UPDATE session_contexts SET context_json = ? WHERE session_id = ?",
+                     (json.dumps(ctx.to_dict(), ensure_ascii=False), row["id"]))

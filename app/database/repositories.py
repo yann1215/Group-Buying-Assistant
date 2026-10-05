@@ -7,6 +7,7 @@ import sqlite3
 from typing import Any
 
 from app.database.db import get_conn
+from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, validate_session_type
 
 
 MAX_SESSION_COUNT = 30
@@ -40,17 +41,21 @@ ORDER_UPDATED_AT_FIELDS = (
 def create_session(
     title: str = "新对话",
     group_name: str | None = None,
+    session_type: str = SINGLE_CAR,
 ) -> int:
+    validate_session_type(session_type)
+    if session_type == MERGED_SHIPPING and group_name:
+        raise ValueError("合发会话不能设置单车群聊名称")
     normalized_title = str(title).strip() or "新对话"
     normalized_group_name = _normalize_optional_text(group_name)
 
     with get_conn() as conn:
         cur = conn.execute(
             """
-            INSERT INTO sessions (title, group_name)
-            VALUES (?, ?)
+            INSERT INTO sessions (title, group_name, session_type)
+            VALUES (?, ?, ?)
             """,
-            (normalized_title, normalized_group_name),
+            (normalized_title, normalized_group_name, session_type),
         )
         session_id = int(cur.lastrowid)
 
@@ -63,7 +68,7 @@ def get_session(session_id: int) -> dict[str, Any] | None:
     with get_conn() as conn:
         row = conn.execute(
             """
-            SELECT id, title, group_name, created_at, updated_at
+            SELECT id, title, group_name, session_type, created_at, updated_at
             FROM sessions
             WHERE id = ?
             """,
@@ -79,7 +84,7 @@ def list_sessions(limit: int | None = MAX_SESSION_COUNT) -> list[dict[str, Any]]
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT id, title, group_name, created_at, updated_at
+            SELECT id, title, group_name, session_type, created_at, updated_at
             FROM sessions
             ORDER BY created_at DESC, id DESC
             LIMIT ?
@@ -103,6 +108,9 @@ def update_session(
         values.append(str(title).strip() or "新对话")
 
     if group_name is not None:
+        session = get_session(session_id)
+        if session and session["session_type"] != SINGLE_CAR:
+            raise ValueError("合发会话不能设置单车群聊名称")
         updates.append("group_name = ?")
         values.append(_normalize_optional_text(group_name))
 
@@ -190,7 +198,19 @@ def save_session_context(
     session_id: int,
     context: dict[str, Any],
 ) -> None:
-    context_to_save = dict(context)
+    session = get_session(session_id)
+    if session is None:
+        raise ValueError(f"会话不存在：{session_id}")
+    if context.get("session_type", session["session_type"]) != session["session_type"]:
+        raise ValueError("上下文类型与会话类型不一致")
+    if session["session_type"] == MERGED_SHIPPING:
+        from app.core.session_types import MergedShippingContext
+        context_to_save = MergedShippingContext.from_dict(context).to_dict()
+    else:
+        context_to_save = dict(context)
+        for field in ("merge_groups", "merge_title", "merge_source_ids", "merge_output_files"):
+            context_to_save.pop(field, None)
+    context_to_save["session_type"] = session["session_type"]
     order_versions = {
         field: context_to_save.pop(field)
         for field in ORDER_VERSION_FIELDS
@@ -236,9 +256,9 @@ def load_session_context(session_id: int) -> dict[str, Any]:
     with get_conn() as conn:
         row = conn.execute(
             f"""
-            SELECT context_json, {', '.join(ORDER_VERSION_FIELDS)}
-            FROM session_contexts
-            WHERE session_id = ?
+            SELECT s.session_type, c.context_json, {', '.join('c.' + f for f in ORDER_VERSION_FIELDS)}
+            FROM sessions s LEFT JOIN session_contexts c ON c.session_id = s.id
+            WHERE s.id = ?
             """,
             (session_id,),
         ).fetchone()
@@ -254,6 +274,10 @@ def load_session_context(session_id: int) -> dict[str, Any]:
     if not isinstance(context, dict):
         context = {}
 
+    context["session_type"] = row["session_type"]
+    if row["session_type"] == MERGED_SHIPPING:
+        from app.core.session_types import MergedShippingContext
+        return MergedShippingContext.from_dict(context).to_dict()
     for field in ORDER_VERSION_FIELDS:
         context[field] = row[field] or ""
 
@@ -293,9 +317,9 @@ def find_session_by_group_name(
         if exclude_session_id is None:
             row = conn.execute(
                 """
-                SELECT id, title, group_name, created_at, updated_at
+                SELECT id, title, group_name, session_type, created_at, updated_at
                 FROM sessions
-                WHERE TRIM(group_name) = ?
+                WHERE session_type = 'single_car' AND TRIM(group_name) = ?
                 LIMIT 1
                 """,
                 (normalized_group_name,),
@@ -304,9 +328,9 @@ def find_session_by_group_name(
         else:
             row = conn.execute(
                 """
-                SELECT id, title, group_name, created_at, updated_at
+                SELECT id, title, group_name, session_type, created_at, updated_at
                 FROM sessions
-                WHERE TRIM(group_name) = ?
+                WHERE session_type = 'single_car' AND TRIM(group_name) = ?
                   AND id != ?
                 LIMIT 1
                 """,
@@ -332,6 +356,9 @@ def update_order_versions(
     order_cache_2_updated_at: str,
 ) -> bool:
     """一次性更新会话的四个订单版本，不覆盖其他上下文数据。"""
+    session = get_session(session_id)
+    if session and session["session_type"] != SINGLE_CAR:
+        raise ValueError("合发会话不能录入单车订单")
     order_versions = {
         "new_order_file": new_order_file,
         "new_order_updated_at": new_order_updated_at,

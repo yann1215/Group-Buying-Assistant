@@ -49,7 +49,10 @@ from app.core.intent_parser import (
     has_negative_words,
     has_share_confirmation_words,
     parse_user_intent,
+    is_intent_allowed,
+    unsupported_intent_reply,
 )
+from app.core.session_types import ConversationContext, MergedShippingContext, SINGLE_CAR, MERGED_SHIPPING, validate_session_type
 from app.core.path_manager import get_parsed_orders_path, get_product_config_path, format_order_path
 from app.core.archive_manager import rename_conversation_files
 
@@ -276,19 +279,15 @@ class BulkGoodsRequestState:
 
 
 @dataclass
-class SessionToolContext:
-    # 仅由编排层设置，不从旧 JSON 信任或恢复。
-    session_id: int | None = None
+class SingleCarContext(ConversationContext):
+    """单车业务上下文。"""
+    session_type = SINGLE_CAR
     config_owner_id: str = field(default_factory=lambda: uuid4().hex)
     last_share_result: dict[str, Any] | None = None
     last_share_signature: str | None = None
     share_results_invalidated: bool = False
     legacy_share_signature: str | None = None
     group_name: str | None = None
-
-    merge_groups: list[str] = field(default_factory=list)
-    merge_title: str | None = None
-    conversation_title_override: str | None = None
 
     pending_order_comparison: dict[str, Any] | None = None
     pending_participation: dict[str, Any] | None = None
@@ -331,10 +330,7 @@ class SessionToolContext:
         不进行持久化。恢复会话后必须重新核对。
         """
         return {
-            "context_version": 1,
-            "merge_groups": list(self.merge_groups),
-            "merge_title": self.merge_title,
-            "conversation_title_override": self.conversation_title_override,
+            **self.common_data(),
             "pending_order_comparison": _to_json_safe(self.pending_order_comparison),
             "pending_participation": _to_json_safe(self.pending_participation),
             "config_owner_id": self.config_owner_id,
@@ -368,8 +364,8 @@ class SessionToolContext:
 
         return cls(
             conversation_title_override=_optional_string(data.get("conversation_title_override")),
-            merge_title=_optional_string(data.get("merge_title")),
-            merge_groups=[name for name in data.get("merge_groups", []) if isinstance(name, str)] if isinstance(data.get("merge_groups"), list) else [],
+            legacy_context=data.get("legacy_context"),
+            migration_needs_review=data.get("migration_needs_review") is True,
             pending_order_comparison=data.get("pending_order_comparison") if isinstance(data.get("pending_order_comparison"), dict) else None,
             pending_participation=data.get("pending_participation") if isinstance(data.get("pending_participation"), dict) else None,
             config_owner_id=str(data.get("config_owner_id") or uuid4().hex),
@@ -422,17 +418,21 @@ class SessionToolContext:
         )
 
 
+# 兼容既有调用名称；该类型仅用于单车业务。
+SessionToolContext = SingleCarContext
+
+
 class ToolOrchestrator:
 
     def __init__(
         self,
         key_input_func: Callable[[str], str] | None = None,
     ) -> None:
-        self.contexts: dict[int, SessionToolContext] = {}
+        self.contexts: dict[int, SessionToolContext | MergedShippingContext] = {}
 
         self.key_input_func = key_input_func
 
-    def get_context(self, session_id: int) -> SessionToolContext:
+    def get_context(self, session_id: int) -> SessionToolContext | MergedShippingContext:
         return self.contexts.setdefault(
             session_id,
             SessionToolContext(session_id=session_id),
@@ -445,8 +445,15 @@ class ToolOrchestrator:
         self,
         session_id: int,
         context_data: dict[str, Any] | None,
-    ) -> SessionToolContext:
-        ctx = SessionToolContext.from_dict(context_data)
+    ) -> SessionToolContext | MergedShippingContext:
+        data = context_data if isinstance(context_data, dict) else {}
+        validate_session_type(data.get("session_type", SINGLE_CAR))
+        if data.get("session_type") == MERGED_SHIPPING:
+            ctx = MergedShippingContext.from_dict(data)
+            ctx.session_id = session_id
+            self.contexts[session_id] = ctx
+            return ctx
+        ctx = SessionToolContext.from_dict(data)
         ctx.session_id = session_id
         # 旧上下文明确记录的配置文件迁入固定目录，保留手工修改。
         if ctx.group_name and ctx.share_config_file:
@@ -470,6 +477,8 @@ class ToolOrchestrator:
             ctx: SessionToolContext,
             new_group_name: str,
     ) -> None:
+        if not isinstance(ctx, SessionToolContext):
+            raise ValueError("合发会话不能设置单车群聊名称")
         new_group_name = str(
             new_group_name or ""
         ).strip()
@@ -559,23 +568,22 @@ class ToolOrchestrator:
             session_id: int,
             user_text: str,
             progress_callback: Callable[[str], None] | None = None,
+            parsed_intent: dict[str, Any] | None = None,
     ) -> str | None:
 
-        intent = parse_user_intent(user_text)
+        ctx = self.get_context(session_id)
+        intent = parsed_intent if parsed_intent is not None else parse_user_intent(user_text, ctx.session_type)
 
-        # print("\n=== TOOL DEBUG ===")
-        # print("tool_orchestrator:", __file__)
-        # print("user_text:", repr(user_text))
-        # print("intent:", intent)
-
-        ctx = self.contexts.setdefault(
-            session_id,
-            SessionToolContext(session_id=session_id),
-        )
-
-        # print("share_request BEFORE:", ctx.share_request)
-
-        if intent["intent"] in {"set_merge_groups", "merge_orders", "rename_conversation", "refresh_merge_mapping", "show_merge_groups"}:
+        if not is_intent_allowed(intent["intent"], ctx.session_type):
+            return unsupported_intent_reply(ctx.session_type)
+        if intent["intent"] == "unsupported":
+            return intent["reply"]
+        if intent["intent"] == "rename_conversation":
+            from app.core.conversation_workflow import rename_conversation
+            return rename_conversation(ctx, intent)
+        if isinstance(ctx, MergedShippingContext):
+            if intent["intent"] == "chat":
+                return None
             from app.core.order_merge_workflow import handle_order_merge
             return handle_order_merge(self, ctx, intent)
 
@@ -905,7 +913,7 @@ class ToolOrchestrator:
 
         lines = [
             "大货计算前请确认以下信息。",
-            format_complete_calculation_preview(ctx),
+            format_complete_calculation_preview(ctx, include_share=False),
             "",
             "当前有效商品单价：",
         ]
@@ -1471,13 +1479,23 @@ def format_pending_share_summary(ctx: SessionToolContext, configs: list[dict[str
     return "\n".join(lines)
 
 
-def format_complete_calculation_preview(ctx: SessionToolContext) -> str:
+def format_complete_calculation_preview(ctx: SessionToolContext, *, include_share: bool = True) -> str:
     """计算确认统一展示当前配置、全部商品和全部特殊成员。"""
     from app.analysis.participation import product_preview
     lines = [f'群聊：{ctx.group_name or "未设置"}',
              f'订单：{format_order_path(ctx.new_order_file)}',
-             format_pending_share_summary(ctx), '', '全部商品配置：']
-    lines.extend(product_preview(item) for item in ctx.product_configs or [])
+             ]
+    if include_share:
+        lines.append(format_pending_share_summary(ctx))
+    lines.extend(['', '全部商品配置：'])
+    for item in ctx.product_configs or []:
+        if include_share:
+            lines.append(product_preview(item))
+        else:
+            fields = ('商品数量', '商品单价', '商品大货总价')
+            lines.append(f"商品{item.get('商品序号')}：{item['商品名称']}" + ''.join(
+                f"｜{field}={item.get(field) if item.get(field) not in (None, '') else '未设置'}"
+                for field in fields))
     lines.extend(['', format_special_members(ctx.special_members)])
     return '\n'.join(lines)
 

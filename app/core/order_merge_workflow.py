@@ -9,6 +9,7 @@ from app.analysis.order_merge import merge_order_files, read_merge_orders
 from app.core.order_identity_cache import mapping_path, load_mapping, resolve_with_mapping, save_mapping
 from app.core.order_version_manager import validate_order_path
 from app.core.path_manager import ORDER_OUTPUT_DIR, sanitize_filename
+from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING
 from app.database.repositories import list_sessions, get_order_versions, get_session
 from integrations.wechatmsg_lite_client import get_wechat_group_members
 
@@ -26,35 +27,53 @@ def get_merge_title(ctx):
     return created.astimezone(timezone(timedelta(hours=8))).strftime("%y%m%d") + "合发"
 
 
+def resolve_sources(ctx, sessions):
+    """已绑定 ID 不重新按名字匹配，删除来源后必须明确重新录入。"""
+    sources = [s for s in sessions if s.get("session_type", SINGLE_CAR) == SINGLE_CAR]
+    if len(ctx.merge_source_ids) != len(ctx.merge_groups):
+        ctx.merge_source_ids = [None] * len(ctx.merge_groups)
+    resolved = []
+    for index, group in enumerate(ctx.merge_groups):
+        source_id = ctx.merge_source_ids[index]
+        matches = [s for s in sources if s["id"] == source_id] if source_id is not None else [
+            s for s in sources if str(s.get("group_name") or "").strip() == group]
+        if len(matches) != 1:
+            resolved.append((group, None, "来源单车会话已删除或不可用，请重新录入合发车名" if source_id is not None
+                             else "无法唯一定位车群，请核对已登记的群聊名称"))
+            continue
+        source = matches[0]
+        current_name = str(source.get("group_name") or "").strip()
+        if not current_name:
+            resolved.append((group, None, "来源单车尚未设置群聊名称"))
+            continue
+        ctx.merge_source_ids[index] = int(source["id"])
+        ctx.merge_groups[index] = current_name
+        resolved.append((current_name, int(source["id"]), None))
+    return resolved
+
+
+def source_order_path(tools, source_id):
+    source_ctx = tools.contexts.get(source_id)
+    if source_ctx is not None and source_ctx.session_type == SINGLE_CAR:
+        return source_ctx.new_order_file
+    return get_order_versions(source_id)["new_order_file"]
+
+
 def handle_order_merge(tools, ctx, intent):
+    if ctx.session_type != MERGED_SHIPPING:
+        return "当前为单车会话，不支持合发指令。请进入合发会话执行。"
     if intent["intent"] == "show_merge_groups":
         if not ctx.merge_groups:
             return "尚未设置合发车名，请先输入“合发：车1，车2”。"
-        sessions = list_sessions(limit=None)
         lines = []
-        for index, group in enumerate(ctx.merge_groups, 1):
-            matches = [session for session in sessions if str(session.get("group_name") or "").strip() == group]
-            if len(matches) != 1:
-                display = "未找到对应车群" if not matches else "车群名称不唯一，请核对"
+        for index, (group, source_id, error) in enumerate(resolve_sources(ctx, list_sessions(limit=None)), 1):
+            if error:
+                display = error
             else:
-                source_id = int(matches[0]["id"])
-                source_ctx = tools.contexts.get(source_id)
-                path = source_ctx.new_order_file if source_ctx is not None else get_order_versions(source_id)["new_order_file"]
+                path = source_order_path(tools, source_id)
                 display = PureWindowsPath(str(path)).name if path else "未设置订单"
             lines.append(f"{index}. {group}：{display}")
         return "\n".join(lines)
-    if intent["intent"] == "rename_conversation":
-        title = intent["conversation_title"]
-        if not title:
-            return "会话名称不能为空，请输入“修改会话名称为合发5.0”。"
-        try:
-            sanitize_filename(title)
-        except ValueError as error:
-            return f"会话名称无效：{error}"
-        ctx.conversation_title_override = title
-        if ctx.merge_groups:
-            ctx.merge_title = title
-        return f"会话名称已修改为：{title}"
     if intent["intent"] == "set_merge_groups":
         groups = intent["merge_groups"]
         if len(groups) < 2 or any(not group for group in groups):
@@ -66,6 +85,8 @@ def handle_order_merge(tools, ctx, intent):
         except ValueError as error:
             return f"无法保存合发配置：{error}"
         ctx.merge_groups = list(groups)
+        ctx.merge_source_ids = [None] * len(groups)
+        resolve_sources(ctx, list_sessions(limit=None))
         ctx.merge_title = title
         return ("已保存合发车序：" + " → ".join(groups) +
                 "。\n每人归入其参加的最靠前车补邮清单，收货信息也取自该车。\n输入“输出合发表”生成总清单和各车补邮清单。")
@@ -75,22 +96,18 @@ def handle_order_merge(tools, ctx, intent):
         return "请先录入合发车名，例如“合发：车1，车2，车3”。"
     try:
         ctx.merge_title = get_merge_title(ctx)
-        sessions = list_sessions(limit=None)
         sources = []
         source_ids = {}
-        for group in groups:
-            matches = [session for session in sessions if str(session.get("group_name") or "").strip() == group]
-            if len(matches) != 1:
-                return f"车群{group}合发清单存在以下问题，请核对：\n1. 无法唯一定位车群，请核对已登记的群聊名称。"
-            session_id = int(matches[0]["id"])
-            # 当前对话上下文可能还未写回数据库。
-            source_ctx = tools.contexts.get(session_id)
-            path = source_ctx.new_order_file if source_ctx is not None else get_order_versions(session_id)["new_order_file"]
+        for group, session_id, error in resolve_sources(ctx, list_sessions(limit=None)):
+            if error:
+                return f"车群{group}合发清单存在以下问题，请核对：\n1. {error}。"
+            path = source_order_path(tools, session_id)
             valid, reason = validate_order_path(path or "")
             if not valid:
                 return f"车群{group}合发清单存在以下问题，请核对：\n1. 最新原始订单无效（{reason}），请先登记有效订单。"
             sources.append((group, path))
             source_ids[group] = session_id
+        groups = ctx.merge_groups
         output = ORDER_OUTPUT_DIR / (sanitize_filename(
             ctx.merge_title + "_补邮清单_" + "_".join(groups)) + ".xlsx")
         def fetch_members(group):
@@ -104,6 +121,8 @@ def handle_order_merge(tools, ctx, intent):
                                                 refresh=intent["intent"] == "refresh_merge_mapping")
         result = merge_order_files(sources, output, {}, resolved_orders_by_group=resolved)
         save_mapping(cache_path, entries)
+        if str(result.path) not in ctx.merge_output_files:
+            ctx.merge_output_files.append(str(result.path))
         reply = [f"合发表已生成：总计{result.total}人，合发{result.combined}人。"]
         reply.extend(f"{group}补邮清单：{count}人" for group, count in result.counts.items())
         reply.append(f"[打开合发表]({result.path})")

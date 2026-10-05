@@ -149,6 +149,16 @@ def archive_conversation_files(
         collect(product_config_owner_path(context["share_config_file"]), "config", True)
     for output in paths.get_group_output_files(group_name):
         collect(output, "output", True)
+    for output in context.get("merge_output_files") or []:
+        if paths.is_within(output, paths.ORDER_OUTPUT_DIR):
+            collect(output, "output", True)
+    legacy = context.get("legacy_context")
+    if isinstance(legacy, dict):
+        workspace = paths.get_workspace_dir(session_id)
+        backup_file = workspace / "legacy_context.json"
+        import json
+        backup_file.write_text(json.dumps(legacy, ensure_ascii=False, indent=2), encoding="utf-8")
+        collect(backup_file, "config", True)
     collect(workspace / "order_identity_mapping.json", "config", True)
 
     for category in ("input", "config", "output"):

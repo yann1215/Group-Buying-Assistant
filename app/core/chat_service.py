@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.core.intent_parser import parse_user_intent
+from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, validate_session_type
 from app.core.order_version_manager import (
     ORDER_VERSION_FIELDS,
     OrderVersionUpdateResult,
@@ -59,7 +60,11 @@ class ChatService:
         self,
         title: str = "新对话",
         group_name: str | None = None,
+        session_type: str = SINGLE_CAR,
     ) -> int:
+        validate_session_type(session_type)
+        if session_type == MERGED_SHIPPING and group_name:
+            raise ValueError("合发会话不能设置单车群聊名称")
         if group_name:
             if self._check_group_name_conflict(-1, group_name) is not None:
                 raise ValueError(f"群聊名称已被其他对话使用：{group_name}")
@@ -68,12 +73,13 @@ class ChatService:
         for session in reversed(sessions[MAX_SESSION_COUNT - 1:]):
             self.delete_conversation(int(session["id"]))
         session_id = create_session(
-            title=title,
+            title=("新合发会话" if title == "新对话" and session_type == MERGED_SHIPPING else title),
             group_name=group_name,
+            session_type=session_type,
         )
         self.tools.load_context(
             session_id,
-            {"group_name": group_name},
+            {"group_name": group_name, "session_type": session_type},
         )
         self.save_working_context(session_id)
         self._discard_deleted_contexts()
@@ -92,7 +98,7 @@ class ChatService:
         context_data = load_session_context(session_id)
         self.tools.load_context(session_id, context_data)
         self._sync_new_order_to_tools(session_id, context_data)
-        if not context_data.get("config_owner_id"):
+        if context_data.get("session_type") == SINGLE_CAR and not context_data.get("config_owner_id"):
             # 首次迁移必须立即保存归属，避免再次打开旧对话时生成另一标识。
             self.save_working_context(session_id)
         # touch_session(session_id)
@@ -150,6 +156,8 @@ class ChatService:
     ) -> str | None:
 
         self._ensure_context_loaded(session_id)
+        if self.tools.get_context(session_id).session_type != SINGLE_CAR:
+            raise ValueError("合发会话不支持设置单车群名或订单，请进入单车会话操作")
 
         messages: list[str] = []
 
@@ -226,7 +234,11 @@ class ChatService:
             content=user_text,
         )
 
-        intent = parse_user_intent(user_text)
+        intent = parse_user_intent(user_text, self.tools.get_context(session_id).session_type)
+        if intent["intent"] == "unsupported":
+            reply = intent["reply"]
+            add_message(session_id=session_id, role="assistant", content=reply)
+            return reply
 
         context_messages: list[str] = []
         context_has_error = False
@@ -327,6 +339,7 @@ class ChatService:
                 session_id=session_id,
                 user_text=user_text,
                 progress_callback=progress_callback,
+                parsed_intent=intent,
             )
         finally:
             # 即使工具执行过程中报错，也保留本轮已经解析出的有效上下文。
@@ -374,7 +387,7 @@ class ChatService:
         )
         self._sync_new_order_to_tools(session_id, context_data)
 
-        if not context_data.get("config_owner_id"):
+        if context_data.get("session_type") == SINGLE_CAR and not context_data.get("config_owner_id"):
             self.save_working_context(session_id)
 
     def _discard_deleted_contexts(self) -> None:
@@ -419,6 +432,8 @@ class ChatService:
         session_id: int,
         order_input: str | Path | list[dict[str, Any]],
     ) -> OrderVersionUpdateResult:
+        if self.tools.get_context(session_id).session_type != SINGLE_CAR:
+            raise ValueError("合发会话不能录入单车订单")
         updater = update_order_entries if isinstance(order_input, list) else shift_order_versions
         result = updater(get_order_versions(session_id), order_input)
 
@@ -449,6 +464,8 @@ class ChatService:
         版本只用于历史比较，不影响当前成员检查、均摊或大货计算。
         """
         ctx = self.tools.get_context(session_id)
+        if ctx.session_type != SINGLE_CAR:
+            return
         old_new_order = str(ctx.new_order_file or "")
 
         for field_name in ORDER_VERSION_FIELDS:
