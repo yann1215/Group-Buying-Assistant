@@ -4,7 +4,8 @@ from typing import Any, ClassVar
 
 SINGLE_CAR = "single_car"
 MERGED_SHIPPING = "merged_shipping"
-SESSION_TYPE_LABELS = {SINGLE_CAR: "单车会话", MERGED_SHIPPING: "合发会话"}
+UNCLASSIFIED = "unclassified"
+SESSION_TYPE_LABELS = {SINGLE_CAR: "单车会话", MERGED_SHIPPING: "合发会话", UNCLASSIFIED: "未分类"}
 
 
 def validate_session_type(value: str) -> str:
@@ -29,6 +30,20 @@ class ConversationContext:
             "legacy_context": self.legacy_context,
             "migration_needs_review": self.migration_needs_review,
         }
+
+
+@dataclass
+class UnclassifiedContext(ConversationContext):
+    session_type: ClassVar[str] = UNCLASSIFIED
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.common_data()
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "UnclassifiedContext":
+        return cls(conversation_title_override=data.get("conversation_title_override"),
+                   legacy_context=data.get("legacy_context"),
+                   migration_needs_review=data.get("migration_needs_review") is True)
 
 
 @dataclass

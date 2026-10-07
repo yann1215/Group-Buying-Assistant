@@ -4,7 +4,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL DEFAULT '新对话',
     group_name TEXT,
-    session_type TEXT NOT NULL DEFAULT 'single_car' CHECK (session_type IN ('single_car', 'merged_shipping')),
+    draft_text TEXT NOT NULL DEFAULT '',
+    session_type TEXT NOT NULL DEFAULT 'unclassified' CHECK (session_type IN ('single_car', 'merged_shipping', 'unclassified')),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

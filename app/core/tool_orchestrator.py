@@ -52,7 +52,7 @@ from app.core.intent_parser import (
     is_intent_allowed,
     unsupported_intent_reply,
 )
-from app.core.session_types import ConversationContext, MergedShippingContext, SINGLE_CAR, MERGED_SHIPPING, validate_session_type
+from app.core.session_types import ConversationContext, MergedShippingContext, UnclassifiedContext, SINGLE_CAR, MERGED_SHIPPING, UNCLASSIFIED, validate_session_type
 from app.core.path_manager import get_parsed_orders_path, get_product_config_path, format_order_path
 from app.core.archive_manager import rename_conversation_files
 
@@ -289,6 +289,8 @@ class SingleCarContext(ConversationContext):
     legacy_share_signature: str | None = None
     group_name: str | None = None
 
+    chat_history_period: dict[str, Any] = field(default_factory=lambda: {"count": 1, "unit": "week"})
+
     pending_order_comparison: dict[str, Any] | None = None
     pending_participation: dict[str, Any] | None = None
 
@@ -339,6 +341,7 @@ class SingleCarContext(ConversationContext):
             "share_results_invalidated": self.share_results_invalidated,
             "legacy_share_signature": self.legacy_share_signature,
             "group_name": self.group_name,
+            "chat_history_period": dict(self.chat_history_period),
             "special_members": _to_json_safe(self.special_members),
             "new_order_file": self.new_order_file,
             "new_order_updated_at": self.new_order_updated_at,
@@ -361,6 +364,7 @@ class SingleCarContext(ConversationContext):
 
         special_members = data.get("special_members")
         product_configs = data.get("product_configs")
+        from app.core.chat_history_workflow import normalize_history_period
 
         return cls(
             conversation_title_override=_optional_string(data.get("conversation_title_override")),
@@ -374,6 +378,7 @@ class SingleCarContext(ConversationContext):
             share_results_invalidated=data.get("share_results_invalidated") is True,
             legacy_share_signature=data.get("legacy_share_signature"),
             group_name=_optional_string(data.get("group_name")),
+            chat_history_period=normalize_history_period(data.get("chat_history_period")),
             special_members=_dict_list_or_empty(special_members),
             new_order_file=_optional_string(data.get("new_order_file")),
             new_order_updated_at=_optional_string(
@@ -428,11 +433,11 @@ class ToolOrchestrator:
         self,
         key_input_func: Callable[[str], str] | None = None,
     ) -> None:
-        self.contexts: dict[int, SessionToolContext | MergedShippingContext] = {}
+        self.contexts: dict[int, SessionToolContext | MergedShippingContext | UnclassifiedContext] = {}
 
         self.key_input_func = key_input_func
 
-    def get_context(self, session_id: int) -> SessionToolContext | MergedShippingContext:
+    def get_context(self, session_id: int) -> SessionToolContext | MergedShippingContext | UnclassifiedContext:
         return self.contexts.setdefault(
             session_id,
             SessionToolContext(session_id=session_id),
@@ -445,9 +450,14 @@ class ToolOrchestrator:
         self,
         session_id: int,
         context_data: dict[str, Any] | None,
-    ) -> SessionToolContext | MergedShippingContext:
+    ) -> SessionToolContext | MergedShippingContext | UnclassifiedContext:
         data = context_data if isinstance(context_data, dict) else {}
         validate_session_type(data.get("session_type", SINGLE_CAR))
+        if data.get("session_type") == UNCLASSIFIED:
+            ctx = UnclassifiedContext.from_dict(data)
+            ctx.session_id = session_id
+            self.contexts[session_id] = ctx
+            return ctx
         if data.get("session_type") == MERGED_SHIPPING:
             ctx = MergedShippingContext.from_dict(data)
             ctx.session_id = session_id
@@ -581,11 +591,18 @@ class ToolOrchestrator:
         if intent["intent"] == "rename_conversation":
             from app.core.conversation_workflow import rename_conversation
             return rename_conversation(ctx, intent)
+        if isinstance(ctx, UnclassifiedContext):
+            return None
         if isinstance(ctx, MergedShippingContext):
             if intent["intent"] == "chat":
                 return None
             from app.core.order_merge_workflow import handle_order_merge
             return handle_order_merge(self, ctx, intent)
+
+        if intent["intent"] == "extract_chat_history":
+            self.update_context_from_intent(ctx, intent)
+            from app.core.chat_history_workflow import handle_chat_history
+            return handle_chat_history(self, ctx, intent, progress_callback)
 
         from app.core.participation_workflow import handle_participation
         from app.core.order_comparison_workflow import handle_order_comparison

@@ -7,7 +7,7 @@ import sqlite3
 from typing import Any
 
 from app.database.db import get_conn
-from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, validate_session_type
+from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, UNCLASSIFIED, validate_session_type
 
 
 MAX_SESSION_COUNT = 30
@@ -41,11 +41,13 @@ ORDER_UPDATED_AT_FIELDS = (
 def create_session(
     title: str = "新对话",
     group_name: str | None = None,
-    session_type: str = SINGLE_CAR,
+    session_type: str = UNCLASSIFIED,
 ) -> int:
     validate_session_type(session_type)
     if session_type == MERGED_SHIPPING and group_name:
         raise ValueError("合发会话不能设置单车群聊名称")
+    if session_type == UNCLASSIFIED and group_name and str(group_name).strip():
+        session_type = SINGLE_CAR
     normalized_title = str(title).strip() or "新对话"
     normalized_group_name = _normalize_optional_text(group_name)
 
@@ -75,6 +77,26 @@ def get_session(session_id: int) -> dict[str, Any] | None:
             (session_id,),
         ).fetchone()
         return dict(row) if row is not None else None
+
+
+def load_session_draft(session_id: int) -> str:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT draft_text FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"会话不存在：{session_id}")
+        return row["draft_text"]
+
+
+def save_session_draft(session_id: int, text: str) -> None:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE sessions SET draft_text = ? WHERE id = ?", (text, session_id)
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"会话不存在：{session_id}")
+        conn.commit()
 
 
 def list_sessions(limit: int | None = MAX_SESSION_COUNT) -> list[dict[str, Any]]:
@@ -203,7 +225,10 @@ def save_session_context(
         raise ValueError(f"会话不存在：{session_id}")
     if context.get("session_type", session["session_type"]) != session["session_type"]:
         raise ValueError("上下文类型与会话类型不一致")
-    if session["session_type"] == MERGED_SHIPPING:
+    if session["session_type"] == UNCLASSIFIED:
+        from app.core.session_types import UnclassifiedContext
+        context_to_save = UnclassifiedContext.from_dict(context).to_dict()
+    elif session["session_type"] == MERGED_SHIPPING:
         from app.core.session_types import MergedShippingContext
         context_to_save = MergedShippingContext.from_dict(context).to_dict()
     else:
@@ -275,6 +300,9 @@ def load_session_context(session_id: int) -> dict[str, Any]:
         context = {}
 
     context["session_type"] = row["session_type"]
+    if row["session_type"] == UNCLASSIFIED:
+        from app.core.session_types import UnclassifiedContext
+        return UnclassifiedContext.from_dict(context).to_dict()
     if row["session_type"] == MERGED_SHIPPING:
         from app.core.session_types import MergedShippingContext
         return MergedShippingContext.from_dict(context).to_dict()
@@ -441,3 +469,25 @@ def _normalize_optional_text(value: str | None) -> str | None:
 
     normalized = str(value).strip()
     return normalized or None
+
+
+def classify_session(session_id: int, context: dict[str, Any]) -> None:
+    """只允许从未分类归类一次，类型和首批业务数据在同一事务中保存。"""
+    session_type = validate_session_type(context["session_type"])
+    if session_type not in (SINGLE_CAR, MERGED_SHIPPING):
+        raise ValueError("只能归类为单车或合发会话")
+    data = dict(context)
+    versions = {field: data.pop(field) for field in ORDER_VERSION_FIELDS if field in data}
+    with get_conn() as conn:
+        changed = conn.execute(
+            "UPDATE sessions SET session_type = ?, group_name = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ? AND session_type = ?",
+            (session_type, data.get("group_name"), session_id, UNCLASSIFIED),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("会话不存在或已归类，不能自动转换类型")
+        conn.execute("INSERT INTO session_contexts (session_id, context_json) VALUES (?, ?) "
+                     "ON CONFLICT(session_id) DO UPDATE SET context_json = excluded.context_json, "
+                     "updated_at = CURRENT_TIMESTAMP", (session_id, json.dumps(data, ensure_ascii=False)))
+        if versions:
+            _update_order_versions(conn, session_id, versions)

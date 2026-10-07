@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, SESSION_TYPE_LABELS, validate_session_type
+from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, UNCLASSIFIED, SESSION_TYPE_LABELS, validate_session_type
 
 from app.analysis.special_parser import (
     has_show_special_member_words,
@@ -155,6 +155,7 @@ def parse_merged_shipping_intent(user_text: str) -> dict[str, Any]:
 COMMON_INTENTS = {"chat", "rename_conversation", "unsupported"}
 MERGE_INTENTS = {"set_merge_groups", "show_merge_groups", "refresh_merge_mapping", "merge_orders"}
 SINGLE_INTENTS = {
+    "extract_chat_history",
     "set_context", "show_orders", "compare_orders", "confirm_orders", "cancel_orders",
     "show_share", "calculate_share", "update_share_config", "confirm_share_config", "cancel_share",
     "calculate_bulk_goods", "member_check", "show_special_members", "update_special_members", "update_participation",
@@ -163,10 +164,14 @@ SINGLE_INTENTS = {
 
 def is_intent_allowed(intent: str, session_type: str) -> bool:
     validate_session_type(session_type)
+    if session_type == UNCLASSIFIED:
+        return intent in COMMON_INTENTS
     return intent in COMMON_INTENTS or intent in (SINGLE_INTENTS if session_type == SINGLE_CAR else MERGE_INTENTS)
 
 
 def unsupported_intent_reply(session_type: str) -> str:
+    if session_type == UNCLASSIFIED:
+        return "请先录入群聊名称或订单开始单车业务，或输入“合发：车1，车2”开始合发业务。"
     current = SESSION_TYPE_LABELS[session_type]
     target = SESSION_TYPE_LABELS[MERGED_SHIPPING if session_type == SINGLE_CAR else SINGLE_CAR]
     return f"当前为{current}，不支持此指令。请进入{target}执行。"
@@ -179,6 +184,8 @@ def parse_user_intent(user_text: str, session_type: str = SINGLE_CAR) -> dict[st
     if common["intent"] != "chat":
         return common
     merged = parse_merged_shipping_intent(user_text)
+    if session_type == UNCLASSIFIED:
+        return parse_unclassified_intent(user_text, merged)
     if session_type == SINGLE_CAR:
         merge_clauses = [parse_merged_shipping_intent(clause) for clause in re.split(r"[，,；;\n]+", user_text)]
         if merged["intent"] != "chat" or any(item["intent"] != "chat" for item in merge_clauses):
@@ -198,6 +205,33 @@ def parse_user_intent(user_text: str, session_type: str = SINGLE_CAR) -> dict[st
     ):
         return {"intent": "unsupported", "reply": unsupported_intent_reply(session_type)}
     return {"intent": "chat"}
+
+
+def parse_unclassified_intent(user_text: str, merged: dict[str, Any]) -> dict[str, Any]:
+    # 合发录入的冒号后都是车名，不能把车名再次作为单车指令解析。
+    if merged["intent"] != "chat":
+        if merged["intent"] == "set_merge_groups":
+            # 分号后的业务操作与逗号分隔的车名列表不同，不能一起归类。
+            trailing = re.split(r"[；;\n]+", user_text)[1:]
+            if any(parse_single_car_intent(clause)["intent"] not in {"chat", "cancel_share", "confirm_share_config"}
+                   for clause in trailing):
+                return {"intent": "unsupported", "reply": "同一条消息包含单车和合发操作，请分开输入；当前会话仍未分类。"}
+        return merged
+    clauses = [clause.strip() for clause in re.split(r"[，,；;\n]+", user_text) if clause.strip()]
+    merge_clauses = [clause for clause in clauses if parse_merged_shipping_intent(clause)["intent"] != "chat"]
+    if merge_clauses:
+        other = [clause for clause in clauses if clause not in merge_clauses]
+        if any(parse_single_car_intent(clause)["intent"] not in {"chat", "cancel_share", "confirm_share_config"}
+               for clause in other):
+            return {"intent": "unsupported", "reply": "同一条消息包含单车和合发操作，请分开输入；当前会话仍未分类。"}
+        return {"intent": "unsupported", "reply": "请每次输入一条合发指令；当前会话仍未分类。"}
+    single = parse_single_car_intent(user_text)
+    if single.get("group_name") or single.get("order_entries") or single.get("order_input"):
+        return single
+    if single["intent"] == "chat" or (single["intent"] in {"confirm_share_config", "cancel_share"}
+                                     and not re.search(r"均摊|大货", user_text)):
+        return {"intent": "chat"}
+    return {"intent": "unsupported", "reply": unsupported_intent_reply(UNCLASSIFIED)}
 
 
 def parse_single_car_intent(user_text: str) -> dict[str, Any]:
@@ -254,6 +288,16 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
     }
 
     if not text:
+        return result
+
+    from app.core.chat_history_workflow import parse_history_command
+    history = parse_history_command(text)
+    if history is not None:
+        result.update(history)
+        # 仅提取明确的群名分句，避免聊天记录中的词被误当作业务参数。
+        for clause in re.split(r"[，,；;\n]+", text):
+            if re.match(r"\s*(?:群聊名称|当前群聊|群聊|群名)\s*[:：]", clause):
+                result["group_name"] = parse_group_name(clause)
         return result
 
     if re.fullmatch(r"(?:取消|不要|不)(?:比较|比对|对比)(?:订单)?", text):

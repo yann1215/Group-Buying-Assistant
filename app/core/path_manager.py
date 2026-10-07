@@ -73,6 +73,18 @@ def get_parsed_orders_path(session_id: int | str) -> Path:
     return get_workspace_dir(session_id) / "parsed_orders.csv"
 
 
+def get_chat_history_path(session_id: int | str, room_wxid: str, *, filtered: bool = True) -> Path:
+    """聊天记录最终路径只使用会话 ID 和真实群聊 wxid。"""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+@chatroom", room_wxid):
+        raise ValueError("无效群聊 wxid，无法确定聊天记录文件名")
+    workspace = get_workspace_dir(session_id)
+    suffix = "" if filtered else "_unfiltered"
+    path = workspace / f"{room_wxid}{suffix}.csv"
+    if not is_within(path, workspace):
+        raise ValueError("聊天记录文件超出当前工作目录")
+    return path
+
+
 def _group_file(directory: Path, group_name: str, suffix: str, extension: str = ".csv") -> Path:
     if not re.fullmatch(r"\.[A-Za-z0-9]+", extension):
         raise ValueError(f"无效扩展名：{extension}")

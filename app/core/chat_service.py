@@ -5,15 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
-from app.core.intent_parser import parse_user_intent
-from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, validate_session_type
+from app.core.intent_parser import parse_user_intent, MERGE_INTENTS
+from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, UNCLASSIFIED, MergedShippingContext, validate_session_type
 from app.core.order_version_manager import (
     ORDER_VERSION_FIELDS,
     OrderVersionUpdateResult,
     shift_order_versions,
     update_order_entries,
 )
-from app.core.tool_orchestrator import ToolOrchestrator, invalidate_share_confirmation
+from app.core.tool_orchestrator import ToolOrchestrator, SessionToolContext, invalidate_share_confirmation
 from app.core.archive_manager import archive_conversation_files
 from app.core.path_manager import sanitize_filename, format_order_path
 
@@ -21,6 +21,7 @@ from app.database.repositories import (
     MAX_SESSION_COUNT,
     add_message,
     create_session,
+    classify_session,
     delete_session,
     find_session_by_group_name,
     get_order_versions,
@@ -28,6 +29,8 @@ from app.database.repositories import (
     get_session,
     list_sessions,
     load_session_context,
+    load_session_draft,
+    save_session_draft,
     save_session_context,
     # touch_session,
     update_order_versions,
@@ -60,11 +63,13 @@ class ChatService:
         self,
         title: str = "新对话",
         group_name: str | None = None,
-        session_type: str = SINGLE_CAR,
+        session_type: str = UNCLASSIFIED,
     ) -> int:
         validate_session_type(session_type)
         if session_type == MERGED_SHIPPING and group_name:
             raise ValueError("合发会话不能设置单车群聊名称")
+        if session_type == UNCLASSIFIED and group_name and str(group_name).strip():
+            session_type = SINGLE_CAR
         if group_name:
             if self._check_group_name_conflict(-1, group_name) is not None:
                 raise ValueError(f"群聊名称已被其他对话使用：{group_name}")
@@ -87,6 +92,12 @@ class ChatService:
 
     def list_conversations(self) -> list[dict[str, Any]]:
         return list_sessions()
+
+    def load_conversation_draft(self, session_id: int) -> str:
+        return load_session_draft(session_id)
+
+    def save_conversation_draft(self, session_id: int, text: str) -> None:
+        save_session_draft(session_id, text)
 
     def load_conversation(
         self,
@@ -156,6 +167,10 @@ class ChatService:
     ) -> str | None:
 
         self._ensure_context_loaded(session_id)
+        if self.tools.get_context(session_id).session_type == UNCLASSIFIED:
+            early_reply, messages, _ = self._initialize_business(
+                session_id, {"intent": "set_context", "group_name": group_name, "order_input": order_input})
+            return early_reply or "\n\n".join(messages) or None
         if self.tools.get_context(session_id).session_type != SINGLE_CAR:
             raise ValueError("合发会话不支持设置单车群名或订单，请进入单车会话操作")
 
@@ -240,15 +255,21 @@ class ChatService:
             add_message(session_id=session_id, role="assistant", content=reply)
             return reply
 
+        initial_input = self.tools.get_context(session_id).session_type == UNCLASSIFIED
         context_messages: list[str] = []
         context_has_error = False
+        if initial_input:
+            early_reply, context_messages, context_has_error = self._initialize_business(session_id, intent)
+            if early_reply is not None:
+                add_message(session_id=session_id, role="assistant", content=early_reply)
+                return early_reply
 
         # =========================================================
         # 1. 独立处理群聊名称
         # =========================================================
         group_name = intent.get("group_name")
 
-        if group_name:
+        if group_name and not initial_input:
             normalized_group_name = str(group_name).strip()
 
             conflict_session = self._check_group_name_conflict(
@@ -284,7 +305,7 @@ class ChatService:
         # =========================================================
         order_input = intent.get("order_entries") or intent.get("order_input")
 
-        if order_input:
+        if order_input and not initial_input:
             result = self._update_order_versions(
                 session_id,
                 order_input,
@@ -373,6 +394,64 @@ class ChatService:
         )
 
         return assistant_text
+
+    def _initialize_business(self, session_id: int, intent: dict[str, Any]) -> tuple[str | None, list[str], bool]:
+        """先校验首次输入，再一次提交类型和业务数据；失败保留未分类状态。"""
+        current = self.tools.get_context(session_id)
+        if current.session_type != UNCLASSIFIED:
+            raise ValueError("仅未分类会话可以自动归类")
+        common = current.to_dict()
+        if intent["intent"] in MERGE_INTENTS:
+            candidate = MergedShippingContext.from_dict(common)
+            candidate.session_id = session_id
+            reply = None
+            if intent["intent"] == "set_merge_groups":
+                from app.core.order_merge_workflow import handle_order_merge
+                reply = handle_order_merge(self.tools, candidate, intent)
+                if not candidate.merge_groups:
+                    return reply, [], True
+            classify_session(session_id, candidate.to_dict())
+            self.tools.contexts[session_id] = candidate
+            self.save_working_context(session_id)
+            return reply, [], False
+
+        group = str(intent.get("group_name") or "").strip()
+        order_input = intent.get("order_entries") or intent.get("order_input")
+        if not group and not order_input:
+            return None, [], False
+        messages = []
+        has_error = False
+        valid_group = None
+        if group:
+            try:
+                conflict = self._check_group_name_conflict(session_id, group)
+                if conflict is not None:
+                    messages.append(f"群聊名称重名。\n“{group}”已经被其他对话使用，当前群聊名称未修改。")
+                    has_error = True
+                else:
+                    valid_group = group
+                    messages.append(f"群聊名称已更新：{group}")
+            except ValueError as error:
+                messages.append(f"群聊名称无效：{error}")
+                has_error = True
+        result = None
+        if order_input:
+            updater = update_order_entries if isinstance(order_input, list) else shift_order_versions
+            result = updater(get_order_versions(session_id), order_input)
+            messages.append(self._format_order_update_result(result))
+            has_error = has_error or not result.success
+        if not valid_group and not (result and result.success):
+            return "\n\n".join(messages), messages, True
+        candidate = SessionToolContext.from_dict(common)
+        candidate.session_id = session_id
+        candidate.group_name = valid_group
+        if result and result.success:
+            for name in ORDER_VERSION_FIELDS:
+                setattr(candidate, name, result.versions[name] or None)
+        classify_session(session_id, candidate.to_dict())
+        self.tools.contexts[session_id] = candidate
+        self.save_working_context(session_id)
+        return None, messages, has_error
 
     def _ensure_context_loaded(self, session_id: int) -> None:
         if session_id in self.tools.contexts:

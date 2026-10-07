@@ -1,6 +1,7 @@
 # app/database/db.py
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -8,7 +9,7 @@ from typing import Any
 from app.config import DB_PATH, ensure_dirs
 
 
-CURRENT_DB_VERSION = 3
+CURRENT_DB_VERSION = 5
 
 
 ORDER_VERSION_COLUMNS = {
@@ -40,6 +41,7 @@ def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(schema_sql)
         _migrate_database(conn)
+        _migrate_unclassified_sessions(conn)
 
         # 迁移过程中重建表会同时移除旧索引，再执行一次可补齐索引。
         conn.executescript(schema_sql)
@@ -63,6 +65,9 @@ def _migrate_database(conn: sqlite3.Connection) -> None:
 
     if "group_name" not in session_columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN group_name TEXT")
+
+    if "draft_text" not in session_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN draft_text TEXT NOT NULL DEFAULT ''")
 
     _migrate_order_version_columns(conn)
     _migrate_session_types(conn)
@@ -318,3 +323,75 @@ def _migrate_session_types(conn: sqlite3.Connection) -> None:
                      (row["id"],))
         conn.execute("UPDATE session_contexts SET context_json = ? WHERE session_id = ?",
                      (json.dumps(ctx.to_dict(), ensure_ascii=False), row["id"]))
+
+
+def _migrate_unclassified_sessions(conn: sqlite3.Connection) -> None:
+    """扩展类型约束和默认值；仅迁移确认为空白的旧会话。"""
+    from app.core.session_types import UnclassifiedContext
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    table_sql = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").fetchone()[0]
+    needs_rebuild = "'unclassified'" not in table_sql
+    if not needs_rebuild and version >= CURRENT_DB_VERSION:
+        return
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if needs_rebuild:
+            sequence = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'sessions'").fetchone()
+            objects = conn.execute("SELECT sql FROM sqlite_master WHERE tbl_name = 'sessions' "
+                                   "AND type IN ('index', 'trigger') AND sql IS NOT NULL").fetchall()
+            create_sql = re.sub(r"CREATE TABLE(?: IF NOT EXISTS)?\s+[\"`\[]?sessions[\"`\]]?",
+                                "CREATE TABLE sessions_unclassified", table_sql, count=1, flags=re.I)
+            create_sql = create_sql.replace("DEFAULT 'single_car'", "DEFAULT 'unclassified'")
+            create_sql = create_sql.replace("'single_car', 'merged_shipping'", "'single_car', 'merged_shipping', 'unclassified'")
+            conn.execute(create_sql)
+            columns = [row["name"] for row in conn.execute("PRAGMA table_info(sessions)")]
+            names = ", ".join('"' + name.replace('"', '""') + '"' for name in columns)
+            conn.execute(f"INSERT INTO sessions_unclassified ({names}) SELECT {names} FROM sessions")
+            conn.execute("DROP TABLE sessions")
+            conn.execute("ALTER TABLE sessions_unclassified RENAME TO sessions")
+            # 保留已删除会话的 ID 上限，避免新会话复用合发配置引用过的旧 ID。
+            if sequence is not None:
+                updated = conn.execute("UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'sessions'",
+                                       (sequence["seq"],))
+                if not updated.rowcount:
+                    conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('sessions', ?)",
+                                 (sequence["seq"],))
+            for obj in objects:
+                conn.execute(obj["sql"])
+        rows = conn.execute("SELECT s.id, c.context_json, " + ", ".join("c." + field for field in ORDER_VERSION_COLUMNS) +
+                            " FROM sessions s LEFT JOIN session_contexts c ON s.id = c.session_id "
+                            "WHERE s.session_type = 'single_car' AND s.title = '新对话' "
+                            "AND COALESCE(TRIM(s.group_name), '') = '' "
+                            "AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id)").fetchall()
+        automatic = {"context_version", "session_type", "config_owner_id", "legacy_share_signature"}
+        for row in rows:
+            try:
+                data = json.loads(row["context_json"] or "{}")
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(data, dict) or any(row[field] for field in ORDER_VERSION_COLUMNS):
+                continue
+            active = False
+            for key, value in data.items():
+                if key in automatic or (key == "chat_history_period" and value == {"count": 1, "unit": "week"}):
+                    continue
+                if isinstance(value, dict):
+                    active = active or any(value.values())
+                else:
+                    active = active or bool(value)
+            if active:
+                continue
+            context = UnclassifiedContext().to_dict()
+            conn.execute("UPDATE sessions SET session_type = 'unclassified' WHERE id = ?", (row["id"],))
+            conn.execute("INSERT INTO session_contexts (session_id, context_json) VALUES (?, ?) "
+                         "ON CONFLICT(session_id) DO UPDATE SET context_json = excluded.context_json",
+                         (row["id"], json.dumps(context, ensure_ascii=False)))
+        conn.execute(f"PRAGMA user_version = {CURRENT_DB_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")

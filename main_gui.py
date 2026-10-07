@@ -19,7 +19,7 @@ from threading import Event
 
 from PySide6.QtWidgets import QInputDialog, QLineEdit
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QKeyEvent, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,7 +48,7 @@ def get_runtime_dir() -> Path:
 
 
 from app.core.chat_service import ChatService
-from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, SESSION_TYPE_LABELS
+from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, UNCLASSIFIED, SESSION_TYPE_LABELS
 from app.database.db import init_db
 from integrations.wechatmsg_lite_client import (
     ensure_wechat_database_key,
@@ -214,6 +214,11 @@ class ChatWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self.is_processing = False
         self._updating_session_list = False
+        self._draft_dirty = False
+        self._draft_timer = QTimer(self)
+        self._draft_timer.setSingleShot(True)
+        self._draft_timer.setInterval(500)
+        self._draft_timer.timeout.connect(self._autosave_draft)
 
         # 必须保存 worker 引用，防止任务结束前被 Python 回收
         self.current_worker: SendMessageWorker | None = None
@@ -244,13 +249,10 @@ class ChatWindow(QMainWindow):
         sidebar_layout.setContentsMargins(12, 16, 12, 16)
         sidebar_layout.setSpacing(10)
 
-        self.new_session_button = QPushButton("＋ 单车会话")
+        self.new_session_button = QPushButton("＋ 新对话")
         self.new_session_button.setObjectName("newSessionButton")
         self.new_session_button.clicked.connect(self.create_new_session)
         sidebar_layout.addWidget(self.new_session_button)
-        self.new_merge_session_button = QPushButton("＋ 合发会话")
-        self.new_merge_session_button.clicked.connect(lambda: self.create_new_session(MERGED_SHIPPING))
-        sidebar_layout.addWidget(self.new_merge_session_button)
 
         self.session_list = QListWidget()
         self.session_list.setObjectName("sessionList")
@@ -299,6 +301,7 @@ class ChatWindow(QMainWindow):
         self.input_box.setMinimumHeight(72)
         self.input_box.setMaximumHeight(125)
         self.input_box.submitted.connect(self.send_current_message)
+        self.input_box.textChanged.connect(self._schedule_draft_save)
         input_layout.addWidget(self.input_box, 1)
 
         self.send_button = QPushButton("发送")
@@ -465,19 +468,42 @@ class ChatWindow(QMainWindow):
             self.session_list.blockSignals(False)
             self._updating_session_list = False
 
+    def _schedule_draft_save(self) -> None:
+        self._draft_dirty = True
+        self._draft_timer.start()
+
+    def _save_pending_draft(self) -> None:
+        self._draft_timer.stop()
+        if self._draft_dirty:
+            self.chat_service.save_conversation_draft(
+                self.session_id, self.input_box.toPlainText()
+            )
+            self._draft_dirty = False
+
+    def _autosave_draft(self) -> None:
+        try:
+            self._save_pending_draft()
+        except Exception as exc:
+            QMessageBox.warning(self, "保存草稿失败", f"{type(exc).__name__}: {exc}")
+
     def load_session(
             self,
             session_id: int,
             *,
             refresh_sidebar: bool = True,
     ) -> None:
+        self._save_pending_draft()
+        draft = self.chat_service.load_conversation_draft(session_id)
         messages = self.chat_service.load_conversation(session_id)
         self.session_id = session_id
+        self.input_box.blockSignals(True)
+        try:
+            self.input_box.setPlainText(draft)
+        finally:
+            self.input_box.blockSignals(False)
         self.chat_view.clear()
         ctx = self.chat_service.tools.get_context(session_id)
-        example = ("输入“合发：车1，车2”保存车序，或输入“给我合发清单”"
-                   if ctx.session_type == MERGED_SHIPPING else "订单：订单1；算均摊")
-        self.input_box.setPlaceholderText(f"{example}；Enter 发送，Shift+Enter 换行")
+        self._update_input_hint()
         if ctx.migration_needs_review:
             self.append_message("assistant", "此旧会话同时包含单车和合发数据，已迁移为合发会话。原始数据已保留在会话备份中，请核对来源单车配置。")
 
@@ -526,14 +552,13 @@ class ChatWindow(QMainWindow):
             self.refresh_session_list(self.session_id)
 
     @Slot()
-    def create_new_session(self, session_type: str = SINGLE_CAR) -> None:
-        if isinstance(session_type, bool):
-            session_type = SINGLE_CAR
+    def create_new_session(self) -> None:
         if self.is_processing:
             return
 
         try:
-            session_id = self.chat_service.create_conversation(session_type=session_type)
+            self._save_pending_draft()
+            session_id = self.chat_service.create_conversation()
             self.load_session(session_id)
         except Exception as exc:
             QMessageBox.critical(
@@ -580,6 +605,8 @@ class ChatWindow(QMainWindow):
             self.chat_service.delete_conversation(
                 self.session_id,
             )
+            self._draft_timer.stop()
+            self._draft_dirty = False
 
             sessions = (
                 self.chat_service.list_conversations()
@@ -605,7 +632,22 @@ class ChatWindow(QMainWindow):
                 f"{type(exc).__name__}: {exc}",
             )
 
+    def _update_input_hint(self) -> None:
+        kind = self.chat_service.tools.get_context(self.session_id).session_type
+        if kind == UNCLASSIFIED:
+            example = "录入“群聊名称 XXX”或“订单 XXX”开始单车业务；输入“合发：车1，车2”开始合发业务"
+        elif kind == MERGED_SHIPPING:
+            example = "输入“合发：车1，车2”保存车序，或输入“给我合发清单”"
+        else:
+            example = "订单：订单1；算均摊"
+        self.input_box.setPlaceholderText(f"{example}；Enter 发送，Shift+Enter 换行")
+
     def _welcome_text(self) -> str:
+        if self.chat_service.tools.get_context(self.session_id).session_type == UNCLASSIFIED:
+            return ("新对话尚未分类。\n\n"
+                    "单车业务：先输入“群聊名称 XXX”或“订单 XXX”。\n"
+                    "合发业务：输入“合发：车1，车2”，车名对应已登记的单车群聊。\n\n"
+                    "系统会根据首次有效业务输入确定会话类型。普通聊天和修改名称不会决定类型。")
         if self.chat_service.tools.get_context(self.session_id).session_type == MERGED_SHIPPING:
             return ("这是合发会话，请先在各单车会话登记群名和订单，再录入合发车序：\n"
                     "  合发：车1，车2，车3\n\n"
@@ -637,8 +679,16 @@ class ChatWindow(QMainWindow):
         if not user_text:
             return
 
+        try:
+            self.chat_service.save_conversation_draft(self.session_id, "")
+        except Exception as exc:
+            QMessageBox.warning(self, "清空草稿失败", f"{type(exc).__name__}: {exc}")
+            return
+
         self.append_message("user", user_text)
         self.input_box.clear()
+        self._draft_timer.stop()
+        self._draft_dirty = False
         self.set_processing(True)
 
         self.current_worker = SendMessageWorker(
@@ -661,6 +711,7 @@ class ChatWindow(QMainWindow):
         try:
             self.append_message("assistant", reply)
             self.refresh_session_list(self.session_id)
+            self._update_input_hint()
         finally:
             self.set_processing(False)
 
@@ -683,6 +734,7 @@ class ChatWindow(QMainWindow):
                 ),
             )
             self.refresh_session_list(self.session_id)
+            self._update_input_hint()
         finally:
             self.set_processing(False)
 
@@ -700,7 +752,6 @@ class ChatWindow(QMainWindow):
         self.send_button.setEnabled(not processing)
         self.session_list.setEnabled(not processing)
         self.new_session_button.setEnabled(not processing)
-        self.new_merge_session_button.setEnabled(not processing)
         self.delete_session_button.setEnabled(not processing)
         self.send_button.setText("处理中…" if processing else "发送")
 
@@ -766,6 +817,12 @@ class ChatWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 event.ignore()
                 return
+        try:
+            self._save_pending_draft()
+        except Exception as exc:
+            QMessageBox.warning(self, "保存草稿失败", f"{type(exc).__name__}: {exc}")
+            event.ignore()
+            return
         event.accept()
 
 
