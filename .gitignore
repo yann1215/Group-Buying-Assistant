@@ -141,6 +141,7 @@ log/
 logs/
 test/
 tests/
+tests/*
 test_*.py
 *_test.py
 conftest.py

@@ -53,7 +53,9 @@ def handle_order_comparison(ctx, intent, text):
         snapshot = {"fields": fields, "values": values, "signatures": signatures, "group_name": ctx.group_name}
         if confirming and snapshot == pending:
             ctx.pending_order_comparison = None
-            return compare_orders(*values, ctx.group_name, expected_signatures=signatures)
+            result = compare_orders(*values, ctx.group_name, expected_signatures=signatures, structured=True)
+            ctx.order_comparison_reports.append(result)
+            return result["message"]
         ctx.pending_order_comparison = snapshot
         ctx.share_request.pending_config_confirmation = False
         ctx.bulk_request.pending_confirmation = False

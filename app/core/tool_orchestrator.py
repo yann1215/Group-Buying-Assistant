@@ -17,6 +17,7 @@ from typing import Any, Callable
 from decimal import Decimal
 import hashlib
 import json
+from time import monotonic
 from uuid import uuid4
 
 from app.analysis.order_parser import parse_order_file
@@ -55,6 +56,33 @@ from app.core.intent_parser import (
 from app.core.session_types import ConversationContext, MergedShippingContext, UnclassifiedContext, SINGLE_CAR, MERGED_SHIPPING, UNCLASSIFIED, validate_session_type
 from app.core.path_manager import get_parsed_orders_path, get_product_config_path, format_order_path
 from app.core.archive_manager import rename_conversation_files
+
+
+MEMBER_CHECK_CACHE_SECONDS = 3 * 60
+
+
+def member_check_signature(ctx: SingleCarContext) -> str | None:
+    """只校验影响成员核对的数据，均摊金额和大货价格不影响缓存。"""
+    if not ctx.group_name or not ctx.new_order_file or not ctx.parsed_order_file or not ctx.share_config_file:
+        return None
+    if not owns_product_config(ctx.share_config_file, ctx.config_owner_id):
+        return None
+    try:
+        configs = load_product_share_config_file(ctx.share_config_file)
+        data = {
+            "group": ctx.group_name,
+            "owner": ctx.config_owner_id,
+            "order_path": str(Path(ctx.new_order_file).resolve()),
+            "order": hashlib.sha256(Path(ctx.new_order_file).read_bytes()).hexdigest(),
+            "parsed_path": str(Path(ctx.parsed_order_file).resolve()),
+            "parsed": hashlib.sha256(Path(ctx.parsed_order_file).read_bytes()).hexdigest(),
+            "config_path": str(Path(ctx.share_config_file).resolve()),
+            "products": [{k: c.get(k) for k in ("商品序号", "商品名称", "计入均摊")} for c in configs],
+            "members": ctx.special_members,
+        }
+        return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+    except (OSError, ValueError, RuntimeError):
+        return None
 
 
 def emit_progress(
@@ -290,6 +318,10 @@ class SingleCarContext(ConversationContext):
     group_name: str | None = None
 
     chat_history_period: dict[str, Any] = field(default_factory=lambda: {"count": 1, "unit": "week"})
+    chat_history_metadata: dict[str, Any] | None = None
+    order_comparison_reports: list[dict[str, Any]] = field(default_factory=list)
+    pending_transfer_analysis: dict[str, Any] | None = None
+    transfer_focus_products: list[dict[str, Any]] = field(default_factory=list)
 
     pending_order_comparison: dict[str, Any] | None = None
     pending_participation: dict[str, Any] | None = None
@@ -311,6 +343,9 @@ class SingleCarContext(ConversationContext):
     # 新订单核对缓存
     member_checked: bool = False
     member_check_result: dict[str, Any] | None = None
+    # 仅保留于当前运行会话；恢复会话后必须重新检查。
+    member_checked_at: float | None = None
+    member_check_signature: str | None = None
     parsed_order_file: str | None = None
 
     share_config_file: str | None = None
@@ -342,6 +377,10 @@ class SingleCarContext(ConversationContext):
             "legacy_share_signature": self.legacy_share_signature,
             "group_name": self.group_name,
             "chat_history_period": dict(self.chat_history_period),
+            "chat_history_metadata": _to_json_safe(self.chat_history_metadata),
+            "order_comparison_reports": _to_json_safe(self.order_comparison_reports),
+            "pending_transfer_analysis": _to_json_safe(self.pending_transfer_analysis),
+            "transfer_focus_products": _to_json_safe(self.transfer_focus_products),
             "special_members": _to_json_safe(self.special_members),
             "new_order_file": self.new_order_file,
             "new_order_updated_at": self.new_order_updated_at,
@@ -379,6 +418,10 @@ class SingleCarContext(ConversationContext):
             legacy_share_signature=data.get("legacy_share_signature"),
             group_name=_optional_string(data.get("group_name")),
             chat_history_period=normalize_history_period(data.get("chat_history_period")),
+            chat_history_metadata=data.get("chat_history_metadata") if isinstance(data.get("chat_history_metadata"), dict) else None,
+            order_comparison_reports=_dict_list_or_empty(data.get("order_comparison_reports")),
+            pending_transfer_analysis=data.get("pending_transfer_analysis") if isinstance(data.get("pending_transfer_analysis"), dict) else None,
+            transfer_focus_products=_dict_list_or_empty(data.get("transfer_focus_products")),
             special_members=_dict_list_or_empty(special_members),
             new_order_file=_optional_string(data.get("new_order_file")),
             new_order_updated_at=_optional_string(
@@ -436,6 +479,8 @@ class ToolOrchestrator:
         self.contexts: dict[int, SessionToolContext | MergedShippingContext | UnclassifiedContext] = {}
 
         self.key_input_func = key_input_func
+        # 专用分析接口：接收包含 CSV 内容和特别关注商品的字典，返回分析结果文本。
+        self.transfer_analysis_client = None
 
     def get_context(self, session_id: int) -> SessionToolContext | MergedShippingContext | UnclassifiedContext:
         return self.contexts.setdefault(
@@ -599,6 +644,11 @@ class ToolOrchestrator:
             from app.core.order_merge_workflow import handle_order_merge
             return handle_order_merge(self, ctx, intent)
 
+        from app.core.transfer_analysis_workflow import handle_transfer_analysis
+        transfer_reply = handle_transfer_analysis(self, ctx, intent, user_text, progress_callback)
+        if transfer_reply is not None:
+            return transfer_reply
+
         if intent["intent"] == "extract_chat_history":
             self.update_context_from_intent(ctx, intent)
             from app.core.chat_history_workflow import handle_chat_history
@@ -761,11 +811,6 @@ class ToolOrchestrator:
             progress_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
 
-        emit_progress(
-            progress_callback,
-            "正在检查成员……",
-        )
-
         # 即使存在旧缓存，也应先确认特殊成员配置仍然有效。
         special_member_errors = (
             validate_special_member_cache(
@@ -790,13 +835,25 @@ class ToolOrchestrator:
             }
 
         if (
-                ctx.member_checked
+                not force
+                and ctx.member_checked
                 and ctx.member_check_result
+                and ctx.member_check_result.get("ok")
+                and ctx.member_checked_at is not None
+                and 0 <= monotonic() - ctx.member_checked_at < MEMBER_CHECK_CACHE_SECONDS
+                and ctx.member_check_signature is not None
+                and ctx.member_check_signature == member_check_signature(ctx)
                 and ctx.parsed_order_file
                 and Path(ctx.parsed_order_file).is_file()
-                and not force
         ):
+            emit_progress(progress_callback, "复用 3 分钟内的成员检查结果。")
             return ctx.member_check_result
+
+        ctx.member_checked = False
+        ctx.member_check_result = None
+        ctx.member_checked_at = None
+        ctx.member_check_signature = None
+        emit_progress(progress_callback, "正在检查成员……")
 
         if not ctx.group_name:
             return {
@@ -853,6 +910,10 @@ class ToolOrchestrator:
 
         if product_configs is not None:
             ctx.product_configs = product_configs
+
+        if result.get("ok"):
+            ctx.member_check_signature = member_check_signature(ctx)
+            ctx.member_checked_at = monotonic()
 
         return result
 
@@ -1032,11 +1093,10 @@ class ToolOrchestrator:
         if not ctx.bulk_request.pending_confirmation:
             return "当前没有等待确认的大货计算。"
 
-        # 用户确认时再强制重新读取一次订单，
-        # 防止两次消息之间订单文件被修改。
+        # 3 分钟内复用成员检查；订单内容或参摊设置变化时自动重新检查。
         check_result = self.ensure_member_checked(
             ctx,
-            force=True,
+            force=False,
             progress_callback=progress_callback,
         )
 
@@ -1055,7 +1115,7 @@ class ToolOrchestrator:
             ctx.bulk_request.pending_confirmation = False
 
             return (
-                    "确认时重新检查发现群成员或订单已发生变化，"
+                    "确认时成员检查结果存在群成员或订单问题，"
                     "本次大货计算已停止。\n\n"
                     + format_member_check_result(
                 check_result
@@ -1256,8 +1316,9 @@ class ToolOrchestrator:
         req = ctx.share_request
         req.pending_config_confirmation = True
         req.confirmation_signature = share_signature(ctx)
-        lines = ["计算均摊前，请确认商品配置：", format_complete_calculation_preview(ctx)]
-        lines.extend([f"配置文件：{ctx.share_config_file}", '确认无误后可输入“计算”“算”“无误”或“下一步”；需修改时请修改配置后重新输入“算均摊”。'])
+        lines = ["计算均摊前，请确认商品配置：", "", format_complete_calculation_preview(ctx)]
+        lines.extend(["", f"配置文件：{ctx.share_config_file}", "",
+                      '确认无误请回复“是”；需修改时请修改配置后重新输入“算均摊”。'])
         return "\n".join(lines)
 
     def handle_confirm_share_config(self, ctx: SessionToolContext, intent: dict[str, Any],
@@ -1278,8 +1339,8 @@ class ToolOrchestrator:
         req.force = False
         if not req.config_confirmed or not req.confirmation_signature or req.confirmation_signature != share_signature(ctx):
             return self.handle_calculate_share(ctx, {}, progress_callback)
-        # 重新查成员，不能沿用配置或订单变更前的核对缓存。
-        check_result = self.ensure_member_checked(ctx, force=True, progress_callback=progress_callback)
+        # 仅复用 3 分钟内且订单、成员及商品参摊设置未变化的核对结果。
+        check_result = self.ensure_member_checked(ctx, progress_callback=progress_callback)
         if not check_result.get("ok"):
             return format_member_check_result(check_result)
         if req.confirmation_signature != share_signature(ctx):
@@ -1315,7 +1376,7 @@ class ToolOrchestrator:
         # 只读：不准备订单、不写配置、不检查成员、不生成结果文件。
         signature = share_signature(ctx, include_members=True)
         if ctx.last_share_result and signature and signature == ctx.last_share_signature:
-            return format_share_summary(ctx.last_share_result)
+            return format_share_summary(ctx.last_share_result, ctx.special_members)
         configs = []
         if ctx.share_config_file and owns_product_config(ctx.share_config_file, ctx.config_owner_id):
             if Path(ctx.share_config_file).is_file():
@@ -1426,7 +1487,7 @@ def format_legacy_share_summary(configs: list[dict[str, Any]]) -> str | None:
     return "\n".join(lines)
 
 
-def format_share_summary(result: dict[str, Any]) -> str:
+def format_share_summary(result: dict[str, Any], special_members: list[dict[str, Any]] | None = None) -> str:
     """查询和计算完成共享同一摘要，统计由计算器提供。"""
     mode = result.get("share_mode")
     scope = result.get("calculation_scope")
@@ -1447,6 +1508,9 @@ def format_share_summary(result: dict[str, Any]) -> str:
         for c in products:
             suffix = "" if c["included"] else "（不参摊）"
             lines.append(f"- {c['product_name']}：{c['quantity']} 个{suffix}")
+    if special_members is not None:
+        lines.append("不参摊说明：" + format_non_share_special_member_note(special_members))
+        lines.append("")
     if scope == "independent":
         lines.append("各商品单人均摊：" if mode == "head" else "各商品单个均摊：")
         for c in products:
@@ -1459,7 +1523,8 @@ def format_share_summary(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_pending_share_summary(ctx: SessionToolContext, configs: list[dict[str, Any]] | None = None) -> str:
+def format_pending_share_summary(ctx: SessionToolContext, configs: list[dict[str, Any]] | None = None,
+                                 *, include_details: bool = True) -> str:
     if configs is None:
         configs = ctx.product_configs or []
     req = ctx.share_request
@@ -1487,6 +1552,8 @@ def format_pending_share_summary(ctx: SessionToolContext, configs: list[dict[str
             total = next(iter(amounts))
     lines = [f"均摊类型：{mode}", f"计算方式：{scope}",
              f"总均摊：{format_share_money(total)}"]
+    if not include_details:
+        return "\n".join(lines)
     if scope == "独立":
         lines.extend(f"- {c['商品名称']}独立均摊：{c.get('商品均摊') or '未填写'}" for c in active)
     lines.append("参摊人数：待计算" if share_mode == "head" else "参摊个数：待计算")
@@ -1498,16 +1565,17 @@ def format_pending_share_summary(ctx: SessionToolContext, configs: list[dict[str
 
 def format_complete_calculation_preview(ctx: SessionToolContext, *, include_share: bool = True) -> str:
     """计算确认统一展示当前配置、全部商品和全部特殊成员。"""
-    from app.analysis.participation import product_preview
+    from app.analysis.participation import label
     lines = [f'群聊：{ctx.group_name or "未设置"}',
              f'订单：{format_order_path(ctx.new_order_file)}',
              ]
     if include_share:
-        lines.append(format_pending_share_summary(ctx))
+        lines.append(format_pending_share_summary(ctx, include_details=False))
     lines.extend(['', '全部商品配置：'])
     for item in ctx.product_configs or []:
         if include_share:
-            lines.append(product_preview(item))
+            state = '参摊' if item.get('计入均摊', True) else '不参摊'
+            lines.append(label('商品', item) + '｜' + state)
         else:
             fields = ('商品数量', '商品单价', '商品大货总价')
             lines.append(f"商品{item.get('商品序号')}：{item['商品名称']}" + ''.join(
@@ -1831,7 +1899,7 @@ def format_share_result(
     lines.append(format_member_check_summary_for_share(member_check_result))
     lines.append("")
 
-    lines.append(format_share_summary(result))
+    lines.append(format_share_summary(result, special_members or []))
 
     lines.append(f"实际总收款：{result['total_collected']}")
     lines.append(f"向上取整多收：{result['over_collected']}")

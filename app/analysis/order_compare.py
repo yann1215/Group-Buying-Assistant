@@ -17,7 +17,10 @@ def file_signature(value):
     return digest.hexdigest()
 
 
-def compare_orders(old_file, new_file, group_name, expected_signatures=None):
+def compare_orders(old_file, new_file, group_name, expected_signatures=None, *, structured=False):
+    signatures = [file_signature(value) for value in (old_file, new_file)]
+    if expected_signatures is not None and signatures != expected_signatures:
+        raise ValueError("订单文件发生变化，请重新确认")
     with tempfile.TemporaryDirectory() as directory:
         tables = []
         for index, source in enumerate((old_file, new_file)):
@@ -58,7 +61,7 @@ def compare_orders(old_file, new_file, group_name, expected_signatures=None):
             changes.append(("新增商品", "", "商品名称", "", field))
         elif field not in new_fields:
             changes.append(("删除商品", "", "商品名称", field, ""))
-    if expected_signatures is not None and [file_signature(value) for value in (old_file, new_file)] != expected_signatures:
+    if [file_signature(value) for value in (old_file, new_file)] != signatures:
         raise ValueError("比较期间订单文件发生变化，请重新输入比较订单并确认")
     directory = paths.ORDERS_DIR / "comparisons"
     directory.mkdir(parents=True, exist_ok=True)
@@ -80,4 +83,9 @@ def compare_orders(old_file, new_file, group_name, expected_signatures=None):
     counts = Counter(kind for kind, *_ in changes)
     summary = "；".join(f"{kind}：{len({row[1] for row in changes if row[0] == kind})} 单" if kind.endswith("订单") else f"{kind}：{count} 项"
                         for kind, count in counts.items()) or "未发现变化"
-    return f"订单比较完成。{summary}。\n报告：{target.resolve()}"
+    message = f"订单比较完成。{summary}。\n报告：{target.resolve()}"
+    result = {"values": [str(Path(value).resolve()) for value in (old_file, new_file)],
+              "signatures": signatures, "group_name": group_name,
+              "report_path": str(target.resolve()), "report_signature": file_signature(target),
+              "summary": summary, "message": message}
+    return result if structured else message

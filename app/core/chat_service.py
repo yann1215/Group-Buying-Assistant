@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any, Callable
 
 from app.core.intent_parser import parse_user_intent, MERGE_INTENTS
@@ -36,7 +37,9 @@ from app.database.repositories import (
     update_order_versions,
     update_session,
 )
-from app.llm.ollama_client import OllamaClient
+from app.llm.llama_client import LlamaClient
+from app.llm.instruction_normalizer import InstructionNormalizer
+from app.llm.transfer_analyzer import TransferAnalyzer
 
 
 ORDER_SLOT_LABELS = {
@@ -53,11 +56,13 @@ class ChatService:
         self,
         key_input_func: Callable[[str], str] | None = None,
     ) -> None:
-        self.llm = OllamaClient()
+        self.llm = LlamaClient()
+        self.instruction_normalizer = InstructionNormalizer(self.llm)
 
         self.tools = ToolOrchestrator(
             key_input_func=key_input_func,
         )
+        self.tools.transfer_analysis_client = TransferAnalyzer(self.llm)
 
     def create_conversation(
         self,
@@ -250,6 +255,63 @@ class ChatService:
         )
 
         intent = parse_user_intent(user_text, self.tools.get_context(session_id).session_type)
+        ctx = self.tools.get_context(session_id)
+        waiting = {
+            "transfer_analysis": bool(getattr(ctx, "pending_transfer_analysis", None)),
+            "order_comparison": bool(getattr(ctx, "pending_order_comparison", None)),
+            "participation": bool(getattr(ctx, "pending_participation", None)),
+            "share": bool(getattr(getattr(ctx, "share_request", None), "pending_config_confirmation", False)),
+            "bulk": bool(getattr(getattr(ctx, "bulk_request", None), "pending_confirmation", False)),
+        }
+        # 精确短回复由已有状态机消费，不能在模型调用前改变等待状态。
+        short_reply = bool(any(waiting.values()) and re.fullmatch(
+            r"(?:确认分析|确认|是|yes|y|1|对|无误|没问题|没有问题|算|计算|算吧|继续|继续算|下一步|好|好的|取消|否|不是|不|不要|不对|不正确|先别改|不要改|暂不修改|选择\s*\d+|\d+)",
+            user_text.strip(), re.I))
+        inquiry = bool(re.search(r"怎么|如何|什么意思|为什么", user_text))
+        clauses = [s.strip() for s in re.split(r"[，,；;\n]+", user_text) if s.strip()]
+        partial = any(
+            parse_user_intent(clause, ctx.session_type)["intent"] == "chat"
+            and re.search(r"帮|请|看看|检查|别|不要|取消|改|删|计算|提取|弄", clause)
+            for clause in clauses
+        )
+        chat_reply = None
+        if not short_reply and (intent["intent"] == "chat" or inquiry or partial):
+            if progress_callback:
+                progress_callback("正在理解指令……")
+            try:
+                result = self.instruction_normalizer.normalize(user_text, {
+                    "session_type": ctx.session_type, "group_name": getattr(ctx, "group_name", None),
+                    "waiting": waiting,
+                    "recent_messages": [{"role": m["role"], "content": m["content"][:1200]}
+                                        for m in get_messages(session_id)[-5:-1]],
+                })
+                if result.status == "normalized":
+                    effective_text = result.normalized_command.strip()
+                    normalized_intent = parse_user_intent(effective_text, ctx.session_type)
+                    if normalized_intent["intent"] == "chat":
+                        raise ValueError("规范化指令尚未被识别，请使用更明确的指令。")
+                    # 问句不能被升级为写入/执行；否定和取消也不能被模型丢弃。
+                    read_only = {"show_orders", "show_share", "show_special_members", "show_merge_groups"}
+                    if inquiry and normalized_intent["intent"] not in read_only:
+                        raise ValueError("这条消息包含咨询或疑问，请明确要执行的操作。")
+                    if re.search(r"不要|别|取消|暂不|不想|不用", user_text) and not re.search(
+                            r"不要|别|取消|暂不|不想|不用|不参摊|查看", effective_text):
+                        raise ValueError("无法可靠保留原指令的否定语义，请明确要取消或查看的操作。")
+                    confirmation = normalized_intent["intent"]
+                    if confirmation == "confirm_transfer_analysis" and not waiting["transfer_analysis"]:
+                        raise ValueError("当前没有等待确认的转单分析。")
+                    if confirmation == "confirm_orders" and not waiting["order_comparison"]:
+                        raise ValueError("当前没有等待确认的订单比对。")
+                    if confirmation == "confirm_share_config" and not waiting["share"]:
+                        raise ValueError("当前没有等待确认的均摊计算。")
+                    user_text, intent = effective_text, normalized_intent
+                else:
+                    chat_reply = result.clarification_question or result.chat_reply
+            except (RuntimeError, ValueError, OSError) as error:
+                chat_reply = str(error)
+            if chat_reply:
+                add_message(session_id=session_id, role="assistant", content=chat_reply)
+                return chat_reply
         if intent["intent"] == "unsupported":
             reply = intent["reply"]
             add_message(session_id=session_id, role="assistant", content=reply)
@@ -374,18 +436,7 @@ class ChatService:
             )
             return tool_result
 
-        history = get_messages(session_id)
-
-        llm_messages = [
-            {
-                "role": msg["role"],
-                "content": msg["content"],
-            }
-            for msg in history
-            if msg["role"] in ("user", "assistant", "system")
-        ]
-
-        assistant_text = self.llm.chat(llm_messages)
+        assistant_text = "当前没有可继续执行的操作，请输入明确指令。"
 
         add_message(
             session_id=session_id,

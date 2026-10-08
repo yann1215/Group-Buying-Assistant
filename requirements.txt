@@ -1,4 +1,6 @@
-ollama
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+--only-binary llama-cpp-python
+llama-cpp-python==0.3.36
 pandas
 numpy
 scipy

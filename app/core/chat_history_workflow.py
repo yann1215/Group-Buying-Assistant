@@ -188,12 +188,12 @@ def publish_history_files(files, staging):
         raise
 
 
-def handle_chat_history(tools, ctx, intent, progress_callback=None):
+def handle_chat_history(tools, ctx, intent, progress_callback=None, *, time_range=None, structured=False):
     if intent.get("chat_history_error"):
         return intent["chat_history_error"]
     period = normalize_history_period(intent.get("chat_history_period", ctx.chat_history_period))
     try:
-        start, end = history_time_range(period)
+        start, end = time_range or history_time_range(period)
     except ValueError as error:
         return str(error) if "原时间设置未修改" in str(error) else TIME_ERROR
     except OverflowError:
@@ -233,6 +233,16 @@ def handle_chat_history(tools, ctx, intent, progress_callback=None):
             shutil.copyfile(path, filtered_path)
             total, kept = filter_history_csv(filtered_path)
             publish_history_files([(path, raw_destination), (filtered_path, destination)], staging)
+        from app.analysis.order_compare import file_signature
+        ctx.chat_history_metadata = {
+            "group_name": ctx.group_name, "room_wxid": room[1],
+            "fetched_at": history_now().isoformat(), "start": start, "end": end,
+            "raw_path": str(raw_destination.resolve()), "filtered_path": str(destination.resolve()),
+            "filtered_signature": file_signature(destination), "raw_signature": file_signature(raw_destination),
+            "total": total, "kept": kept,
+        }
+        if structured:
+            return dict(ctx.chat_history_metadata)
         empty = "\n没有匹配消息，筛选文件只有表头。" if kept == 0 else ""
         return (f"聊天记录已提取并筛选。\n当前时间设置：{label}（后续沿用）。"
                 f"\n查询范围：{start} 至 {end}（北京时间）。"

@@ -155,6 +155,7 @@ def parse_merged_shipping_intent(user_text: str) -> dict[str, Any]:
 COMMON_INTENTS = {"chat", "rename_conversation", "unsupported"}
 MERGE_INTENTS = {"set_merge_groups", "show_merge_groups", "refresh_merge_mapping", "merge_orders"}
 SINGLE_INTENTS = {
+    "analyze_transfers", "confirm_transfer_analysis", "cancel_transfer_analysis", "update_transfer_focus",
     "extract_chat_history",
     "set_context", "show_orders", "compare_orders", "confirm_orders", "cancel_orders",
     "show_share", "calculate_share", "update_share_config", "confirm_share_config", "cancel_share",
@@ -288,6 +289,20 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
     }
 
     if not text:
+        return result
+
+    if re.search(r"(?:比对转单记录|分析转单记录|查找转单异常)", text) and not re.search(
+            r"(?:不要|取消|暂不|别)\s*(?:比对转单记录|分析转单记录|查找转单异常)", text):
+        result["intent"] = "analyze_transfers"
+        return result
+    if text == "确认分析":
+        result["intent"] = "confirm_transfer_analysis"
+        return result
+    if text == "取消分析":
+        result["intent"] = "cancel_transfer_analysis"
+        return result
+    if re.match(r"^(?:特别关注(?:商品)?|关注商品)\s*[:：]", text):
+        result["intent"] = "update_transfer_focus"
         return result
 
     from app.core.chat_history_workflow import parse_history_command
@@ -570,9 +585,10 @@ def has_share_confirmation_words(text: str) -> bool:
         "算均摊", "计算均摊", "算一下均摊", "确认", "确认计算", "无误",
         "确认无误", "没问题", "没有问题", "可以", "可以计算", "好", "好的",
         "下一步", "继续", "继续算", "继续计算", "按这个算", "按这个计算",
+        "是", "yes", "y", "1",
     }
     clauses = re.split(r"[，,。.!！;；\n]+", text)
-    return any(re.sub(r"\s+", "", clause) in words for clause in clauses)
+    return any(re.sub(r"\s+", "", clause).casefold() in words for clause in clauses)
 
 
 # ----------------------------------------------------------------------
