@@ -428,8 +428,9 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
         result["intent"] = "calculate_share"
         return result
 
+    # 提及均摊本身不代表修改配置；模糊表达交给指令规范化模块。
     if (
-        has_share_words(text)
+        re.search(r"(?:设置|配置|修改|调整|更改)(?:一下)?(?:总)?均摊", text)
         or share_mode is not None
         or calculation_scope is not None
         or amount is not None

@@ -267,7 +267,7 @@ class ChatService:
         short_reply = bool(any(waiting.values()) and re.fullmatch(
             r"(?:确认分析|确认|是|yes|y|1|对|无误|没问题|没有问题|算|计算|算吧|继续|继续算|下一步|好|好的|取消|否|不是|不|不要|不对|不正确|先别改|不要改|暂不修改|选择\s*\d+|\d+)",
             user_text.strip(), re.I))
-        inquiry = bool(re.search(r"怎么|如何|什么意思|为什么", user_text))
+        inquiry = bool(re.search(r"怎么|如何|什么意思|为什么|记得.*(?:均摊|分摊)", user_text))
         clauses = [s.strip() for s in re.split(r"[，,；;\n]+", user_text) if s.strip()]
         partial = any(
             parse_user_intent(clause, ctx.session_type)["intent"] == "chat"
