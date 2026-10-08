@@ -38,7 +38,7 @@ from app.database.repositories import (
     update_session,
 )
 from app.llm.llama_client import LlamaClient
-from app.llm.instruction_normalizer import InstructionNormalizer
+from app.llm.instruction_normalizer import InstructionNormalizer, is_help_request
 from app.llm.transfer_analyzer import TransferAnalyzer
 
 
@@ -267,7 +267,8 @@ class ChatService:
         short_reply = bool(any(waiting.values()) and re.fullmatch(
             r"(?:确认分析|确认|是|yes|y|1|对|无误|没问题|没有问题|算|计算|算吧|继续|继续算|下一步|好|好的|取消|否|不是|不|不要|不对|不正确|先别改|不要改|暂不修改|选择\s*\d+|\d+)",
             user_text.strip(), re.I))
-        inquiry = bool(re.search(r"怎么|如何|什么意思|为什么|记得.*(?:均摊|分摊)", user_text))
+        help_request = is_help_request(user_text)
+        inquiry = help_request or bool(re.search(r"为什么|记得.*(?:均摊|分摊)", user_text))
         clauses = [s.strip() for s in re.split(r"[，,；;\n]+", user_text) if s.strip()]
         partial = any(
             parse_user_intent(clause, ctx.session_type)["intent"] == "chat"
@@ -286,6 +287,8 @@ class ChatService:
                                         for m in get_messages(session_id)[-5:-1]],
                 })
                 if result.status == "normalized":
+                    if help_request:
+                        raise ValueError("这是一条帮助咨询，请单独发送要执行的指令。")
                     effective_text = result.normalized_command.strip()
                     normalized_intent = parse_user_intent(effective_text, ctx.session_type)
                     if normalized_intent["intent"] == "chat":

@@ -635,9 +635,9 @@ class ChatWindow(QMainWindow):
     def _update_input_hint(self) -> None:
         kind = self.chat_service.tools.get_context(self.session_id).session_type
         if kind == UNCLASSIFIED:
-            example = "录入“群聊名称 XXX”或“订单 XXX”开始单车业务；输入“合发：车1，车2”开始合发业务"
+            example = "录入“群聊名称 XXX”或“订单 XXX”开始单车业务；输入“合发”开始合发业务"
         elif kind == MERGED_SHIPPING:
-            example = "输入“合发：车1，车2”保存车序，或输入“给我合发清单”"
+            example = "输入“车名 xxx，订单 xxx”录入车群，或输入“输出合发表”"
         else:
             example = "订单：订单1；算均摊"
         self.input_box.setPlaceholderText(f"{example}；Enter 发送，Shift+Enter 换行")
@@ -646,11 +646,12 @@ class ChatWindow(QMainWindow):
         if self.chat_service.tools.get_context(self.session_id).session_type == UNCLASSIFIED:
             return ("新对话尚未分类。\n\n"
                     "单车业务：先输入“群聊名称 XXX”或“订单 XXX”。\n"
-                    "合发业务：输入“合发：车1，车2”，车名对应已登记的单车群聊。\n\n"
+                    "合发业务：输入“合发”，再逐个录入“车名 xxx，订单 xxx”。\n\n"
                     "系统会根据首次有效业务输入确定会话类型。普通聊天和修改名称不会决定类型。")
         if self.chat_service.tools.get_context(self.session_id).session_type == MERGED_SHIPPING:
-            return ("这是合发会话，请先在各单车会话登记群名和订单，再录入合发车序：\n"
-                    "  合发：车1，车2，车3\n\n"
+            return ("这是合发会话，请逐个录入车群信息：\n"
+                    "  车名 xxx，订单 xxx\n"
+                    "也可关联已登记的单车会话：合发：车1，车2，车3\n\n"
                     "支持以下指令：\n  查看合发车名 / 查看合发订单\n  给我合发清单\n  刷新合发映射\n  修改会话名称为新名称")
         return (
             "已启动。请先录入必填信息：\n"

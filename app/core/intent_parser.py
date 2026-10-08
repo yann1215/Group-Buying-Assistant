@@ -133,6 +133,8 @@ def parse_common_intent(user_text: str) -> dict[str, Any]:
 def parse_merged_shipping_intent(user_text: str) -> dict[str, Any]:
     text = normalize_text(user_text)
     result: dict[str, Any] = {"intent": "chat"}
+    if text == "合发":
+        return {"intent": "start_merged_shipping"}
     # 合发参数中的所有文字均为车名，必须先于其他参数解析。
     merge_match = re.match(r"^合发\s*[:：]([\s\S]*)$", text)
     if merge_match:
@@ -152,14 +154,27 @@ def parse_merged_shipping_intent(user_text: str) -> dict[str, Any]:
     return result
 
 
+def parse_merge_group_entry(user_text: str) -> dict[str, Any] | None:
+    text = normalize_text(user_text)
+    if not re.match(r"^(?:车群|车名|车)(?:\d+)?(?:\s|[:：])", text):
+        return None
+    match = re.fullmatch(
+        r"(?:车群|车名|车)(?:\d+)?\s*[:：]?\s*(.*?)\s*[,，;；\n]\s*"
+        r"(?:订单文件|订单|文件)\s*[:：]?\s*(.+)", text)
+    if not match or not match.group(1).strip():
+        return {"intent": "add_merge_group", "merge_group_name": "", "merge_order_input": ""}
+    return {"intent": "add_merge_group", "merge_group_name": match.group(1).strip(),
+            "merge_order_input": match.group(2).strip()}
+
+
 COMMON_INTENTS = {"chat", "rename_conversation", "unsupported"}
-MERGE_INTENTS = {"set_merge_groups", "show_merge_groups", "refresh_merge_mapping", "merge_orders"}
+MERGE_INTENTS = {"start_merged_shipping", "add_merge_group", "set_merge_groups", "show_merge_groups", "refresh_merge_mapping", "merge_orders"}
 SINGLE_INTENTS = {
     "analyze_transfers", "confirm_transfer_analysis", "cancel_transfer_analysis", "update_transfer_focus",
     "extract_chat_history",
     "set_context", "show_orders", "compare_orders", "confirm_orders", "cancel_orders",
     "show_share", "calculate_share", "update_share_config", "confirm_share_config", "cancel_share",
-    "calculate_bulk_goods", "member_check", "show_special_members", "update_special_members", "update_participation",
+    "calculate_bulk_goods", "calculate_combined", "member_check", "show_special_members", "update_special_members", "update_participation",
 }
 
 
@@ -172,7 +187,7 @@ def is_intent_allowed(intent: str, session_type: str) -> bool:
 
 def unsupported_intent_reply(session_type: str) -> str:
     if session_type == UNCLASSIFIED:
-        return "请先录入群聊名称或订单开始单车业务，或输入“合发：车1，车2”开始合发业务。"
+        return "请先录入群聊名称或订单开始单车业务，或输入“合发”开始合发业务。"
     current = SESSION_TYPE_LABELS[session_type]
     target = SESSION_TYPE_LABELS[MERGED_SHIPPING if session_type == SINGLE_CAR else SINGLE_CAR]
     return f"当前为{current}，不支持此指令。请进入{target}执行。"
@@ -194,6 +209,9 @@ def parse_user_intent(user_text: str, session_type: str = SINGLE_CAR) -> dict[st
         return parse_single_car_intent(user_text)
     if merged["intent"] != "chat":
         return merged
+    entry = parse_merge_group_entry(user_text)
+    if entry is not None:
+        return entry
     single = parse_single_car_intent(user_text)
     # 合发没有单车等待确认状态，普通肯定/取消回复仍可聊天。
     if single["intent"] not in {"chat", "confirm_share_config", "cancel_share"}:
@@ -410,6 +428,10 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
     )
 
     # 查询、取消已优先处理；金额和方式本身不能触发计算。
+
+    if re.search(r"均摊\s*(?:和\s*)?大货\s*(?:一起算|总金额)", text):
+        result["intent"] = "cancel_share" if re.search(r"不要|别|取消|暂不|不想|不用", text) else "calculate_combined"
+        return result
 
     if confirm:
         result["intent"] = "confirm_share_config"

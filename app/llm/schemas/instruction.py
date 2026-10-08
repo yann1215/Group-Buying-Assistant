@@ -10,6 +10,15 @@ class InstructionResult(BaseModel):
     chat_reply: str | None
 
     @classmethod
+    def model_json_schema_for_payload(cls, payload):
+        definition = cls.model_json_schema()
+        if payload.get("help_mode") is True:
+            # 帮助只有回答分支，生成时就禁止模型输出可执行命令。
+            definition["anyOf"] = [branch for branch in definition["anyOf"]
+                                   if branch["properties"]["status"]["const"] == "chat"]
+        return definition
+
+    @classmethod
     def model_json_schema(cls, **kwargs):
         # 将字段互斥也编码进生成约束，不能只依赖生成后的 Python 校验。
         branches = []

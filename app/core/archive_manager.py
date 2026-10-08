@@ -152,6 +152,8 @@ def archive_conversation_files(
     for output in context.get("merge_output_files") or []:
         if paths.is_within(output, paths.ORDER_OUTPUT_DIR):
             collect(output, "output", True)
+    for order in (context.get("merge_order_files") or {}).values():
+        collect(order, "input", False)
     legacy = context.get("legacy_context")
     if isinstance(legacy, dict):
         workspace = paths.get_workspace_dir(session_id)

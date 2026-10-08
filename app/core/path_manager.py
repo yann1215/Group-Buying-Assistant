@@ -18,8 +18,9 @@ TEMP_DIR = BASE_DIR / "temp"
 PRODUCT_CONFIG_SUFFIX = "_商品配置"
 SHARE_RESULT_SUFFIX = "_均摊结果"
 BULK_RESULT_SUFFIX = "_大货结果"
+COMBINED_RESULT_SUFFIX = "_均摊大货总金额"
 MEMBER_RESULT_SUFFIX = "_成员检查结果"
-RESULT_SUFFIXES = (SHARE_RESULT_SUFFIX, BULK_RESULT_SUFFIX, MEMBER_RESULT_SUFFIX)
+RESULT_SUFFIXES = (SHARE_RESULT_SUFFIX, BULK_RESULT_SUFFIX, COMBINED_RESULT_SUFFIX, MEMBER_RESULT_SUFFIX)
 
 
 def ensure_order_dirs() -> None:
@@ -98,6 +99,10 @@ def get_product_config_path(group_name: str) -> Path:
 
 def get_share_output_path(group_name: str, extension: str = ".csv") -> Path:
     return _group_file(ORDER_OUTPUT_DIR, group_name, SHARE_RESULT_SUFFIX, extension)
+
+
+def get_combined_output_path(group_name: str) -> Path:
+    return _group_file(ORDER_OUTPUT_DIR, group_name, COMBINED_RESULT_SUFFIX)
 
 
 def get_bulk_output_path(group_name: str, extension: str = ".csv") -> Path:

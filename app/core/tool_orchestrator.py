@@ -315,6 +315,8 @@ class SingleCarContext(ConversationContext):
     last_share_signature: str | None = None
     share_results_invalidated: bool = False
     legacy_share_signature: str | None = None
+    combined_stage: str | None = None
+    combined_confirmation_signature: str | None = None
     group_name: str | None = None
 
     chat_history_period: dict[str, Any] = field(default_factory=lambda: {"count": 1, "unit": "week"})
@@ -375,6 +377,8 @@ class SingleCarContext(ConversationContext):
             "last_share_signature": self.last_share_signature,
             "share_results_invalidated": self.share_results_invalidated,
             "legacy_share_signature": self.legacy_share_signature,
+            "combined_stage": self.combined_stage,
+            "combined_confirmation_signature": self.combined_confirmation_signature,
             "group_name": self.group_name,
             "chat_history_period": dict(self.chat_history_period),
             "chat_history_metadata": _to_json_safe(self.chat_history_metadata),
@@ -416,6 +420,8 @@ class SingleCarContext(ConversationContext):
             last_share_signature=data.get("last_share_signature"),
             share_results_invalidated=data.get("share_results_invalidated") is True,
             legacy_share_signature=data.get("legacy_share_signature"),
+            combined_stage=data.get("combined_stage") if data.get("combined_stage") in {"share", "bulk"} else None,
+            combined_confirmation_signature=_optional_string(data.get("combined_confirmation_signature")),
             group_name=_optional_string(data.get("group_name")),
             chat_history_period=normalize_history_period(data.get("chat_history_period")),
             chat_history_metadata=data.get("chat_history_metadata") if isinstance(data.get("chat_history_metadata"), dict) else None,
@@ -666,15 +672,27 @@ class ToolOrchestrator:
 
         self.update_context_from_intent(ctx, intent)
 
+        from app.core.combined_calculation_workflow import start_combined, confirm_combined_bulk
+        if intent["intent"] == "calculate_combined":
+            return start_combined(self, ctx, intent, progress_callback)
+        if ctx.combined_stage and intent["intent"] not in {
+            "chat", "confirm_share_config", "cancel_share", "show_share", "show_special_members",
+        }:
+            invalidate_share_confirmation(ctx)
+            ctx.bulk_request.pending_confirmation = False
+
         # 只有处于“大货等待确认”状态时，
         # 才把“是”“没问题”等识别成大货确认。
         if ctx.bulk_request.pending_confirmation:
             if has_affirmative_words(user_text):
+                if ctx.combined_stage == "bulk":
+                    return confirm_combined_bulk(self, ctx, progress_callback)
                 return self.handle_confirm_bulk_goods(ctx,progress_callback=progress_callback)
 
             if has_negative_words(user_text):
                 ctx.bulk_request.pending_confirmation = False
                 ctx.bulk_request.confirmed = False
+                invalidate_share_confirmation(ctx)
 
                 # 清除可能遗留的强制计算状态
                 ctx.share_request.force = False
@@ -713,6 +731,11 @@ class ToolOrchestrator:
             return self.handle_show_share(ctx)
 
         if intent["intent"] == "cancel_share":
+            if ctx.combined_stage:
+                ctx.bulk_request.pending_confirmation = False
+                ctx.bulk_request.confirmed = False
+                invalidate_share_confirmation(ctx)
+                return '已取消本次均摊和大货合并计算；修改配置后请重新输入“均摊大货一起算”。'
             if ctx.share_request.pending_config_confirmation or ctx.share_request.config_confirmed:
                 invalidate_share_confirmation(ctx)
                 return '已取消本次均摊计算；修改配置后请重新输入“算均摊”。'
@@ -1327,20 +1350,31 @@ class ToolOrchestrator:
         if not req.pending_config_confirmation:
             return '当前没有待确认的商品均摊配置，请先输入“算均摊”。'
         if not req.confirmation_signature or req.confirmation_signature != share_signature(ctx):
+            if ctx.combined_stage == "share":
+                from app.core.combined_calculation_workflow import start_combined
+                return "商品配置或订单已变化，请重新确认。\n\n" + start_combined(self, ctx, {}, progress_callback)
             return "商品配置或订单已变化，请重新确认。\n\n" + self.handle_calculate_share(ctx, {})
         req.pending_config_confirmation = False
         req.config_confirmed = True
+        if ctx.combined_stage == "share":
+            from app.core.combined_calculation_workflow import combined_signature
+            reply = self.handle_calculate_bulk_goods(ctx)
+            ctx.combined_stage = "bulk"
+            ctx.combined_confirmation_signature = combined_signature(ctx)
+            return "均摊配置已确认。\n\n" + reply
         return self.execute_confirmed_share(ctx, progress_callback)
 
     def execute_confirmed_share(self, ctx: SessionToolContext,
-                                progress_callback: Callable[[str], None] | None = None) -> str:
+                                progress_callback: Callable[[str], None] | None = None,
+                                check_result: dict[str, Any] | None = None) -> str:
         req = ctx.share_request
         force = req.force
         req.force = False
         if not req.config_confirmed or not req.confirmation_signature or req.confirmation_signature != share_signature(ctx):
             return self.handle_calculate_share(ctx, {}, progress_callback)
         # 仅复用 3 分钟内且订单、成员及商品参摊设置未变化的核对结果。
-        check_result = self.ensure_member_checked(ctx, progress_callback=progress_callback)
+        if check_result is None:
+            check_result = self.ensure_member_checked(ctx, progress_callback=progress_callback)
         if not check_result.get("ok"):
             return format_member_check_result(check_result)
         if req.confirmation_signature != share_signature(ctx):
@@ -1393,6 +1427,8 @@ class ToolOrchestrator:
 
 
 def invalidate_share_confirmation(ctx: SessionToolContext) -> None:
+    ctx.combined_stage = None
+    ctx.combined_confirmation_signature = None
     req = ctx.share_request
     req.pending_config_confirmation = False
     req.config_confirmed = False

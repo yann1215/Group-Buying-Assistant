@@ -53,11 +53,12 @@ class MergedShippingContext(ConversationContext):
     merge_source_ids: list[int | None] = field(default_factory=list)
     merge_title: str | None = None
     merge_output_files: list[str] = field(default_factory=list)
+    merge_order_files: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.common_data(), merge_groups=list(self.merge_groups),
                     merge_source_ids=list(self.merge_source_ids), merge_title=self.merge_title,
-                    merge_output_files=list(self.merge_output_files))
+                    merge_output_files=list(self.merge_output_files), merge_order_files=dict(self.merge_order_files))
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MergedShippingContext":
@@ -74,4 +75,7 @@ class MergedShippingContext(ConversationContext):
             merge_source_ids=[item if type(item) is int and item > 0 else None for item in ids]
             if isinstance(ids, list) else [],
             merge_title=data.get("merge_title"), merge_output_files=strings("merge_output_files"),
+            merge_order_files={key: value for key, value in (data.get("merge_order_files") or {}).items()
+                               if isinstance(key, str) and isinstance(value, str)}
+            if isinstance(data.get("merge_order_files", {}), dict) else {},
         )
