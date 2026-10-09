@@ -593,8 +593,8 @@ class ChatService:
         """
         将数据库中的四个订单版本同步到运行时工具上下文。
 
-        只有新订单变化时才清除依赖订单内容的运行时缓存；旧订单和缓存
-        版本只用于历史比较，不影响当前成员检查、均摊或大货计算。
+        新订单变化时清除成员检查缓存和待确认操作，保留已完成的均摊、
+        大货结果及参数；后续指令只更新对应阶段的数据。
         """
         ctx = self.tools.get_context(session_id)
         if ctx.session_type != SINGLE_CAR:
@@ -606,14 +606,15 @@ class ChatService:
             setattr(ctx, field_name, value or None)
 
         if old_new_order != str(ctx.new_order_file or ""):
-            invalidate_share_confirmation(ctx)
+            invalidate_share_confirmation(ctx, invalidate_result=False)
             ctx.member_checked = False
             ctx.member_check_result = None
+            ctx.member_checked_at = None
+            ctx.member_check_signature = None
             ctx.parsed_order_file = None
             # 配置属于当前车的持久文件，换订单后仍保留其路径和手工设置。
             ctx.product_configs = None
             ctx.bulk_request.pending_confirmation = False
-            ctx.bulk_request.confirmed = False
 
     @staticmethod
     def _format_order_update_result(

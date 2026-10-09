@@ -21,9 +21,8 @@ def combined_signature(ctx):
 
 def start_combined(tools, ctx, intent, progress_callback=None):
     from app.core.tool_orchestrator import invalidate_share_confirmation
-    invalidate_share_confirmation(ctx)
+    invalidate_share_confirmation(ctx, invalidate_result=False)
     ctx.bulk_request.pending_confirmation = False
-    ctx.bulk_request.confirmed = False
     tools.update_share_request_from_intent(ctx, intent)
     ctx.share_request.force = False
     if intent.get("product_share_amounts") or any(
@@ -59,19 +58,23 @@ def confirm_combined_bulk(tools, ctx, progress_callback=None):
         return restart()
     if not check_result.get("ok") or check_result.get("blocking_issues") or get_blocking_member_issues(check_result):
         ctx.bulk_request.pending_confirmation = False
-        invalidate_share_confirmation(ctx)
+        invalidate_share_confirmation(ctx, invalidate_result=False)
         return "成员核对未通过，暂不计算均摊和大货。\n\n" + format_member_check_result(check_result)
+    previous_share_result = ctx.last_share_result
     share_reply = tools.execute_confirmed_share(ctx, progress_callback, check_result=check_result)
     ctx.bulk_request.pending_confirmation = False
-    if ctx.share_results_invalidated or not ctx.last_share_result or not ctx.last_share_signature:
+    if (ctx.last_share_result is previous_share_result or ctx.share_results_invalidated
+            or not ctx.last_share_result or not ctx.last_share_signature):
         return share_reply
     emit_progress(progress_callback, "正在计算大货……")
     bulk_result = create_bulk_receivable_orders(ctx.parsed_order_file, ctx.group_name)
     if not bulk_result.get("ok"):
         return str(bulk_result.get("message") or "大货计算失败。")
+    bulk_result["source_order_file"] = ctx.new_order_file
+    ctx.last_bulk_result = bulk_result
+    ctx.bulk_request.confirmed = True
     emit_progress(progress_callback, "正在生成均摊与大货总金额表……")
     result = create_combined_receivable_orders(ctx.last_share_result, bulk_result, ctx.group_name)
-    ctx.bulk_request.confirmed = True
     lines = ["均摊和大货总金额表已生成。", f"成员数量：{result['order_count']}",
              f"结果文件：{result['result_file']}", "", "| " + " | ".join(COMBINED_FIELDS) + " |",
              "| " + " | ".join(["---"] * len(COMBINED_FIELDS)) + " |"]

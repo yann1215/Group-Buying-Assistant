@@ -37,30 +37,17 @@ def compare_orders(old_file, new_file, group_name, expected_signatures=None, *, 
                 tables.append((fields, rows))
     (old_fields, old), (new_fields, new) = tables
     changes = []
-    fields = list(dict.fromkeys(old_fields + new_fields))
+    fields = [field for field in dict.fromkeys(old_fields + new_fields)
+              if field not in {"单号", "昵称", "总金额"}]
     for key in sorted(set(old) | set(new), key=int):
-        if key not in old or key not in new:
-            kind = "新增订单" if key in new else "删除订单"
-            row = new.get(key) or old[key]
-            for field in fields:
-                if field != "单号" and row.get(field, ""):
-                    changes.append((kind, key, field, old.get(key, {}).get(field, ""), new.get(key, {}).get(field, "")))
-        else:
-            for field in fields:
-                if field == "单号":
-                    continue
-                before, after = old[key].get(field, ""), new[key].get(field, "")
-                # 缺失的商品列代表该商品数量为零。
-                if field not in {"昵称", "总金额"}:
-                    before, after = before or "0", after or "0"
-                if before != after:
-                    changes.append(("修改订单", key, field, before, after))
-    # 即使商品全为零，新增或删除商品列也需要记录。
-    for field in fields:
-        if field not in old_fields:
-            changes.append(("新增商品", "", "商品名称", "", field))
-        elif field not in new_fields:
-            changes.append(("删除商品", "", "商品名称", field, ""))
+        kind = "新增订单" if key not in old else "删除订单" if key not in new else "修改订单"
+        old_row, new_row = old.get(key, {}), new.get(key, {})
+        for field in fields:
+            # 缺失的订单、商品列及空数量均按零计算。
+            before = int(old_row.get(field) or "0")
+            after = int(new_row.get(field) or "0")
+            if before != after:
+                changes.append((kind, key, new_row.get("昵称", ""), field, before, after, after - before))
     if [file_signature(value) for value in (old_file, new_file)] != signatures:
         raise ValueError("比较期间订单文件发生变化，请重新输入比较订单并确认")
     directory = paths.ORDERS_DIR / "comparisons"
@@ -77,12 +64,11 @@ def compare_orders(old_file, new_file, group_name, expected_signatures=None, *, 
             index += 1
     with stream:
         writer = csv.writer(stream)
-        writer.writerow(["群聊名称", "旧订单", "新订单", "比较方向", "差异类型", "单号", "变化字段", "旧值", "新值"])
-        for change in changes or [("无差异", "", "", "", "")]:
-            writer.writerow([group_name, str(old_file), str(new_file), "旧订单 → 新订单", *change])
+        writer.writerow(["修改类型", "单号", "昵称", "变动商品", "旧值", "新值", "变化量"])
+        writer.writerows(changes)
     counts = Counter(kind for kind, *_ in changes)
     summary = "；".join(f"{kind}：{len({row[1] for row in changes if row[0] == kind})} 单" if kind.endswith("订单") else f"{kind}：{count} 项"
-                        for kind, count in counts.items()) or "未发现变化"
+                        for kind, count in counts.items()) or "未发现商品变化"
     message = f"订单比较完成。{summary}。\n报告：{target.resolve()}"
     result = {"values": [str(Path(value).resolve()) for value in (old_file, new_file)],
               "signatures": signatures, "group_name": group_name,

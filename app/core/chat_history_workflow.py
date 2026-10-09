@@ -74,9 +74,9 @@ def parse_history_command(text):
         return None
     if not re.search(r"聊天(?:记录|消息)", compact):
         return None
-    if not re.search(r"提取|获取|导出|查询|查找|查看|搜索|检索|拉取|找出|给我|帮我查", compact):
+    if not re.search(r"提取|获取|导出|查|搜索|检索|拉取|找出|给我", compact):
         return None
-    if re.search(r"(?:不(?:要|用|需要|想)?|取消|别)(?:再)?(?:提取|获取|导出|查询|查看|搜索)", compact):
+    if re.search(r"(?:不(?:要|用|需要|想)?|取消|暂不|别)(?:再)?(?:提取|获取|导出|查|搜索|检索|拉取|找出)", compact):
         return None
     result = {"intent": "extract_chat_history"}
     # 群名中的数字、时间词不参与范围解析。

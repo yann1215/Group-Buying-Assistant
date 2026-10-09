@@ -312,6 +312,7 @@ class SingleCarContext(ConversationContext):
     session_type = SINGLE_CAR
     config_owner_id: str = field(default_factory=lambda: uuid4().hex)
     last_share_result: dict[str, Any] | None = None
+    last_bulk_result: dict[str, Any] | None = None
     last_share_signature: str | None = None
     share_results_invalidated: bool = False
     legacy_share_signature: str | None = None
@@ -374,6 +375,7 @@ class SingleCarContext(ConversationContext):
             "pending_participation": _to_json_safe(self.pending_participation),
             "config_owner_id": self.config_owner_id,
             "last_share_result": _to_json_safe(self.last_share_result),
+            "last_bulk_result": _to_json_safe(self.last_bulk_result),
             "last_share_signature": self.last_share_signature,
             "share_results_invalidated": self.share_results_invalidated,
             "legacy_share_signature": self.legacy_share_signature,
@@ -417,6 +419,7 @@ class SingleCarContext(ConversationContext):
             pending_participation=data.get("pending_participation") if isinstance(data.get("pending_participation"), dict) else None,
             config_owner_id=str(data.get("config_owner_id") or uuid4().hex),
             last_share_result=data.get("last_share_result") if isinstance(data.get("last_share_result"), dict) else None,
+            last_bulk_result=data.get("last_bulk_result") if isinstance(data.get("last_bulk_result"), dict) else None,
             last_share_signature=data.get("last_share_signature"),
             share_results_invalidated=data.get("share_results_invalidated") is True,
             legacy_share_signature=data.get("legacy_share_signature"),
@@ -678,7 +681,7 @@ class ToolOrchestrator:
         if ctx.combined_stage and intent["intent"] not in {
             "chat", "confirm_share_config", "cancel_share", "show_share", "show_special_members",
         }:
-            invalidate_share_confirmation(ctx)
+            invalidate_share_confirmation(ctx, invalidate_result=False)
             ctx.bulk_request.pending_confirmation = False
 
         # 只有处于“大货等待确认”状态时，
@@ -691,8 +694,7 @@ class ToolOrchestrator:
 
             if has_negative_words(user_text):
                 ctx.bulk_request.pending_confirmation = False
-                ctx.bulk_request.confirmed = False
-                invalidate_share_confirmation(ctx)
+                invalidate_share_confirmation(ctx, invalidate_result=False)
 
                 # 清除可能遗留的强制计算状态
                 ctx.share_request.force = False
@@ -733,11 +735,10 @@ class ToolOrchestrator:
         if intent["intent"] == "cancel_share":
             if ctx.combined_stage:
                 ctx.bulk_request.pending_confirmation = False
-                ctx.bulk_request.confirmed = False
-                invalidate_share_confirmation(ctx)
+                invalidate_share_confirmation(ctx, invalidate_result=False)
                 return '已取消本次均摊和大货合并计算；修改配置后请重新输入“均摊大货一起算”。'
             if ctx.share_request.pending_config_confirmation or ctx.share_request.config_confirmed:
-                invalidate_share_confirmation(ctx)
+                invalidate_share_confirmation(ctx, invalidate_result=False)
                 return '已取消本次均摊计算；修改配置后请重新输入“算均摊”。'
             return None
 
@@ -1010,7 +1011,6 @@ class ToolOrchestrator:
         # ---------------------------------
 
         ctx.bulk_request.pending_confirmation = True
-        ctx.bulk_request.confirmed = False
 
         lines = [
             "大货计算前请确认以下信息。",
@@ -1180,6 +1180,10 @@ class ToolOrchestrator:
         )
 
         ctx.bulk_request.pending_confirmation = False
+        if not result.get("ok"):
+            return str(result.get("message") or "大货计算失败。")
+        result["source_order_file"] = ctx.new_order_file
+        ctx.last_bulk_result = result
         ctx.bulk_request.confirmed = True
 
         # 一个完整业务计算已经结束，清除可能残留的“先算”状态
@@ -1328,7 +1332,7 @@ class ToolOrchestrator:
 
     def handle_calculate_share(self, ctx: SessionToolContext, intent: dict[str, Any],
                                progress_callback: Callable[[str], None] | None = None) -> str:
-        invalidate_share_confirmation(ctx)
+        invalidate_share_confirmation(ctx, invalidate_result=False)
         error = self.prepare_share_config(ctx)
         if error:
             return error
@@ -1395,12 +1399,14 @@ class ToolOrchestrator:
             product_configs=ctx.product_configs, group_name=ctx.group_name,
             excluded_order_nos=get_non_share_order_nos(ctx.special_members),
         )
-        invalidate_share_confirmation(ctx)
+        invalidate_share_confirmation(ctx, invalidate_result=False)
         if not result.get("ok"):
             return format_share_need_user_input(result) if result.get("need_user_input") else str(result.get("message") or "均摊计算失败。")
         update_product_config_after_share(ctx.share_config_file, result.get("product_configs") or [])
         ctx.product_configs = load_product_share_config_file(ctx.share_config_file)
         result["product_configs"] = ctx.product_configs
+        result["source_order_file"] = ctx.new_order_file
+        result["special_members"] = _to_json_safe(ctx.special_members)
         ctx.last_share_result = result
         ctx.share_results_invalidated = False
         ctx.last_share_signature = share_signature(ctx, include_members=True)
@@ -1408,25 +1414,28 @@ class ToolOrchestrator:
 
     def handle_show_share(self, ctx: SessionToolContext) -> str:
         # 只读：不准备订单、不写配置、不检查成员、不生成结果文件。
-        signature = share_signature(ctx, include_members=True)
-        if ctx.last_share_result and signature and signature == ctx.last_share_signature:
-            return format_share_summary(ctx.last_share_result, ctx.special_members)
+        # 已完成结果属于计算时的订单快照，换订单或计算大货不使其失效。
+        if ctx.last_share_result and not ctx.share_results_invalidated:
+            return format_share_summary(
+                ctx.last_share_result,
+                ctx.last_share_result.get("special_members", ctx.special_members),
+            )
         configs = []
         if ctx.share_config_file and owns_product_config(ctx.share_config_file, ctx.config_owner_id):
             if Path(ctx.share_config_file).is_file():
                 configs = load_product_share_config_file(ctx.share_config_file)
-        legacy_changed = bool(ctx.legacy_share_signature and ctx.legacy_share_signature != signature)
-        if not ctx.last_share_result and not ctx.share_results_invalidated and not legacy_changed:
+        if not ctx.last_share_result and not ctx.share_results_invalidated:
             historical = format_legacy_share_summary(configs)
             if historical:
                 return historical
-        stale = bool(ctx.last_share_result or legacy_changed or (
+        stale = bool(ctx.last_share_result or (
             ctx.share_results_invalidated and any(c.get("单份均摊") not in (None, "") for c in configs)))
         status = "原计算结果已失效，请重新计算。" if stale else "尚未计算均摊。"
         return status + "\n" + format_pending_share_summary(ctx, configs)
 
 
-def invalidate_share_confirmation(ctx: SessionToolContext) -> None:
+def invalidate_share_confirmation(ctx: SessionToolContext, *, invalidate_result: bool = True) -> None:
+    """取消待确认操作；仅均摊参数变化等场景使已完成结果失效。"""
     ctx.combined_stage = None
     ctx.combined_confirmation_signature = None
     req = ctx.share_request
@@ -1434,8 +1443,9 @@ def invalidate_share_confirmation(ctx: SessionToolContext) -> None:
     req.config_confirmed = False
     req.confirmation_signature = None
     req.force = False
-    ctx.last_share_signature = None
-    ctx.share_results_invalidated = True
+    if invalidate_result:
+        ctx.last_share_signature = None
+        ctx.share_results_invalidated = True
 
 
 def share_signature(ctx: SessionToolContext, *, include_members: bool = False) -> str | None:
@@ -1542,8 +1552,8 @@ def format_share_summary(result: dict[str, Any], special_members: list[dict[str,
     else:
         lines.append(f"参摊个数：{result['total_share_quantity']} 个")
         for c in products:
-            suffix = "" if c["included"] else "（不参摊）"
-            lines.append(f"- {c['product_name']}：{c['quantity']} 个{suffix}")
+            if c["included"]:
+                lines.append(f"- {c['product_name']}：{c['quantity']} 个")
     if special_members is not None:
         lines.append("不参摊说明：" + format_non_share_special_member_note(special_members))
         lines.append("")

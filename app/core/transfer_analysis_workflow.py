@@ -113,9 +113,9 @@ def confirmation_message(snapshot, prefix=""):
             f"比对方向：旧订单 → 新订单（{report_mode}）\n"
             f"聊天记录：{chat['start']} 至 {chat['end']}（北京时间，{chat_mode}）\n"
             f"特别关注：{focus}\n\n"
-            "回复“确认分析”执行（也支持“确认”“是”“yes”“y”“1”“对”“无误”“没问题”）；"
+            "回复“确认分析”执行，或回复“取消分析”取消。\n"
             "可先修改订单、获取其他时间的聊天记录，或输入“特别关注：商品A缺少3件；商品B数量异常”。"
-            "回复“取消分析”取消。\n" + HISTORY_HINT)
+            "\n" + HISTORY_HINT)
 
 
 def execute_analysis(tools, ctx, snapshot, progress_callback):

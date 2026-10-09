@@ -179,7 +179,7 @@ class TransferAnalyzer:
         differences = payload["differences"]
         numeric = {}
         for row in differences:
-            serial, field = row.get("单号"), row.get("变化字段")
+            serial, field = row.get("单号"), row.get("变动商品") or row.get("变化字段")
             if field not in products or not serial:
                 continue
             before = quantity(old.get(serial, {}).get(field, "0"))

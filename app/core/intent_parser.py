@@ -309,8 +309,9 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
     if not text:
         return result
 
-    if re.search(r"(?:比对转单记录|分析转单记录|查找转单异常)", text) and not re.search(
-            r"(?:不要|取消|暂不|别)\s*(?:比对转单记录|分析转单记录|查找转单异常)", text):
+    transfer_command = r"(?:比对转单记录|分析转单记录|查找转单异常|查转单记录|查转单异常)"
+    if re.search(transfer_command, text) and not re.search(
+            rf"(?:不(?:要|用|需要|想)?|取消|暂不|别)\s*(?:再\s*)?{transfer_command}", text):
         result["intent"] = "analyze_transfers"
         return result
     if text == "确认分析":
@@ -1451,10 +1452,18 @@ def parse_order_input(text: str) -> str | None:
 
 
 def parse_order_entries(text: str) -> list[dict[str, Any]]:
-    """仅识别完整录入分句；双订单角色由版本管理层决定。"""
+    """识别录入分句及共用“订单”前缀的逗号列表；角色由版本管理层决定。"""
     entries = []
-    for clause in re.split(r"[，,；;\n]+", text):
+    shared_prefix = False
+    parts = re.split(r"([，,；;\n]+)", text)
+    context_pattern = "|".join(re.escape(keyword) for keyword in sorted(
+        CONTEXT_FIELD_KEYWORDS + ["新订单", "旧订单"], key=len, reverse=True))
+    for index in range(0, len(parts), 2):
+        clause = parts[index]
+        if index and re.fullmatch(r"[，,]+", parts[index - 1]) is None:
+            shared_prefix = False
         if re.match(r"\s*订单(?:文件|表|路径|目录)", clause):
+            shared_prefix = False
             continue
         match = re.fullmatch(
             r"\s*(新订单|旧订单|订单)(?:([0-2])(?!\d))?\s*(?:是|为|：|:|=)?\s*(.+?)\s*", clause)
@@ -1462,7 +1471,14 @@ def parse_order_entries(text: str) -> list[dict[str, Any]]:
             label, number, value = match.groups()
             # 未支持的序号不作为录入标签；数字开头的普通文件名需加空格。
             if label == "订单" and number is None and re.match(r"订单(?:[3-9]|[0-2]\d)", clause.strip()):
+                shared_prefix = False
                 continue
             entries.append({"label": label, "number": int(number) if number else None,
                             "value": value.strip().strip('"\'').strip()})
+            shared_prefix = label == "订单" and number is None
+        elif shared_prefix and clause.strip() and not re.match(rf"\s*(?:{context_pattern})", clause):
+            entries.append({"label": "订单", "number": None,
+                            "value": clause.strip().strip('"\'').strip()})
+        else:
+            shared_prefix = False
     return entries
