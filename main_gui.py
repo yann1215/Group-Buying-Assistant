@@ -686,7 +686,8 @@ class ChatWindow(QMainWindow):
             QMessageBox.warning(self, "清空草稿失败", f"{type(exc).__name__}: {exc}")
             return
 
-        self.append_message("user", user_text)
+        from app.core.key_commands import redact_key_update_command
+        self.append_message("user", redact_key_update_command(user_text))
         self.input_box.clear()
         self._draft_timer.stop()
         self._draft_dirty = False

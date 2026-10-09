@@ -7,6 +7,7 @@ import re
 from typing import Any, Callable
 
 from app.core.intent_parser import parse_user_intent, MERGE_INTENTS
+from app.core.key_commands import parse_key_update_command, redact_key_update_command
 from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, UNCLASSIFIED, MergedShippingContext, validate_session_type
 from app.core.order_version_manager import (
     ORDER_VERSION_FIELDS,
@@ -102,7 +103,7 @@ class ChatService:
         return load_session_draft(session_id)
 
     def save_conversation_draft(self, session_id: int, text: str) -> None:
-        save_session_draft(session_id, text)
+        save_session_draft(session_id, "" if parse_key_update_command(text) is not None else text)
 
     def load_conversation(
         self,
@@ -251,8 +252,16 @@ class ChatService:
         add_message(
             session_id=session_id,
             role="user",
-            content=user_text,
+            content=redact_key_update_command(user_text),
         )
+
+        key_value = parse_key_update_command(user_text)
+        if key_value is not None:
+            from integrations.wechatmsg_lite_client import update_wechat_database_key
+            result = update_wechat_database_key(key_value, key_input_func=self.tools.key_input_func)
+            reply = result["message"]
+            add_message(session_id=session_id, role="assistant", content=reply)
+            return reply
 
         intent = parse_user_intent(user_text, self.tools.get_context(session_id).session_type)
         ctx = self.tools.get_context(session_id)

@@ -73,6 +73,22 @@ def ensure_wechat_database_key(
     )
 
 
+def update_wechat_database_key(
+    key: str = "",
+    key_input_func: Callable[[str], str] | None = None,
+    decrypt_output_root: str = f"{PROJECT_ROOT}/temp",
+) -> dict[str, Any]:
+    _ensure_wechatmsg_lite_path()
+    from wxManager.decrypt_runner import ensure_cached_decrypt_key
+
+    return ensure_cached_decrypt_key(
+        output_root=decrypt_output_root,
+        key_input_func=key_input_func,
+        force_update=True,
+        initial_key=key,
+    )
+
+
 def get_wechat_group_members(
     group_name: str,
     db_dir: str | None = None,
