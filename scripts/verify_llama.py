@@ -42,6 +42,12 @@ def main():
         if (analyzer.last_result["quantity_checks"]["D00001"]["event_delta"] != -1
                 or analyzer.last_result["quantity_checks"]["D00002"]["event_delta"] != 1):
             raise ValueError("样例的转单净数量未正确识别。")
+        if len(analyzer.last_result["findings"]) != 2 or {ref for finding in analyzer.last_result["findings"] if finding.get("quantity_status") == "consistent"
+                for ref in finding["order_refs"]} != {"D00001", "D00002"}:
+            raise ValueError("样例的两条订单差异净数量未被完整核对。")
+        if any(f["status"] != "unresolved" or f["relationship_status"] != "unverified"
+               for f in analyzer.last_result["findings"]):
+            raise ValueError("净数量一致不能当作关系已核实。")
         print("Both local inference modules verified.", flush=True)
     finally:
         client.close()

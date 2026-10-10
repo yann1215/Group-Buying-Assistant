@@ -14,7 +14,7 @@ from app.core.path_manager import get_chat_history_path, get_workspace_dir, is_w
 from integrations.wechatmsg_lite_client import get_wechat_group_messages
 
 DEFAULT_HISTORY_PERIOD = {"count": 1, "unit": "week"}
-HISTORY_KEYWORDS = ("转单", "转", "接", "合单", "合", "核弹", "给", "掰", "吐")
+HISTORY_KEYWORDS = ("转单", "转", "接", "合单", "合", "核弹", "给", "掰", "吐", "分", "姐", "截", "收", "1", "已")
 HISTORY_MESSAGE_TYPES = {"文本", "引用消息"}
 UNIT_LABELS = {"hour": "小时", "day": "天", "week": "周", "month": "个月", "year": "年"}
 TIME_ERROR = "无法识别聊天记录时间，请使用“近7天”“时间1个月”或“从9.1开始”等格式。原时间设置未修改。"
@@ -137,7 +137,7 @@ def history_time_range(period, now=None):
 
 
 def filter_history_csv(path):
-    """筛选文本或引用消息，并移除消息ID、备注列。"""
+    """筛选文本或引用消息，保留消息ID，仅移除备注列。"""
     with path.open("r", encoding="utf-8-sig", newline="") as source:
         reader = csv.reader(source)
         header = next(reader, None)
@@ -147,7 +147,7 @@ def filter_history_csv(path):
             raise ValueError("导出文件缺少“类型”列")
         content_index = header.index("内容")
         type_index = header.index("类型")
-        output_indices = [index for index, name in enumerate(header) if name not in {"消息ID", "备注"}]
+        output_indices = [index for index, name in enumerate(header) if name != "备注"]
         rows = []
         total = 0
         for row in reader:
@@ -167,7 +167,7 @@ def filter_history_csv(path):
 
 
 def publish_history_files(files, staging):
-    """两份文件都准备完毕后更新；写入失败时回滚已经更新的文件。"""
+    """所有文件准备完毕后更新；写入失败时回滚已经更新的文件。"""
     backups = {}
     for index, (_, destination) in enumerate(files):
         if destination.exists():
@@ -232,7 +232,13 @@ def handle_chat_history(tools, ctx, intent, progress_callback=None, *, time_rang
             filtered_path = Path(staging) / "filtered.csv"
             shutil.copyfile(path, filtered_path)
             total, kept = filter_history_csv(filtered_path)
-            publish_history_files([(path, raw_destination), (filtered_path, destination)], staging)
+            if progress_callback:
+                progress_callback("正在从聊天记录提取转单记录……")
+            from app.core.transfer_extraction_workflow import prepare_transfer_extraction
+            extraction = prepare_transfer_extraction(ctx, filtered_path, staging)
+            publish_history_files([(path, raw_destination), (filtered_path, destination),
+                                   *[(Path(staging) / name, workspace / name)
+                                     for name in extraction["files"]]], staging)
         from app.analysis.order_compare import file_signature
         ctx.chat_history_metadata = {
             "group_name": ctx.group_name, "room_wxid": room[1],
@@ -240,6 +246,7 @@ def handle_chat_history(tools, ctx, intent, progress_callback=None, *, time_rang
             "raw_path": str(raw_destination.resolve()), "filtered_path": str(destination.resolve()),
             "filtered_signature": file_signature(destination), "raw_signature": file_signature(raw_destination),
             "total": total, "kept": kept,
+            "transfer_extraction": extraction,
         }
         if structured:
             return dict(ctx.chat_history_metadata)
@@ -247,6 +254,12 @@ def handle_chat_history(tools, ctx, intent, progress_callback=None, *, time_rang
         return (f"聊天记录已提取并筛选。\n当前时间设置：{label}（后续沿用）。"
                 f"\n查询范围：{start} 至 {end}（北京时间）。"
                 f"\n共{total}条，保留{kept}条。{empty}"
-                f"\n未筛选文件：{raw_destination.resolve()}\n筛选文件：{destination.resolve()}")
+                f"\n未筛选文件：{raw_destination.resolve()}\n筛选文件：{destination.resolve()}"
+                f"\n转单提取完成：转单记录{extraction['counts']['transfer_records.csv']}条，"
+                f"候选发起{extraction['counts']['candidate_initiations.csv']}条，"
+                f"候选接收{extraction['counts']['candidate_receipts.csv']}条，"
+                f"转单待核实{extraction['counts']['needs_review']}条。"
+                + "".join(f"\n{name}：{workspace / name}" for name in extraction["files"])
+                + ("\n" + "；".join(extraction["warnings"]) if extraction["warnings"] else ""))
     except (OSError, ValueError, RuntimeError) as error:
         return f"聊天记录提取失败：{error}。\n当前时间设置：{label}。"

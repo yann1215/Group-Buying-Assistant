@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from uuid import uuid4
 from datetime import datetime
 from pathlib import Path
 from zipfile import BadZipFile
@@ -171,7 +172,14 @@ def execute_analysis(tools, ctx, snapshot, progress_callback):
     if progress_callback:
         progress_callback("正在分析转单记录……")
     try:
-        result = tools.transfer_analysis_client.analyze(payload)
+        from app.llm.transfer_analyzer import TransferAnalyzer
+        if isinstance(tools.transfer_analysis_client, TransferAnalyzer):
+            diagnostics_dir = path.parent / "transfer_diagnostics" / uuid4().hex
+            files += f"\n分析诊断目录：{diagnostics_dir}"
+            result = tools.transfer_analysis_client.analyze(payload, progress_callback=progress_callback,
+                                                             diagnostics_dir=diagnostics_dir)
+        else:
+            result = tools.transfer_analysis_client.analyze(payload)
         if not isinstance(result, str) or not result.strip():
             raise ValueError("接口未返回有效的分析结果文本")
     except Exception as error:

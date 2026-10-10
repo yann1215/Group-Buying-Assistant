@@ -11,9 +11,9 @@ from pathlib import Path
 
 from app.analysis.order_parser import parse_order_file
 from app.analysis.order_compare import file_signature
-from app.config import DEFAULT_MODEL, get_resource_path, TRANSFER_MAX_TOKENS
+from app.config import DEFAULT_MODEL, get_resource_path
 from app.llm.knowledge import load_knowledge, select_transfer_knowledge
-from app.llm.schemas.transfer import TransferResult
+from app.llm.transfer_batches import BatchRunner
 
 
 def csv_rows(text):
@@ -51,17 +51,16 @@ def prepare_analysis_payload(payload, metadata):
     return payload
 
 
-def bounded_batches(rows, limit=6000, overlap=0):
+def bounded_batches(rows, limit=6000, overlap=0, max_rows=None):
     batch = []
     size = 0
     for row in rows:
         length = len(json.dumps(row, ensure_ascii=False))
-        if length > limit:
-            raise ValueError("单条分析资料过长，不能完整放入模型上下文。")
-        if batch and size + length > limit:
+        if batch and (size + length > limit or max_rows is not None and len(batch) >= max_rows):
             yield batch
             batch = batch[-overlap:] if overlap else []
-            while batch and sum(len(json.dumps(r, ensure_ascii=False)) for r in batch) + length > limit:
+            while batch and (sum(len(json.dumps(r, ensure_ascii=False)) for r in batch) + length > limit
+                             or max_rows is not None and len(batch) >= max_rows):
                 batch.pop(0)
             size = sum(len(json.dumps(r, ensure_ascii=False)) for r in batch)
         batch.append(row)
@@ -94,9 +93,10 @@ class TransferAnalyzer:
         self.client = client
         self.last_result = None
 
-    def analyze(self, payload):
+    def analyze(self, payload, progress_callback=None, diagnostics_dir=None):
         self.last_result = None
-        prompt = get_resource_path("app/llm/prompts/transfer.md").read_text(encoding="utf-8")
+        prompts = {stage: get_resource_path(f"app/llm/prompts/transfer_{stage}.md").read_text(encoding="utf-8")
+                   for stage in ("extract", "review")}
         knowledge = select_transfer_knowledge(payload["knowledge"]["entries"], json.dumps(
             {"messages": payload["messages"], "focus_products": payload["focus_products"], "orders": payload["orders"]},
             ensure_ascii=False))
@@ -110,20 +110,43 @@ class TransferAnalyzer:
         if len(json.dumps(base, ensure_ascii=False)) > 12000:
             raise ValueError("订单身份或知识资料过长，请缩小分析范围。未静默截断资料。")
         messages = payload["messages"]
-        events, seen, limitations, model_notes = [], set(), [], []
-        for batch in bounded_batches(messages, overlap=3):
-            result = self.client.structured(prompt, {**base, "stage": "extract", "messages": batch},
-                                            TransferResult, max_tokens=TRANSFER_MAX_TOKENS)
-            if result.stage != "extract":
-                raise ValueError("模型返回错误的分析阶段。")
-            check_refs(result, batch, [], knowledge)
+        known_orders = {r["单号"] for rows in orders.values() for r in rows}
+
+        def validate(result, batch_messages, differences, rules):
+            check_refs(result, batch_messages, differences, rules)
+            reviewed = [ref for finding in result.findings for ref in finding.order_refs]
+            if len(reviewed) != len(set(reviewed)):
+                raise ValueError("模型重复核查同一订单差异，不能合并矛盾结论")
             for event in result.events:
-                item = event.model_dump()
-                key = json.dumps(item, ensure_ascii=False, sort_keys=True)
-                if key not in seen:
-                    seen.add(key)
-                    events.append(item)
-            model_notes.extend(result.limitations)
+                if any(serial is not None and serial not in known_orders
+                       for serial in (event.sender_order, event.receiver_order)):
+                    raise ValueError("模型编造了订单单号")
+                if event.product is not None and event.product not in products:
+                    raise ValueError("模型编造了商品名称")
+
+        runner = BatchRunner(self.client, prompts, validate, diagnostics_dir, progress_callback)
+        events, seen, limitations, model_notes = [], set(), [], []
+        message_batches = list(bounded_batches(messages, limit=3000, overlap=3, max_rows=12))
+        for index, batch in enumerate(message_batches, 1):
+            if progress_callback:
+                progress_callback(f"正在提取转单事件：第 {index}/{len(message_batches)} 批聊天……")
+            for result in runner.run({**base, "stage": "extract", "messages": batch}):
+                for event in result.events:
+                    item = event.model_dump()
+                    # 相同事件的不同说明和引用顺序不能变成新事件。
+                    key = json.dumps({k: sorted(v) if k == "message_refs" else v
+                                      for k, v in item.items() if k not in {"explanation", "knowledge_refs"}},
+                                     ensure_ascii=False, sort_keys=True)
+                    if key not in seen:
+                        seen.add(key)
+                        events.append(item)
+                model_notes.extend(result.limitations)
+        represented = {ref for event in events for ref in event["message_refs"]}
+        candidate_ids = [r["id"] for r in messages if r["id"] not in represented
+                         and re.search(r"转.{0,30}(?:给|@)|合单给|取消转", r.get("内容", ""))]
+        if candidate_ids:
+            runner.failures.append({"stage": "extract", "ids": candidate_ids,
+                                    "error": "疑似转单消息没有对应提取事件，需人工核实；候选词匹配不代表已确认转单。"})
         old = {r["单号"]: r for r in orders["old"]}
         new = {r["单号"]: r for r in orders["new"]}
         known = set(old) | set(new)
@@ -139,6 +162,11 @@ class TransferAnalyzer:
             if product is not None and product not in products:
                 raise ValueError("模型编造了商品名称。")
             if event["state"] != "confirmed" or not all((sender, receiver, product, event["quantity"])):
+                continue
+            if any(e["product"] == product and set(e["message_refs"]) & set(event["message_refs"])
+                   and (e["sender_order"], e["receiver_order"], e["quantity"]) != (sender, receiver, event["quantity"])
+                   for e in events):
+                limitations.append("共享证据存在人员或数量冲突，相关事件均未计入数量。")
                 continue
             if any(e["state"] in {"cancelled", "uncertain"} and e["product"] == product
                    and e["sender_order"] == sender and e["receiver_order"] == receiver for e in events):
@@ -187,7 +215,28 @@ class TransferAnalyzer:
             if before is not None and after is not None:
                 numeric[row["id"]] = {"actual_delta": after - before, "event_delta": expected[serial, field]}
         findings = []
-        for batch in bounded_batches(differences, limit=4000):
+        remaining = []
+        for row in differences:
+            check = numeric.get(row["id"])
+            product = row.get("变动商品") or row.get("变化字段")
+            supporting = [e for e in events if e["state"] == "confirmed" and e["product"] == product
+                          and row.get("单号") in (e["sender_order"], e["receiver_order"])
+                          and (product, frozenset(e["message_refs"])) in counted]
+            if (check and check["actual_delta"] != 0 and check["actual_delta"] == check["event_delta"]
+                    and supporting):
+                # 只匹配通过身份、库存、取消及重复证据检查的净数量；无需模型重做算术。
+                findings.append({"status": "unresolved", "quantity_status": "consistent",
+                                 "relationship_status": "unverified",
+                                 "summary": f"单号{row['单号']}，{product}：按已识别事件计算净数量一致（{check['actual_delta']:+d}）；转单人员及逐笔关系待核实。",
+                                 "order_refs": [row["id"]],
+                                 "message_refs": sorted({ref for e in supporting for ref in e["message_refs"]}),
+                                 "knowledge_refs": sorted({ref for e in supporting for ref in e["knowledge_refs"]})})
+            else:
+                remaining.append(row)
+        difference_batches = list(bounded_batches(remaining, limit=4000, max_rows=3))
+        for index, batch in enumerate(difference_batches, 1):
+            if progress_callback:
+                progress_callback(f"正在核查订单差异：第 {index}/{len(difference_batches)} 批……")
             serials = {r.get("单号") for r in batch}
             selected = [e for e in events if e["sender_order"] in serials or e["receiver_order"] in serials
                         or e["sender_order"] is None or e["receiver_order"] is None]
@@ -195,15 +244,32 @@ class TransferAnalyzer:
             context = {**base, "stage": "review", "differences": batch, "events": selected,
                        "messages": [message_map[ref] for ref in sorted(refs)],
                        "quantity_checks": {r["id"]: numeric[r["id"]] for r in batch if r["id"] in numeric}}
-            if len(json.dumps(context, ensure_ascii=False)) > 22000:
-                raise ValueError("关联转单事件过多，请缩小聊天时间范围后分析。")
-            result = self.client.structured(prompt, context, TransferResult, max_tokens=TRANSFER_MAX_TOKENS)
-            if result.stage != "review":
-                raise ValueError("模型返回错误的审阅阶段。")
-            check_refs(result, context["messages"], batch, knowledge)
-            if {ref for f in result.findings for ref in f.order_refs} != {r["id"] for r in batch}:
-                raise ValueError("模型未完整核查本批订单差异。")
-            for finding in result.findings:
+            results = runner.run(context)
+            batch_findings = [f for result in results for f in result.findings]
+            model_notes.extend(note for result in results for note in result.limitations)
+            covered = {ref for f in batch_findings for ref in f.order_refs}
+            missing_rows = [r for r in batch if r["id"] not in covered]
+            # 超限恢复已用完预算的差异不再发起新一轮补查。
+            failed_ids = {ref for failure in runner.failures if failure["stage"] == "review" for ref in failure["ids"]}
+            retry_rows = [r for r in missing_rows if r["id"] not in failed_ids]
+            if retry_rows:
+                if progress_callback:
+                    progress_callback(f"正在补查模型漏答的 {len(missing_rows)} 条订单差异……")
+                retry_context = {**context, "differences": retry_rows,
+                                 "quantity_checks": {r["id"]: numeric[r["id"]] for r in retry_rows
+                                                     if r["id"] in numeric}}
+                # 只补查一次，保留已核查结果，避免反复重跑全部聊天。
+                for retry in runner.run(retry_context):
+                    batch_findings.extend(retry.findings)
+                    model_notes.extend(retry.limitations)
+                    covered.update(ref for f in retry.findings for ref in f.order_refs)
+            for row in missing_rows:
+                if row["id"] not in covered:
+                    findings.append({"status": "unresolved", "analysis_status": "incomplete",
+                                     "summary": f"模型仍未返回有效判断（漏答或批次失败），需人工核实：{row['id']}",
+                                     "order_refs": [row["id"]], "message_refs": [], "knowledge_refs": []})
+                    limitations.append("部分订单差异因漏答或批次失败未完成核查，已明确标为待核实。")
+            for finding in batch_findings:
                 item = finding.model_dump()
                 if item["status"] == "matched":
                     related_serials = {r.get("单号") for r in batch if r["id"] in item["order_refs"]}
@@ -218,7 +284,22 @@ class TransferAnalyzer:
                     item["status"] = "unresolved"
                     item["summary"] = "程序数量核对未通过，需要核实。" + item["summary"]
                 findings.append(item)
-            model_notes.extend(result.limitations)
+        for finding in findings:
+            finding["relationship_status"] = "unverified"
+            if any(f["stage"] == "extract" for f in runner.failures):
+                finding["analysis_status"] = "incomplete"
+                finding["summary"] = "聊天提取有未完成范围，以下仅基于已识别部分。" + finding["summary"]
+                if finding.get("quantity_status") == "consistent":
+                    finding["quantity_status"] = "partial_consistent"
+            if finding["status"] == "matched":
+                finding["status"] = "unresolved"
+                finding["summary"] = "模型认为存在对应证据，人员及逐笔转单关系仍待核实。" + finding["summary"]
+            if "quantity_status" not in finding:
+                checks = [numeric[ref] for ref in finding["order_refs"] if ref in numeric]
+                finding["quantity_status"] = ("different" if any(c["actual_delta"] != c["event_delta"] for c in checks)
+                                               else "not_established")
+        for failure in runner.failures:
+            limitations.append(f"未完成批次 {failure['stage']}：{', '.join(failure['ids'])}；{failure['error']}")
         # 已确认事件应涵盖未变化的单号，否则仍存在缺少订单变更的可能。
         missing = []
         for (serial, product), delta in expected.items():
@@ -227,17 +308,32 @@ class TransferAnalyzer:
                 missing.append(f"单号{serial}，{product}：订单变化{actual:+d}，已识别转单净变化{delta:+d}，待核实")
         limitations.extend(missing)
         limitations.extend([payload["chat_coverage"], "聊天分段保留三条重叠上下文，跨段远距离确认、取消或改口可能无法关联。",
+                            "净数量一致不代表人员及逐笔关系已核实，多笔净额相抵也不能证明转单正确。",
                             "未检出异常不代表全部转单正确；未匹配人员、商品或数量的事件仍需人工核查。"])
+        for event in events:
+            event["relationship_status"] = "unverified"
         self.last_result = {"model": getattr(self.client, "model", DEFAULT_MODEL),
                             "knowledge_sha256": payload["knowledge"]["sha256"],
                             "knowledge_sections": [e["id"] for e in knowledge],
                             "events": events, "findings": findings, "quantity_checks": numeric,
                             "unverified_model_notes": list(dict.fromkeys(model_notes)),
                             "limitations": list(dict.fromkeys(limitations)),
-                            "coverage": {"start": payload["chat_start"], "end": payload["chat_end"], "messages": len(messages)}}
-        lines = [f"转单分析完成：分析{len(messages)}条文本/引用消息，识别{len(events)}条事件。"]
+                            "failures": runner.failures,
+                            "diagnostics_dir": str(diagnostics_dir) if diagnostics_dir else None,
+                            "coverage": {"start": payload["chat_start"], "end": payload["chat_end"], "messages": len(messages),
+                                         "processed_messages": len(runner.successful_message_ids),
+                                         "unprocessed_message_ids": [r["id"] for r in messages if r["id"] not in runner.successful_message_ids],
+                                         "unresolved_candidate_message_ids": candidate_ids,
+                                         "complete": not runner.failures and not any(f.get("analysis_status") == "incomplete" for f in findings)}}
+        complete = self.last_result["coverage"]["complete"]
+        heading = "转单分析处理完成（关系待核实）" if complete else "转单分析部分完成，存在未核查范围"
+        lines = [f"{heading}：处理{len(runner.successful_message_ids)}/{len(messages)}条文本/引用消息，识别{len(events)}条事件。"]
         for index, f in enumerate(findings, 1):
             label = {"matched": "已匹配", "suspected": "疑似异常", "unresolved": "待核实"}[f["status"]]
+            if f.get("quantity_status") == "consistent":
+                label = "净数量一致，关系待核实"
+            elif f.get("quantity_status") == "partial_consistent":
+                label = "部分证据数量一致，分析未完成"
             lines.append(f"{index}. [{label}] {f['summary']}\n证据：订单 {', '.join(f['order_refs'])}；聊天 {', '.join(f['message_refs']) or '未找到'}；知识 {', '.join(f['knowledge_refs'])}")
         if not findings:
             lines.append("没有可核查的订单差异，转单事件仍需人工核实。")
