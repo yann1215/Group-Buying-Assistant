@@ -163,14 +163,16 @@ def audit_transfers(old, new, chat, *, identities=(), focus_products=(), history
     reserved = set()
     partially_reserved = set()
 
+    def message_evidence(msg):
+        nickname = (msg["row"].get("群昵称") or msg["row"].get("昵称")
+                    or msg["row"].get("微信昵称") or "昵称未知")
+        content = msg["body"]
+        if msg["quote"]:
+            content += "[引用：" + msg["quote"] + "]"
+        return f"{nickname}（{msg['time'] or '时间未知'}）：{content}"
+
     def evidence(m, sender=None):
-        result = []
-        for role, msg in (("发起", sender), ("接收", m)):
-            if msg:
-                result.append(f"{role}消息{msg['id']}（{msg['time'] or '时间未知'}）：{msg['body']}")
-        if m["quote"]:
-            result.append("引用：" + m["quote"])
-        return result
+        return [message_evidence(msg) for msg in (sender, m) if msg]
 
     def relevant(scope, items):
         if not focus_products:
@@ -187,7 +189,7 @@ def audit_transfers(old, new, chat, *, identities=(), focus_products=(), history
         pending.append({"members": sorted(keys), "products": sorted({i["商品名称"] for i in items
                         if i.get("商品名称") in selected} or selected), "reason": reason,
                         "taint": taint,
-                        "evidence": evidence(m) + [f"候选发起{s['id']}（{s['time']}）：{s['body']}" for s in candidates]})
+                        "evidence": [message_evidence(s) for s in candidates] + evidence(m)})
 
     # 引用优先占用发起记录；无引用接收只能搜索早于接收且 @ 本人的发起。
     for m in sorted(receipts, key=lambda r: (not bool(r["quote"]), r["when"] or datetime.max, r["id"])):
@@ -254,27 +256,33 @@ def audit_transfers(old, new, chat, *, identities=(), focus_products=(), history
         if source and source["member"] == m["member"]:
             issues.append("发起人与接收人相同")
         if not source:
-            # 引用原文可独立证明接收量，但发起身份仍需追查。
-            uncertain(m, "未匹配到发起消息，转出方待核实", (), scope, items, taint=False)
+            uncertain(m, "未匹配到符合条件的发起消息，候选接收不计入转单数量", (), scope, items)
+            continue
         if not m["when"] or (not m["quote"] and m["body"] in {"1", "已", "姐", "截"}):
             issues.append("缺少可靠时间或明确接收表达")
         if issues or scope == "未知" or (scope != "整单" and any(
                 not i.get("商品名称") or not i.get("数量") for i in items)):
             uncertain(m, "；".join(issues) or "商品或数量无法确定", candidates, scope, items)
             continue
-        if source:
-            reserved.add(source["id"])
-            if re.search(r"只|仅|部分|再接|再收", m["body"]):
-                partially_reserved.add(source["id"])
-        offered_scope, offered, _ = transfer_scope(source_text, products) if source_text else ("未知", [], [])
+        offered_scope, offered, _ = transfer_scope(source_text, products)
+        if offered_scope == "未知" or (offered_scope == "部分商品" and not any(o.get("商品名称") for o in offered)):
+            uncertain(m, "发起消息没有可确认的转出商品，候选接收不计入转单数量", candidates, scope, items)
+            continue
         if offered_scope == "部分商品" and any(i["商品名称"] not in {o["商品名称"] for o in offered} for i in items):
             uncertain(m, "接收商品与发起范围冲突", candidates, scope, items)
             continue
+        if offered_scope == "整单" and scope != "整单" and any(
+                i["商品名称"] in {o["商品名称"] for o in offered if o.get("排除")} for i in items):
+            uncertain(m, "接收商品已被发起整单排除，候选接收不计入转单数量", candidates, scope, items)
+            continue
+        reserved.add(source["id"])
+        if re.search(r"只|仅|部分|再接|再收", m["body"]):
+            partially_reserved.add(source["id"])
         events.append({"sender": source["member"] if source else None, "receiver": m["member"],
                        "source_id": source["id"] if source else "quote:" + m["quote"] if m["quote"] else m["id"],
                        "receipt_id": m["id"], "time": m["time"], "when": m["when"],
                        "scope": scope, "items": items, "evidence": evidence(m, source),
-                       "offered": offered,
+                       "offered": offered, "offered_scope": offered_scope,
                        "certainty": 0 if m["quote"] else 1,
                        "partial": bool(re.search(r"只|仅|部分|再接|再收", m["body"]))})
 
@@ -310,6 +318,12 @@ def audit_transfers(old, new, chat, *, identities=(), focus_products=(), history
             continue
         applied[key] = signature
         items = event["items"]
+        if event["offered_scope"] == "整单" and event["scope"] != "整单" and any(
+                balances.get((sender, i["商品名称"]), 0) <= 0 or (sender, i["商品名称"]) in tainted for i in items):
+            pending.append({"members": [sender, receiver], "products": sorted(selected),
+                            "reason": "无法确认发起整单包含接收商品，候选接收不计入转单数量", "evidence": event["evidence"]})
+            tainted.update((k, p) for k in (sender, receiver) for p in selected)
+            continue
         overallocated = any(o.get("数量来源") == "明确" and o.get("数量") is not None
                             and allocated[event["source_id"], o["商品名称"]] + sum(
                                 i["数量"] for i in items if i["商品名称"] == o["商品名称"]) > o["数量"]
@@ -430,6 +444,8 @@ def audit_transfers(old, new, chat, *, identities=(), focus_products=(), history
         for issue in group["pending"]:
             lines.append("、".join(members.label(k) for k in issue["members"]) + "：" + issue["reason"] + "。")
         ev = [e for f in group["findings"] for e in f["evidence"]] + [e for i in group["pending"] for e in i["evidence"]]
-        lines.extend("依据：" + e for e in dict.fromkeys(ev))
+        if ev:
+            lines.append("\n依据：\n")
+            lines.extend("- " + e.replace("\n", "\n  ") for e in dict.fromkeys(ev))
     return {"groups": groups, "findings": findings, "pending": pending, "text": "\n".join(lines),
             "focus_products": sorted(selected), "history_complete": history_complete}

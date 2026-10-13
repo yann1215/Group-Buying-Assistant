@@ -11,7 +11,8 @@ from openpyxl.utils.exceptions import InvalidFileException
 
 from app.analysis.order_compare import compare_orders, file_signature
 from app.analysis.order_parser import parse_order_file
-from app.analysis.transfer_audit import audit_transfers
+from app.analysis.transfer_csv_audit import audit_transfer_records
+from app.analysis.transfer_extraction import FILES
 from app.analysis.transfer_focus import parse_focus_products
 from app.core import chat_history_workflow as history
 from app.core.order_identity_cache import load_source_mapping
@@ -30,7 +31,8 @@ def fresh_history(ctx):
     try:
         age = (history.history_now() - datetime.fromisoformat(metadata["fetched_at"])).total_seconds()
         path = Path(metadata["filtered_path"])
-        if (0 <= age < 600 and is_within(path, get_workspace_dir(ctx.session_id))
+        if ((0 <= age < 600 or (get_workspace_dir(ctx.session_id) / FILES[0]).is_file())
+                and is_within(path, get_workspace_dir(ctx.session_id))
                 and path.is_file() and metadata.get("start") and metadata.get("end")
                 and file_signature(path) == metadata["filtered_signature"]):
             return dict(metadata)
@@ -52,7 +54,7 @@ def cached_report(ctx, values, signatures):
     return None
 
 
-def prepare_confirmation(ctx):
+def prepare_confirmation(ctx, requested_period=None):
     if not ctx.group_name:
         raise ValueError("请先设置群聊名称，再分析转单记录。")
     values = []
@@ -66,7 +68,20 @@ def prepare_confirmation(ctx):
     signatures = [file_signature(value) for value in values]
     metadata = fresh_history(ctx)
     pending = ctx.pending_transfer_analysis
-    if metadata:
+    if requested_period is None and pending:
+        requested_period = pending["chat"].get("requested_period")
+    if requested_period is not None:
+        start, end = history.history_time_range(requested_period)
+        if pending and pending["chat"].get("requested_period") == requested_period:
+            start, end = pending["chat"]["start"], pending["chat"]["end"]
+        if not metadata or (metadata["start"], metadata["end"]) != (start, end):
+            metadata = None
+        if metadata:
+            chat = {"mode": "reuse", "metadata": metadata, "start": start, "end": end}
+        else:
+            chat = {"mode": "refresh", "start": start, "end": end}
+        chat["requested_period"] = dict(requested_period)
+    elif metadata:
         chat = {"mode": "reuse", "metadata": metadata, "start": metadata["start"], "end": metadata["end"]}
     else:
         # 等待确认期间保持展示的时间范围；模式变化则需要重新确认。
@@ -85,7 +100,8 @@ def confirmation_message(snapshot, prefix=""):
     chat = snapshot["chat"]
     focus = "；".join(f"{p['product_name']}：{p['description']}" for p in snapshot["focus_products"]) or "无"
     report_mode = "复用已有比对报告" if snapshot["report_path"] else "确认后生成比对报告"
-    chat_mode = ("复用十分钟内获取的记录" if chat["mode"] == "reuse"
+    chat_mode = ("复用已有转单 CSV 及其聊天时间范围" if chat["mode"] == "reuse"
+                 else "确认后按指定范围提取，最晚截至执行时刻" if chat.get("requested_period")
                  else "预计范围，确认后提取近一周，最终截至确认执行时刻")
     return (f"{prefix}请确认转单分析信息：\n"
             f"旧订单：{format_order_path(snapshot['values'][0])}\n"
@@ -111,7 +127,7 @@ def execute_analysis(tools, ctx, snapshot, progress_callback):
         original_period = ctx.chat_history_period
         try:
             metadata = history.handle_chat_history(
-                tools, ctx, {"chat_history_period": dict(history.DEFAULT_HISTORY_PERIOD)}, progress_callback,
+                tools, ctx, {"chat_history_period": dict(chat.get("requested_period") or history.DEFAULT_HISTORY_PERIOD)}, progress_callback,
                 structured=True)
         finally:
             ctx.chat_history_period = original_period
@@ -126,13 +142,13 @@ def execute_analysis(tools, ctx, snapshot, progress_callback):
     report_path = Path(report["report_path"])
     filtered_path = Path(metadata["filtered_path"])
     payload = {
-        "task": "核查聊天中的转单与订单变化是否一致，特别关注指定商品的数量异常和缺少数量。"
+        "task": "仅按转单记录 CSV 核算订单变化，有数量差额后才回查相关成员候选记录。"
                 "返回摘要、匹配记录、疑似异常、订单与聊天证据及无法确定的事项。"
                 "特别关注信息是用户提供的线索，不能直接视为已证实结论。",
         "group_name": ctx.group_name, "old_order": snapshot["values"][0], "new_order": snapshot["values"][1],
         "direction": "旧订单 → 新订单", "comparison_path": str(report_path),
         "comparison_csv": report_path.read_text(encoding="utf-8-sig"),
-        "chat_history_path": str(filtered_path), "chat_history_csv": filtered_path.read_text(encoding="utf-8-sig"),
+        "transfer_records_path": str(get_workspace_dir(ctx.session_id) / FILES[0]),
         "chat_start": metadata["start"], "chat_end": metadata["end"],
         "focus_products": snapshot["focus_products"],
     }
@@ -141,7 +157,7 @@ def execute_analysis(tools, ctx, snapshot, progress_callback):
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
     if progress_callback:
-        progress_callback("正在匹配接收记录、核查双方数量并按风险排序……")
+        progress_callback("正在按转单 CSV 核查数量，存在差额时回查候选记录……")
     warnings = []
     identities = load_source_mapping(ctx.session_id, ctx.group_name, warnings=warnings)
     for member in getattr(ctx, "special_members", ()):
@@ -151,26 +167,36 @@ def execute_analysis(tools, ctx, snapshot, progress_callback):
     with TemporaryDirectory(dir=get_workspace_dir(ctx.session_id)) as directory:
         tables = [read_csv_dict_rows(parse_order_file(value, Path(directory) / f"{index}.csv"))[0]
                   for index, value in enumerate(snapshot["values"])]
-    # 原始记录可保留没有命中筛选关键词的撤销消息；必须属于当前会话且签名一致。
-    audit_chat_path = filtered_path
-    raw_path = Path(metadata["raw_path"]) if metadata.get("raw_path") else None
-    if raw_path and is_within(raw_path, get_workspace_dir(ctx.session_id)) and raw_path.is_file():
-        if file_signature(raw_path) != metadata.get("raw_signature"):
-            raise ValueError("原始聊天记录发生变化，请重新获取聊天记录后分析。")
-        audit_chat_path = raw_path
-    audit_chat_signature = file_signature(audit_chat_path)
-    rows, fields = read_csv_dict_rows(audit_chat_path)
-    if not {"类型", "内容"}.issubset(fields):
-        raise ValueError("聊天记录缺少类型或内容列")
-    result = audit_transfers(*tables, rows, identities=identities, focus_products=snapshot["focus_products"],
-                             history_complete=metadata.get("covers_order_interval") is True)
+    workspace = get_workspace_dir(ctx.session_id)
+    records_path = workspace / FILES[0]
+    if not records_path.is_file():
+        raise ValueError("缺少转单记录 CSV，请先获取聊天记录生成转单记录后再分析。")
+    input_signatures = {records_path: file_signature(records_path)}
+    records, fields = read_csv_dict_rows(records_path)
+    if not {"转移范围", "商品转移", "发起人单号", "接收人单号"}.issubset(fields):
+        raise ValueError("转单记录 CSV 缺少必要字段，请检查文件。")
+
+    def load_candidates():
+        for name, kind in zip(FILES[1:], ("候选发起", "候选接收")):
+            candidate_path = workspace / name
+            if not candidate_path.is_file():
+                continue
+            input_signatures[candidate_path] = file_signature(candidate_path)
+            for row in read_csv_dict_rows(candidate_path)[0]:
+                yield kind, row
+
+    result = audit_transfer_records(*tables, records, identities=identities,
+                                    focus_products=snapshot["focus_products"],
+                                    history_complete=metadata.get("covers_order_interval") is True,
+                                    candidate_loader=load_candidates)
     if ([file_signature(value) for value in snapshot["values"]] != snapshot["signatures"]
             or file_signature(filtered_path) != metadata["filtered_signature"]):
         raise ValueError("核查期间订单或聊天记录发生变化，请重新分析。")
-    if file_signature(audit_chat_path) != audit_chat_signature:
-        raise ValueError("核查期间原始聊天记录发生变化，请重新分析。")
-    result["chat_history_path"] = str(audit_chat_path)
-    result["text"] += f"\n聊天范围：{metadata['start']} 至 {metadata['end']}（北京时间）。"
+    if any(file_signature(source) != signature for source, signature in input_signatures.items()):
+        raise ValueError("核查期间转单或候选 CSV 发生变化，请重新分析。")
+    result["transfer_records_path"] = str(records_path)
+    result["input_signatures"] = {str(source): signature for source, signature in input_signatures.items()}
+    result["text"] += f"\n\n聊天范围：{metadata['start']} 至 {metadata['end']}（北京时间）。"
     if warnings:
         result["text"] += "\n" + "\n".join(warnings)
     result_path = path.with_name("transfer_analysis_result.json")
@@ -181,7 +207,7 @@ def execute_analysis(tools, ctx, snapshot, progress_callback):
         temporary.write_text(content, encoding="utf-8")
         temporary.replace(destination)
     files = f"\n异常报告：{report_output}\n结构化结果：{result_path}\n订单比对文件：{report_path}"
-    return result["text"] + "\n" + files + "\n" + HISTORY_HINT
+    return result["text"] + files + "\n" + HISTORY_HINT
 
 
 def handle_transfer_analysis(tools, ctx, intent, text, progress_callback=None):
@@ -199,6 +225,8 @@ def handle_transfer_analysis(tools, ctx, intent, text, progress_callback=None):
     if confirming and pending is None:
         return "当前没有等待确认的转单分析，请先输入“分析转单记录”。"
     try:
+        if intent.get("chat_history_error"):
+            return intent["chat_history_error"]
         focus = parse_focus_products(text)
         if focus is not None:
             ctx.transfer_focus_products = focus
@@ -206,7 +234,10 @@ def handle_transfer_analysis(tools, ctx, intent, text, progress_callback=None):
             return "特别关注商品已保存。输入“分析转单记录”后确认执行。"
         if action == "analyze_transfers":
             ctx.pending_transfer_analysis = None
-        snapshot = prepare_confirmation(ctx)
+        requested_period = intent.get("chat_history_period")
+        snapshot = prepare_confirmation(ctx, requested_period) if requested_period is not None else prepare_confirmation(ctx)
+        if requested_period is not None:
+            ctx.chat_history_period = dict(requested_period)
         if confirming and snapshot == pending:
             ctx.pending_transfer_analysis = None
             return execute_analysis(tools, ctx, snapshot, progress_callback)

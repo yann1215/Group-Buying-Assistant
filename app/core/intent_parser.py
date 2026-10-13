@@ -313,6 +313,8 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
     if re.search(transfer_command, text) and not re.search(
             rf"(?:不(?:要|用|需要|想)?|取消|暂不|别)\s*(?:再\s*)?{transfer_command}", text):
         result["intent"] = "analyze_transfers"
+        from app.core.chat_history_workflow import parse_history_time_fields
+        result.update(parse_history_time_fields(text))
         return result
     if text == "确认分析":
         result["intent"] = "confirm_transfer_analysis"

@@ -17,7 +17,7 @@ DEFAULT_HISTORY_PERIOD = {"count": 1, "unit": "week"}
 HISTORY_KEYWORDS = ("转单", "转", "接", "合单", "合", "核弹", "给", "掰", "吐", "分", "姐", "截", "收", "1", "已")
 HISTORY_MESSAGE_TYPES = {"文本", "引用消息"}
 UNIT_LABELS = {"hour": "小时", "day": "天", "week": "周", "month": "个月", "year": "年"}
-TIME_ERROR = "无法识别聊天记录时间，请使用“近7天”“时间1个月”或“从9.1开始”等格式。原时间设置未修改。"
+TIME_ERROR = "无法识别聊天记录时间，请使用“近7天”“从10.1开始”“从10.1开始，持续一周”或“10.1-10.7”等格式。原时间设置未修改。"
 
 
 def history_now():
@@ -27,7 +27,12 @@ def history_now():
 def normalize_history_period(value):
     if isinstance(value, dict) and isinstance(value.get("start_date"), str):
         try:
-            return {"start_date": date.fromisoformat(value["start_date"]).isoformat()}
+            result = {"start_date": date.fromisoformat(value["start_date"]).isoformat()}
+            if "end_date" in value:
+                result["end_date"] = date.fromisoformat(value["end_date"]).isoformat()
+                if result["end_date"] < result["start_date"]:
+                    raise ValueError(TIME_ERROR)
+            return result
         except ValueError:
             return dict(DEFAULT_HISTORY_PERIOD)
     if (isinstance(value, dict) and type(value.get("count")) is int
@@ -50,7 +55,7 @@ def _number(value):
     raise ValueError(TIME_ERROR)
 
 
-def parse_history_start_date(value, now):
+def parse_history_start_date(value, now, *, allow_future=False):
     """不写年份时使用设置当年的年份，保存后不随年份变化。"""
     number = r"[0-9零一二两三四五六七八九十]+"
     match = re.fullmatch(rf"(?:(\d{{4}})年)?({number})月({number})(?:日|号)?", value)
@@ -62,7 +67,7 @@ def parse_history_start_date(value, now):
         start = date(int(match[1]) if match[1] else now.year, _number(match[2]), _number(match[3]))
     except ValueError:
         raise ValueError(TIME_ERROR) from None
-    if start > now.date():
+    if not allow_future and start > now.date():
         raise ValueError("开始日期不能晚于今天。原时间设置未修改。")
     return {"start_date": start.isoformat()}
 
@@ -79,10 +84,69 @@ def parse_history_command(text):
     if re.search(r"(?:不(?:要|用|需要|想)?|取消|暂不|别)(?:再)?(?:提取|获取|导出|查|搜索|检索|拉取|找出)", compact):
         return None
     result = {"intent": "extract_chat_history"}
+    result.update(parse_history_time_fields(text))
+    return result
+
+
+def parse_history_time_fields(text):
+    """提取与动作无关的时间参数，聊天提取和转单分析共用。"""
+    result = {}
     # 群名中的数字、时间词不参与范围解析。
     command = "，".join(clause for clause in re.split(r"[，,；;\n]+", text)
                        if not re.match(r"\s*(?:群聊名称|当前群聊|群聊|群名|车名)\s*[:：]", clause))
     command = re.sub(r"\s+", "", command)
+    # 关注商品中的数量不是日期参数。
+    command = re.split(r"特别关注[:：]|关注商品[:：]", command, maxsplit=1)[0]
+    number = r"[0-9零一二两三四五六七八九十]+"
+    date_token = rf"(?:(?:\d{{4}})[./-])?\d{{1,2}}[./-]\d{{1,2}}|(?:\d{{4}}年)?{number}月{number}(?:日|号)?"
+    day = rf"(?:{date_token})"
+    duration = rf"(?P<count>{number})(?:个)?(?P<unit>天|日|周|星期|礼拜|月|年)"
+    forms = [
+        ("range", rf"(?:从)?(?P<start>{day})(?:到|至|~|～|—|–|-)(?P<end>{day})"),
+        ("range", rf"起始[:：]?(?P<start>{day})[，,；;]*结束[:：]?(?P<end>{day})"),
+        ("forward", rf"从(?P<start>{day})(?:开始|起)[，,；;]*持续{duration}"),
+        ("backward", rf"(?P<end>{day})向前{duration}"),
+    ]
+    found = [(kind, match) for kind, pattern in forms for match in re.finditer(pattern, command)]
+    if found:
+        try:
+            if len(found) != 1:
+                raise ValueError(TIME_ERROR)
+            kind, match = found[0]
+            rest = command[:match.start()] + command[match.end():]
+            if re.search(r"\d|从|起始|结束|持续|向前|最近|过去|近|半", rest):
+                raise ValueError(TIME_ERROR)
+            now = history_now()
+            def parsed(value, future=False):
+                return date.fromisoformat(parse_history_start_date(value, now, allow_future=future)["start_date"])
+            if kind == "range":
+                start, end = parsed(match["start"]), parsed(match["end"], True)
+            else:
+                count = _number(match["count"])
+                if count <= 0:
+                    raise ValueError(TIME_ERROR)
+                def shift(anchor, sign):
+                    unit = match["unit"]
+                    if unit in {"月", "年"}:
+                        index = anchor.year * 12 + anchor.month - 1 + sign * count * (12 if unit == "年" else 1)
+                        year, month = divmod(index, 12)
+                        return anchor.replace(year=year, month=month + 1,
+                                              day=min(anchor.day, calendar.monthrange(year, month + 1)[1]))
+                    return anchor + timedelta(days=sign * count * (7 if unit in {"周", "星期", "礼拜"} else 1))
+                if kind == "forward":
+                    start = parsed(match["start"])
+                    end = shift(start, 1) - timedelta(days=1)
+                else:
+                    end = parsed(match["end"], True)
+                    start = shift(end + timedelta(days=1), -1)
+            if start > end:
+                raise ValueError("结束日期不能早于开始日期。原时间设置未修改。")
+            if start > now.date():
+                raise ValueError("开始日期不能晚于今天。原时间设置未修改。")
+            result["chat_history_period"] = {"start_date": start.isoformat(), "end_date": end.isoformat()}
+        except (ValueError, OverflowError) as error:
+            result["chat_history_error"] = str(error) if "原时间设置未修改" in str(error) else TIME_ERROR
+        return result
     pattern = r"(?<![\d.\-])([0-9零一二两三四五六七八九十]+)(?:个)?(小时|天|日|周|星期|礼拜|月|年)"
     if "从" in command:
         starts = list(re.finditer(r"从(.+?)(?:开始|起)", command))
@@ -111,7 +175,7 @@ def parse_history_command(text):
             result["chat_history_period"] = {"count": count, "unit": units[match[2]]}
         except ValueError:
             result["chat_history_error"] = TIME_ERROR
-    elif matches or re.search(r"时间|最近|近期|近|过去|半|昨天|今天|上周|上个月|\d", command):
+    elif matches or re.search(r"时间|最近|近期|近|过去|半|昨天|今天|上周|上个月|起始|结束|持续|向前|\d", command):
         result["chat_history_error"] = TIME_ERROR
     return result
 
@@ -123,7 +187,13 @@ def history_time_range(period, now=None):
         if start_date > now.date():
             raise ValueError("开始日期不能晚于今天。原时间设置未修改。")
         start = datetime.combine(start_date, datetime.min.time(), tzinfo=now.tzinfo)
-        return start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")
+        end = now
+        if "end_date" in period:
+            end_date = date.fromisoformat(period["end_date"])
+            if end_date < start_date:
+                raise ValueError("结束日期不能早于开始日期。原时间设置未修改。")
+            end = min(now, datetime.combine(end_date, datetime.max.time(), tzinfo=now.tzinfo))
+        return start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")
     count, unit = period["count"], period["unit"]
     if unit in {"month", "year"}:
         index = now.year * 12 + now.month - 1 - count * (12 if unit == "year" else 1)
@@ -201,6 +271,8 @@ def handle_chat_history(tools, ctx, intent, progress_callback=None, *, time_rang
     ctx.chat_history_period = period
     label = (f"从{period['start_date']} 00:00开始" if "start_date" in period
              else f"最近{period['count']}{UNIT_LABELS[period['unit']]}")
+    if "end_date" in period:
+        label = f"{period['start_date']} 至 {period['end_date']}（包含结束日全天，最晚截至执行时刻）"
     if not ctx.group_name:
         return f"聊天记录时间设置已保存：{label}。请先设置车名（群名：实际微信群名称），再提取聊天记录。"
     if progress_callback:
