@@ -8,12 +8,12 @@ from collections import defaultdict
 from pathlib import Path
 
 from app.utils.csv_utils import read_csv_dict_rows
-from app.utils.name_matching import match_names
+from app.utils.name_matching import match_names, normalize_name
 
 INITIATION_WORDS = ("转", "掰", "合单", "核弹", "合", "分")
 RECEIPT_WORDS = ("接", "姐", "截", "收", "1", "已")
 EXCLUDED_RECEIPTS = ("接下来", "接单", "接受", "接龙", "接触", "接着", "接手",
-                     "接待", "接送", "接电话", "接近", "接口", "接班", "接头")
+                     "接待", "接送", "接电话", "接近", "接口", "接班", "接头", "交接")
 PERSON_FIELDS = ("wxid", "单号", "群昵称", "微信昵称", "订单昵称")
 TRANSFER_FIELDS = [*("发起人" + f for f in PERSON_FIELDS), *("接收人" + f for f in PERSON_FIELDS),
                    "消息原文", "引用对象", "消息引用", "转移范围", "商品转移", "确认状态", "问题备注",
@@ -43,6 +43,7 @@ def is_initiation(text):
 
 
 def has_receipt(text):
+    text = text.replace("交接", "")
     return any(w in text for w in RECEIPT_WORDS)
 
 
@@ -68,6 +69,25 @@ def parse_quantity(value):
     return digits.get(value)
 
 
+def match_transfer_products(query, products):
+    """完整名称、连续简称优先；分段简称限定为主体前缀加商品类型。"""
+    matches = match_names(query, products, ("商品名称",))
+    if matches:
+        return matches
+    query = normalize_name(query)
+    # 不进行任意跳字匹配，至少保留两个主体字符和完整的类型后缀。
+    for kind in ("底胚", "本体", "特典"):
+        if not query.endswith(kind):
+            continue
+        subject = query[:-len(kind)]
+        if len(subject) < 2:
+            return []
+        return [product for product in products
+                if normalize_name(product.get("商品名称")).endswith(kind)
+                and normalize_name(product.get("商品名称"))[:-len(kind)].startswith(subject)]
+    return []
+
+
 def parse_products(text, products):
     """只解析目标之前的商品，防止 @23 等单号成为数量。"""
     notes = []
@@ -91,9 +111,9 @@ def parse_products(text, products):
     for chunk in chunks:
         number = r"[\d零一二两三四五六七八九十]+"
         match = re.fullmatch(rf"(.+?)\s*(?:[xX×*]\s*)?({number})\s*(?:个|件|份|套|张|本|枚)?", chunk)
-        prefix = re.fullmatch(rf"({number})\s*(?:个|件|份|套|张|本|枚)\s*(.+)", chunk)
+        prefix = re.fullmatch(rf"({number})\s*(?:个|件|份|套|张|本|枚)?\s*(.+)", chunk)
         # 完整商品名称可含数字，优先识别名称。
-        if any(chunk == n for n in names):
+        if any(normalize_name(chunk) == normalize_name(n) for n in names):
             raw, quantity, source = chunk, 1, "默认"
         elif match:
             raw, quantity, source = match[1].strip(), parse_quantity(match[2]), "明确"
@@ -101,7 +121,7 @@ def parse_products(text, products):
             raw, quantity, source = prefix[2].strip(), parse_quantity(prefix[1]), "明确"
         else:
             raw, quantity, source = chunk, 1, "默认"
-        candidates = match_names(raw, products, ("商品名称",))
+        candidates = match_transfer_products(raw, products)
         name = candidates[0]["商品名称"] if len(candidates) == 1 else None
         if not name:
             notes.append(f"商品“{raw}”" + ("匹配多个候选：" + "、".join(p["商品名称"] for p in candidates)
@@ -120,7 +140,7 @@ def parse_products(text, products):
 def person(row, identities, notes):
     result = {"wxid": row.get("wxid", ""), "单号": row.get("单号", ""),
               "群昵称": row.get("群昵称", ""), "微信昵称": row.get("昵称", row.get("微信昵称", "")),
-              "订单昵称": row.get("订单昵称", "")}
+              "订单昵称": str(row.get("订单昵称") or "").strip()}
     result["单号"] = str(result["单号"] or serial_from_nickname(result["群昵称"]))
     if result["wxid"]:
         matches = [p for p in identities if p.get("wxid") == result["wxid"]]
@@ -134,7 +154,7 @@ def person(row, identities, notes):
         return result
     for dest, src in (("wxid", "wxid"), ("单号", "serial"), ("微信昵称", "wechat_name"),
                       ("订单昵称", "name"), ("群昵称", "group_name")):
-        values = {str(p[src]) for p in matches if p.get(src) not in (None, "")}
+        values = {str(p[src]).strip() for p in matches if str(p.get(src) or "").strip()}
         if len(values) > 1 or (result[dest] and values and result[dest] not in values):
             notes.append(f"身份映射冲突：{dest}")
         elif not result[dest] and len(values) == 1:
@@ -237,8 +257,8 @@ def extract_records(rows, products=(), identities=()):
             remainder = m["body"]
             for word in EXCLUDED_RECEIPTS:
                 remainder = remainder.replace(word, "")
-            if "接" in remainder:
-                receipts.append(make_candidate(m, products, identities, "无引用且包含独立接收关键词“接”"))
+            if "接" in remainder or "收" in remainder:
+                receipts.append(make_candidate(m, products, identities, "无引用且包含独立接收关键词“接/收”"))
     return transfers, initiations, receipts
 
 

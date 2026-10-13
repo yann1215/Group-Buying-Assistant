@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from app.analysis.transfer_extraction import FILES, write_extraction, serial_from_nickname
-from app.core.order_identity_cache import load_mapping, mapping_path
+from app.core.order_identity_cache import load_source_mapping
 from app.utils.csv_utils import read_csv_dict_rows
 
 
@@ -20,9 +20,7 @@ def prepare_transfer_extraction(ctx, chat_path, staging):
             warnings.append("商品配置不属于当前会话，商品名称待核实")
     else:
         warnings.append("未找到商品配置，商品名称待核实")
-    identities = [entry for entry in load_mapping(mapping_path(ctx.session_id))
-                  if entry.get("group") == ctx.group_name
-                  and str(entry.get("source_session_id")) == str(ctx.session_id)]
+    identities = load_source_mapping(ctx.session_id, ctx.group_name, warnings=warnings)
     # 当前会话已确认的成员资料也可提供 wxid 与订单昵称。
     for member in getattr(ctx, "special_members", ()):
         if member.get("wxid"):
@@ -33,6 +31,16 @@ def prepare_transfer_extraction(ctx, chat_path, staging):
     order_path = getattr(ctx, "parsed_order_file", None)
     if order_path and Path(order_path).is_file():
         orders, _ = read_csv_dict_rows(order_path)
+    # 聊天群昵称可能已去掉单号；使用映射里的单号补齐订单昵称。
+    # 保留所有候选，让提取器报告冲突，不能任意选择同号订单。
+    for identity in list(identities):
+        if str(identity.get("name") or "").strip():
+            continue
+        serial = serial_from_nickname(str(identity.get("serial") or ""))
+        names = {o.get("昵称", "") for o in orders
+                 if serial and serial_from_nickname(str(o.get("单号") or "")) == serial}
+        for name in names - {""}:
+            identities.append(dict(identity, name=name))
     for row in read_csv_dict_rows(chat_path)[0]:
         if not row.get("wxid"):
             continue

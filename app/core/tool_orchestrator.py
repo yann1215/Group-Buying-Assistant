@@ -489,7 +489,6 @@ class ToolOrchestrator:
 
         self.key_input_func = key_input_func
         # 专用分析接口：接收包含 CSV 内容和特别关注商品的字典，返回分析结果文本。
-        self.transfer_analysis_client = None
 
     def get_context(self, session_id: int) -> SessionToolContext | MergedShippingContext | UnclassifiedContext:
         return self.contexts.setdefault(

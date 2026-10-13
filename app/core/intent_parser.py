@@ -309,7 +309,7 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
     if not text:
         return result
 
-    transfer_command = r"(?:比对转单记录|分析转单记录|查找转单异常|查转单记录|查转单异常)"
+    transfer_command = r"(?:比对转单记录|分析转单记录|分析转单异常|查找转单异常|查转单记录|查转单异常)"
     if re.search(transfer_command, text) and not re.search(
             rf"(?:不(?:要|用|需要|想)?|取消|暂不|别)\s*(?:再\s*)?{transfer_command}", text):
         result["intent"] = "analyze_transfers"
@@ -320,7 +320,12 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
     if text == "取消分析":
         result["intent"] = "cancel_transfer_analysis"
         return result
-    if re.match(r"^(?:特别关注(?:商品)?|关注商品)\s*[:：]", text):
+    from app.analysis.transfer_focus import parse_focus_products
+    try:
+        transfer_focus = parse_focus_products(text)
+    except ValueError:
+        transfer_focus = []  # 交给核查工作流返回具体的输入错误。
+    if transfer_focus is not None:
         result["intent"] = "update_transfer_focus"
         return result
 
@@ -451,7 +456,7 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
         result["intent"] = "calculate_share"
         return result
 
-    # 提及均摊本身不代表修改配置；模糊表达交给指令规范化模块。
+    # 提及均摊本身不代表修改配置；未识别的表达按未知指令处理。
     if (
         re.search(r"(?:设置|配置|修改|调整|更改)(?:一下)?(?:总)?均摊", text)
         or share_mode is not None

@@ -7,7 +7,7 @@ from tempfile import NamedTemporaryFile
 
 from app.analysis.order_identity import resolve_order_identities
 from app.analysis.order_parser import OrderParseError
-from app.core.path_manager import get_workspace_dir
+from app.core.path_manager import get_workspace_dir, is_within
 
 
 def mapping_path(session_id):
@@ -24,6 +24,32 @@ def load_mapping(path: Path) -> list[dict]:
     if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("entries"), list):
         return []
     return [entry for entry in data["entries"] if isinstance(entry, dict)]
+
+
+def load_source_mapping(session_id, group, *, warnings=None):
+    """读取属于单车来源的映射，包括合发会话保存的条目，不跨车套用。"""
+    local = mapping_path(session_id)
+    workspace = local.parent.parent
+    paths = [local]
+    for candidate in sorted(workspace.glob("*/order_identity_mapping.json")):
+        if (candidate != local and candidate.parent.name.isascii()
+                and candidate.parent.name.isdecimal() and not candidate.parent.is_symlink()
+                and not candidate.is_symlink() and is_within(candidate, workspace)):
+            paths.append(candidate)
+    entries = []
+    for path in paths:
+        try:
+            loaded = load_mapping(path)
+        except OSError as error:
+            if warnings is not None:
+                warnings.append(f"身份映射读取失败：{path}（{error}），相关人员信息可能不完整")
+            continue
+        for entry in loaded:
+            if (entry.get("group") == group
+                    and str(entry.get("source_session_id")) == str(session_id)
+                    and entry not in entries):
+                entries.append(entry)
+    return entries
 
 
 def _identity(entry):

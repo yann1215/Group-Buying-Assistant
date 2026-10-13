@@ -1,47 +1,26 @@
-"""确认转单分析资料，复用有效文件，并调用可替换的专用分析接口。"""
+"""确认并复用转单资料，执行双向数量核查及排序报告。"""
 from __future__ import annotations
 
 import json
-import re
-from uuid import uuid4
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from zipfile import BadZipFile
 
 from openpyxl.utils.exceptions import InvalidFileException
 
 from app.analysis.order_compare import compare_orders, file_signature
+from app.analysis.order_parser import parse_order_file
+from app.analysis.transfer_audit import audit_transfers
+from app.analysis.transfer_focus import parse_focus_products
 from app.core import chat_history_workflow as history
+from app.core.order_identity_cache import load_source_mapping
 from app.core.order_version_manager import validate_order_path
 from app.core.path_manager import format_order_path, get_workspace_dir, is_within
+from app.utils.csv_utils import read_csv_dict_rows
 
 CONFIRM_REPLIES = {"确认分析", "确认", "是", "yes", "y", "1", "对", "无误", "没问题"}
 HISTORY_HINT = "如需其他时长的聊天记录，或手动强制更新，请输入“获取聊天记录”指令，例如“获取近1个月的聊天记录”。"
-
-
-def parse_focus_products(text):
-    match = re.search(r"(?:特别关注(?:商品)?|关注商品)\s*[:：]([\s\S]*)", text)
-    if not match:
-        return None
-    value = match[1].strip()
-    if value in {"无", "没有", "无特别关注", "清空"}:
-        return []
-    products = []
-    for item in re.split(r"[，,；;\n]+", value):
-        item = item.strip()
-        if not item:
-            continue
-        parts = re.split(r"[:：]|(?=缺少|缺了|少了|数量异常)", item, maxsplit=1)
-        name = parts[0].strip()
-        description = parts[1].strip() if len(parts) > 1 else "数量异常，缺少数量未知"
-        if not name:
-            raise ValueError("请填写特别关注的商品名称，例如“特别关注：商品A缺少3件”。")
-        quantity = re.search(r"(?:缺少|缺了|少了)\s*(\d+)(?:件|个|份|套|张|本|枚)?", description)
-        products.append({"product_name": name, "description": description,
-                         "missing_quantity": int(quantity[1]) if quantity else None})
-    if not products:
-        raise ValueError("请填写特别关注商品，或输入“特别关注：无”。")
-    return products
 
 
 def fresh_history(ctx):
@@ -157,41 +136,52 @@ def execute_analysis(tools, ctx, snapshot, progress_callback):
         "chat_start": metadata["start"], "chat_end": metadata["end"],
         "focus_products": snapshot["focus_products"],
     }
-    if tools.transfer_analysis_client is not None:
-        from app.llm.transfer_analyzer import prepare_analysis_payload
-        payload = prepare_analysis_payload(payload, metadata)
-        if [file_signature(value) for value in snapshot["values"]] != snapshot["signatures"]:
-            raise ValueError("准备模型资料期间订单内容发生变化，请重新确认。")
     path = get_workspace_dir(ctx.session_id) / "transfer_analysis_input.json"
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
-    files = f"\n订单比对文件：{report_path}\n筛选聊天记录：{filtered_path}\n分析输入：{path}"
-    if tools.transfer_analysis_client is None:
-        return "分析资料已准备，LLM 分析接口尚未配置。" + files + "\n" + HISTORY_HINT
     if progress_callback:
-        progress_callback("正在分析转单记录……")
-    try:
-        from app.llm.transfer_analyzer import TransferAnalyzer
-        if isinstance(tools.transfer_analysis_client, TransferAnalyzer):
-            diagnostics_dir = path.parent / "transfer_diagnostics" / uuid4().hex
-            files += f"\n分析诊断目录：{diagnostics_dir}"
-            result = tools.transfer_analysis_client.analyze(payload, progress_callback=progress_callback,
-                                                             diagnostics_dir=diagnostics_dir)
-        else:
-            result = tools.transfer_analysis_client.analyze(payload)
-        if not isinstance(result, str) or not result.strip():
-            raise ValueError("接口未返回有效的分析结果文本")
-    except Exception as error:
-        return f"分析资料已准备，LLM 分析失败：{error}。" + files
-    structured_result = getattr(tools.transfer_analysis_client, "last_result", None)
-    if isinstance(structured_result, dict):
-        result_path = path.with_name("transfer_analysis_result.json")
-        result_temporary = result_path.with_suffix(".tmp")
-        result_temporary.write_text(json.dumps(structured_result, ensure_ascii=False, indent=2), encoding="utf-8")
-        result_temporary.replace(result_path)
-        files += f"\n结构化分析结果：{result_path}"
-    return result + files
+        progress_callback("正在匹配接收记录、核查双方数量并按风险排序……")
+    warnings = []
+    identities = load_source_mapping(ctx.session_id, ctx.group_name, warnings=warnings)
+    for member in getattr(ctx, "special_members", ()):
+        if member.get("wxid"):
+            identities.append({"wxid": member["wxid"], "serial": member.get("单号", ""),
+                               "wechat_name": member.get("昵称", ""), "name": member.get("订单昵称", "")})
+    with TemporaryDirectory(dir=get_workspace_dir(ctx.session_id)) as directory:
+        tables = [read_csv_dict_rows(parse_order_file(value, Path(directory) / f"{index}.csv"))[0]
+                  for index, value in enumerate(snapshot["values"])]
+    # 原始记录可保留没有命中筛选关键词的撤销消息；必须属于当前会话且签名一致。
+    audit_chat_path = filtered_path
+    raw_path = Path(metadata["raw_path"]) if metadata.get("raw_path") else None
+    if raw_path and is_within(raw_path, get_workspace_dir(ctx.session_id)) and raw_path.is_file():
+        if file_signature(raw_path) != metadata.get("raw_signature"):
+            raise ValueError("原始聊天记录发生变化，请重新获取聊天记录后分析。")
+        audit_chat_path = raw_path
+    audit_chat_signature = file_signature(audit_chat_path)
+    rows, fields = read_csv_dict_rows(audit_chat_path)
+    if not {"类型", "内容"}.issubset(fields):
+        raise ValueError("聊天记录缺少类型或内容列")
+    result = audit_transfers(*tables, rows, identities=identities, focus_products=snapshot["focus_products"],
+                             history_complete=metadata.get("covers_order_interval") is True)
+    if ([file_signature(value) for value in snapshot["values"]] != snapshot["signatures"]
+            or file_signature(filtered_path) != metadata["filtered_signature"]):
+        raise ValueError("核查期间订单或聊天记录发生变化，请重新分析。")
+    if file_signature(audit_chat_path) != audit_chat_signature:
+        raise ValueError("核查期间原始聊天记录发生变化，请重新分析。")
+    result["chat_history_path"] = str(audit_chat_path)
+    result["text"] += f"\n聊天范围：{metadata['start']} 至 {metadata['end']}（北京时间）。"
+    if warnings:
+        result["text"] += "\n" + "\n".join(warnings)
+    result_path = path.with_name("transfer_analysis_result.json")
+    report_output = path.with_name("transfer_analysis_report.txt")
+    for destination, content in ((result_path, json.dumps(result, ensure_ascii=False, indent=2)),
+                                 (report_output, result["text"])):
+        temporary = destination.with_suffix(".tmp")
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(destination)
+    files = f"\n异常报告：{report_output}\n结构化结果：{result_path}\n订单比对文件：{report_path}"
+    return result["text"] + "\n" + files + "\n" + HISTORY_HINT
 
 
 def handle_transfer_analysis(tools, ctx, intent, text, progress_callback=None):

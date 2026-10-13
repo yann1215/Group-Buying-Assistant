@@ -195,3 +195,6 @@ desktop.ini
 *.tmp
 *.swp
 *.swo
+
+# Local verification scripts
+scripts/verify_*.py
