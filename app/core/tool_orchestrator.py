@@ -641,6 +641,9 @@ class ToolOrchestrator:
             return unsupported_intent_reply(ctx.session_type)
         if intent["intent"] == "unsupported":
             return intent["reply"]
+        if intent["intent"] == "show_help":
+            from app.core.command_help import help_reply
+            return help_reply(intent.get("help_topic", ""))
         if intent["intent"] == "rename_conversation":
             from app.core.conversation_workflow import rename_conversation
             return rename_conversation(ctx, intent)

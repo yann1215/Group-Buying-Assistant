@@ -8,7 +8,6 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
 
 
-import html
 import os
 import sys
 import traceback
@@ -48,6 +47,7 @@ def get_runtime_dir() -> Path:
 
 
 from app.core.chat_service import ChatService
+from app.core.command_help import help_command_from_link, message_html
 from app.core.session_types import SINGLE_CAR, MERGED_SHIPPING, UNCLASSIFIED, SESSION_TYPE_LABELS
 from app.database.db import init_db
 from integrations.wechatmsg_lite_client import (
@@ -283,6 +283,8 @@ class ChatWindow(QMainWindow):
         self.chat_view.setObjectName("chatView")
         self.chat_view.setReadOnly(True)
         self.chat_view.setOpenExternalLinks(False)
+        self.chat_view.setOpenLinks(False)
+        self.chat_view.anchorClicked.connect(self.open_help_link)
         self.chat_view.document().setDocumentMargin(14)
         main_layout.addWidget(self.chat_view, 1)
 
@@ -760,8 +762,23 @@ class ChatWindow(QMainWindow):
         if not processing:
             self.input_box.setFocus()
 
+    def open_help_link(self, url) -> None:
+        if self.is_processing:
+            return
+        command = help_command_from_link(url.toString())
+        if command is None:
+            return
+        # 帮助仅本地读取并保存聊天记录，不清空用户正在编辑的草稿。
+        try:
+            reply = self.chat_service.send_message(self.session_id, command)
+        except Exception as exc:
+            self.handle_error(f"{type(exc).__name__}: {exc}")
+            return
+        self.append_message("user", command)
+        self.append_message("assistant", reply)
+
     def append_message(self, role: str, text: str) -> None:
-        safe_text = html.escape(text).replace("\n", "<br>")
+        safe_text = message_html(text, allow_help_links=role == "assistant")
 
         if role == "user":
             align = "right"
@@ -782,7 +799,7 @@ class ChatWindow(QMainWindow):
             border = "#D5DCD8"
             text_color = "#26322C"
 
-        message_html = f"""
+        bubble_html = f"""
         <table width="100%" cellspacing="0" cellpadding="0">
           <tr>
             <td align="{align}" style="padding: 4px 0;">
@@ -803,7 +820,7 @@ class ChatWindow(QMainWindow):
         """
 
         self.chat_view.moveCursor(QTextCursor.End)
-        self.chat_view.insertHtml(message_html)
+        self.chat_view.insertHtml(bubble_html)
         self.chat_view.moveCursor(QTextCursor.End)
         self.chat_view.ensureCursorVisible()
 

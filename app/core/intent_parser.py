@@ -111,6 +111,10 @@ RESERVED_PRODUCT_NAMES = {
 
 def parse_common_intent(user_text: str) -> dict[str, Any]:
     text = normalize_text(user_text)
+    from app.core.command_help import parse_help_command
+    help_intent = parse_help_command(text)
+    if help_intent is not None:
+        return help_intent
     result: dict[str, Any] = {"intent": "chat"}
     # 同时支持“修改对话 新名称”和“对话改为新名称”，避免落入模型聊天。
     rename_match = re.fullmatch(
@@ -167,7 +171,7 @@ def parse_merge_group_entry(user_text: str) -> dict[str, Any] | None:
             "merge_order_input": match.group(2).strip()}
 
 
-COMMON_INTENTS = {"chat", "rename_conversation", "unsupported"}
+COMMON_INTENTS = {"chat", "rename_conversation", "unsupported", "show_help"}
 MERGE_INTENTS = {"start_merged_shipping", "add_merge_group", "set_merge_groups", "show_merge_groups", "refresh_merge_mapping", "merge_orders"}
 SINGLE_INTENTS = {
     "analyze_transfers", "confirm_transfer_analysis", "cancel_transfer_analysis", "update_transfer_focus",

@@ -256,6 +256,11 @@ class ChatService:
             return reply
 
         intent = parse_user_intent(user_text, self.tools.get_context(session_id).session_type)
+        if intent["intent"] == "show_help":
+            from app.core.command_help import help_reply
+            reply = help_reply(intent.get("help_topic", ""))
+            add_message(session_id=session_id, role="assistant", content=reply)
+            return reply
         if intent["intent"] == "unsupported":
             reply = intent["reply"]
             add_message(session_id=session_id, role="assistant", content=reply)
@@ -380,7 +385,8 @@ class ChatService:
             )
             return tool_result
 
-        assistant_text = "抱歉，我无法理解你的指令，请用规范方式表达。"
+        from app.core.command_help import HELP_HINT
+        assistant_text = "抱歉，我无法理解你的指令，请用规范方式表达。\n" + HELP_HINT
 
         add_message(
             session_id=session_id,
