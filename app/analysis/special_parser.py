@@ -222,11 +222,25 @@ def parse_special_member_updates(
     if has_show_special_member_words(normalized):
         return []
 
+    # 明确的“角色 + 分隔符 + 昵称”录入中，吗/么可能是昵称的一部分。
+    # 仅豁免普通录入，参摊询问和修改/清理询问仍按问句处理。
+    registration = re.fullmatch(
+        rf"(?:请设置|设置|请设定|设定)?\s*(?:{_ROLE_PATTERN_TEXT})"
+        rf"(?:\s*[:：=]\s*|\s+)(?P<name>\S+)", normalized,
+    )
+    explicit_registration = registration is not None and not any(
+        word in registration['name']
+        for word in NON_SHARE_WORDS + SHARE_WORDS
+        + ('修改', '改为', '改成', '换成', '换为', '设为', '设置为',
+           '删除', '删掉', '删去', '移除', '清空', '清除', '去掉', '重置')
+    )
+
     # 修改/清理命令先固定角色边界，禁止失败后将动作词作为昵称。
     command_prefix = re.split(r"修改为|修改成|设置为|改为|改成|换成|换为|设为", normalized, maxsplit=1)[0]
     if (re.match(r"^(?:(?:请|帮我)\s*)*(?:不要|别|先别|暂不|不必|怎么|如何|能否|是否|可不可以)", command_prefix)
             or re.search(r"(?:不要|先别|别|暂不|不必|怎么|如何|能否|是否)\s*(?:删除|删掉|删去|移除|清空|清除|去掉|重置|修改|$)", command_prefix)
-            or re.search(r"[？?]|(?:吗|么)\s*$", normalized)):
+            or re.search(r"[？?]", normalized)
+            or (not explicit_registration and re.search(r"(?:吗|么)\s*$", normalized))):
         return []
     operation = parse_special_member_operation(normalized)
     if operation is not None:
