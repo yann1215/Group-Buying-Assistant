@@ -138,9 +138,11 @@ def parse_group_member_orders(
     ]
 
     # 4. 调用 order_parser.py 简化订单表
+    quantity_report: dict[str, Any] = {}
     parsed_order_file = parse_order_file(
         order_input=order_input,
         output_path=parsed_output_path,
+        quantity_report=quantity_report,
     )
 
     # 5. 读取订单成员
@@ -251,7 +253,11 @@ def parse_group_member_orders(
         only_non_share_orders=only_non_share_orders,
     )
 
+    if quantity_report.get("zero_quantity_orders"):
+        blocking_issues.append("存在商品数量全部为 0 的订单，继续计算将排除这些订单")
+
     return {
+        **quantity_report,
         "ok": True,
         "message": "群成员序号与订单单号比对完成",
 

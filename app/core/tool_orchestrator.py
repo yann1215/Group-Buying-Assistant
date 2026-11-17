@@ -744,6 +744,19 @@ class ToolOrchestrator:
                 return '已取消本次均摊计算；修改配置后请重新输入“算均摊”。'
             return None
 
+        if intent["intent"] == "shipping_check":
+            from app.analysis.shipping_check import check_shipping_information
+            check_result = self.ensure_member_checked(
+                ctx, force=True, progress_callback=progress_callback)
+            reply = format_member_check_result(check_result)
+            if not ctx.new_order_file:
+                return reply
+            try:
+                shipping_reply = check_shipping_information(ctx.new_order_file)
+            except (OSError, ValueError, RuntimeError) as exc:
+                shipping_reply = f"收货信息检查失败：{exc}"
+            return "单车补邮检查\n\n" + reply + "\n\n" + shipping_reply
+
         if intent["intent"] == "member_check":
             check_result = self.ensure_member_checked(
                 ctx,
@@ -1385,6 +1398,8 @@ class ToolOrchestrator:
             return format_member_check_result(check_result)
         if req.confirmation_signature != share_signature(ctx):
             return "成员核对期间商品配置或订单发生变化，暂不计算。\n\n" + self.handle_calculate_share(ctx, {})
+        if check_result.get("all_orders_zero"):
+            return "停止均摊计算：所有订单的商品数量均为 0，排除后没有可计算的订单。\n\n" + format_member_check_result(check_result)
         if get_blocking_member_issues(check_result) and not force:
             return ("计算均摊前发现名单核对问题，暂不计算。\n\n"
                     + format_member_check_result(check_result)
@@ -1843,11 +1858,6 @@ def format_member_check_result(
     lines.append("成员与订单核对完成。")
     lines.append(f"群聊名称：{result.get('群聊名称')}")
     lines.append(f"群成员数量：{result.get('member_count')}")
-    lines.append(f"简化后的订单文件：{result.get('parsed_order_file')}")
-    share_config_file = result.get("share_config_file")
-    if share_config_file:
-        lines.append(f"商品均摊配置表：{share_config_file}")
-
     auto_added_members = result.get("auto_added_special_members") or []
     if auto_added_members:
         lines.append("")
@@ -1925,6 +1935,26 @@ def format_member_check_result(
                 lines.append(f"- {member_text}｜{product_text}")
             else:
                 lines.append(f"- {member_text}")
+
+    anomalies = result.get("quantity_anomalies") or []
+    if anomalies:
+        lines.append("")
+        lines.append(f"商品数量异常：共 {len({item['单号'] for item in anomalies})} 个订单、{len(anomalies)} 项商品，数量已全部置为 0。")
+        for item in anomalies:
+            lines.append(f"- 单号 {item['单号']}｜{item['昵称']}｜Excel 第 {item['行号']} 行｜{item['商品名称']}：{item['原始数量']} → 0")
+    zero_orders = result.get("zero_quantity_orders") or []
+    if zero_orders:
+        lines.append("")
+        lines.append("以下订单的商品数量全部为 0，继续计算时将排除：")
+        for item in zero_orders:
+            lines.append(f"- 单号 {item['单号']}｜{item['昵称']}")
+    if result.get("all_orders_zero"):
+        lines.append("整个订单文件的商品数量全部为 0，停止均摊计算；排除全零订单后没有可计算的订单。")
+    lines.append("")
+    lines.append(f"简化后的订单文件：{result.get('parsed_order_file')}")
+    share_config_file = result.get("share_config_file")
+    if share_config_file:
+        lines.append(f"商品均摊配置表：{share_config_file}")
 
     return "\n".join(lines)
 

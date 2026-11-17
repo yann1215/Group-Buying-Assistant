@@ -49,6 +49,7 @@ def parse_order_file(
     order_input: str | Path | dict[str, Any],
     output_path: str | Path,
     product_anchor_header: str | None = None,
+    quantity_report: dict[str, Any] | None = None,
 ) -> str:
     """
     读取订单 Excel 的第 2 个 sheet，将订单商品数据整理为宽表 CSV。
@@ -60,7 +61,7 @@ def parse_order_file(
         - 第 2 列是“昵称”
         - 从第 3 行最右侧向左查找商品定位关键词
         - 找到关键词后，关键词所在列之后均为商品名称列
-        - 商品数量只能是正整数或空
+        - 商品数量允许非负整数或空，小数和负数置零
         - 单号必须是正整数，不能为空
 
     输出 CSV：
@@ -134,6 +135,8 @@ def parse_order_file(
     fieldnames = ["单号", "昵称", "总金额"] + product_headers
 
     rows_written = 0
+    anomalies = []
+    zero_orders = []
 
     with output_path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -196,14 +199,23 @@ def parse_order_file(
                     product_name=product_header,
                 )
 
+                if not _is_blank(quantity_raw) and quantity == 0 and Decimal(str(quantity_raw).strip()) != 0:
+                    anomalies.append({"单号": order_no, "昵称": row_data["昵称"],
+                                      "商品名称": product_header, "原始数量": str(quantity_raw),
+                                      "行号": row_idx})
                 row_data[product_header] = quantity
 
+            if not any(row_data[name] for name in product_headers):
+                zero_orders.append({"单号": order_no, "昵称": row_data["昵称"]})
             writer.writerow(row_data)
             rows_written += 1
 
     if rows_written == 0:
         raise OrderParseError("解析完成，但没有提取到任何订单行。")
 
+    if quantity_report is not None:
+        quantity_report.update(quantity_anomalies=anomalies, zero_quantity_orders=zero_orders,
+                               all_orders_zero=len(zero_orders) == rows_written)
     return str(output_path.resolve())
 
 
@@ -445,20 +457,22 @@ def _parse_quantity_optional(
     """
     商品数量允许为空。
 
-    非空时必须是正整数。
+    非负整数正常读取；小数和负数置零。
     """
     if _is_blank(value):
         return ""
 
-    parsed = _parse_positive_int(value)
-
-    if parsed is None:
+    try:
+        number = Decimal(str(value).strip())
+    except InvalidOperation:
+        number = Decimal("NaN")
+    if not number.is_finite():
         raise OrderParseError(
-            f"第 {row_idx} 行商品“{product_name}”的数量必须是正整数或空。"
-            f"实际值：{value!r}"
+            f"第 {row_idx} 行商品“{product_name}”的数量必须是有效数字或空。实际值：{value!r}"
         )
-
-    return parsed
+    if number < 0 or number != number.to_integral_value():
+        return 0
+    return int(number)
 
 
 def _parse_positive_int(value: Any) -> int | None:

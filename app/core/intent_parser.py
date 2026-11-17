@@ -178,7 +178,7 @@ SINGLE_INTENTS = {
     "extract_chat_history",
     "set_context", "show_orders", "compare_orders", "confirm_orders", "cancel_orders",
     "show_share", "calculate_share", "update_share_config", "confirm_share_config", "cancel_share",
-    "calculate_bulk_goods", "calculate_combined", "member_check", "show_special_members", "update_special_members", "update_participation",
+    "calculate_bulk_goods", "calculate_combined", "shipping_check", "member_check", "show_special_members", "update_special_members", "update_participation",
 }
 
 
@@ -311,6 +311,10 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
     }
 
     if not text:
+        return result
+
+    if re.fullmatch(r"(?:查补邮|查地址|看补邮|核对补邮|算补邮|查发货)[。！!？?]*", text):
+        result["intent"] = "shipping_check"
         return result
 
     transfer_command = r"(?:比对转单记录|分析转单记录|分析转单异常|查找转单异常|查转单记录|查转单异常)"

@@ -150,11 +150,12 @@ def calculate_share(
         for row in order_rows
         if normalize_order_no_for_compare(row.order_no)
            not in excluded_order_no_set
+        and any(quantity > 0 for quantity in row.quantities.values())
     ]
 
     if not order_rows:
         raise ShareCalculateError(
-            "排除不参摊特殊成员后，没有可参与均摊的订单。"
+            "排除全零订单和不参摊特殊成员后，没有可参与均摊的订单。"
         )
 
     configs = build_product_configs(
