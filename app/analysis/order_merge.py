@@ -206,6 +206,7 @@ def merge_order_files(sources: list[tuple[str, str | Path]], output: str | Path,
         counts[first] += 1
 
     serial_fill = PatternFill("solid", fgColor=Color(theme=8, tint=0.8))
+    own_serial_headers = {ws.title: f"{group}单号" for group, ws in sheets.items()}
     for ws in wb:
         ws.freeze_panes = "D2"
         ws.auto_filter.ref = ws.dimensions
@@ -219,8 +220,8 @@ def merge_order_files(sources: list[tuple[str, str | Path]], output: str | Path,
                 36 if header.endswith("订单内容") else 24 if header in {"订单昵称", "微信昵称"} else 20)
             for cell in column:
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
-                # 各车补邮清单的所有单号列：着色5，浅色80%。
-                if (ws in sheets.values() and header.endswith("单号")
+                # 只给当前车补邮清单的本车单号着色，总清单和非统一发货不着色。
+                if (header == own_serial_headers.get(ws.title)
                         and cell.row > 1 and cell.value is not None
                         and str(cell.value).strip()):
                     cell.fill = serial_fill

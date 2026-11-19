@@ -143,10 +143,10 @@ def parse_merged_shipping_intent(user_text: str) -> dict[str, Any]:
     if exclusion:
         return {"intent": "remove_merge_exclusion" if exclusion[1] == "取消排除" else "add_merge_exclusion",
                 "exclusion_target": exclusion[2].strip()}
-    if text == "合发":
+    if text in {"合发", "和单", "和", "合并"}:
         return {"intent": "start_merged_shipping"}
     # 合发参数中的所有文字均为车名，必须先于其他参数解析。
-    merge_match = re.match(r"^合发\s*[:：]([\s\S]*)$", text)
+    merge_match = re.match(r"^(?:合发|和单|和|合并)\s*[:：]([\s\S]*)$", text)
     if merge_match:
         result["intent"] = "set_merge_groups"
         result["merge_groups"] = [name.strip() for name in re.split(r"[,，]", merge_match.group(1))]
@@ -362,6 +362,11 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
         result["intent"] = "confirm_orders"
         return result
 
+    unit_words = r"(?:单个|单份|单人|一个|一份|一人|每个|每份|每人|每件)"
+    if re.fullmatch(rf"(?:恢复自动均摊|自动计算均摊|(?:取消|清空){unit_words}均摊)", text):
+        result.update(intent="update_share_config", clear_unit_amount=True)
+        return result
+
     if re.fullmatch(r"(?:取消|不要|不算|暂不计算)均摊", text) or has_negative_words(text) or re.search(r"(?:不|不要|暂不|取消)(?:确认|计算|算).*均摊|(?:不|不要|暂不)确认计算", text):
         result["intent"] = "cancel_share"
         return result
@@ -412,20 +417,31 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
     # 3. 解析均摊、商品金额等
     # 必须先解析各商品金额，再解析总金额。
     # 否则“1号10元，2号20元”可能把 10元 误认成总金额。
-    share_mode = parse_share_mode(text)
-    calculation_scope = parse_calculation_scope(text)
+    unit_pattern = rf"(?P<label>{unit_words}|商品个数)(?:商品)?(?:均摊|分摊|摊)(?:金额)?\s*(?:是|为|=|：|:)?\s*[￥¥]?\s*(?P<value>\d+(?:\.\d{{1,2}})?)(?![\d.])\s*元?"
+    unit_match = re.search(unit_pattern, text)
+    amount_text = re.sub(unit_pattern, "", text)
+    share_mode = parse_share_mode(amount_text)
+    calculation_scope = parse_calculation_scope(amount_text)
 
     # “个数摊100”“人头摊300”中的数字是总均摊金额，
     # 不能识别成某个商品的独立均摊金额。
-    if is_global_share_amount_command(text):
+    if is_global_share_amount_command(amount_text):
         product_share_amounts = []
     else:
-        product_share_amounts = parse_product_share_amounts(text)
+        product_share_amounts = parse_product_share_amounts(amount_text)
 
     amount = parse_amount(
-        text=text,
+        text=amount_text,
         allow_unlabeled_amount=not bool(product_share_amounts),
     )
+
+    if unit_match:
+        result["unit_amount"] = unit_match["value"]
+        label = unit_match["label"]
+        if label in {"单人", "一人", "每人"}:
+            share_mode = "head"
+        elif label not in {"单份", "一份", "每份"}:
+            share_mode = "quantity"
 
     # 4. 设置群聊信息、文件路径
     group_name = parse_group_name(text)
@@ -479,6 +495,7 @@ def parse_single_car_intent(user_text: str) -> dict[str, Any]:
         or calculation_scope is not None
         or amount is not None
         or product_share_amounts
+        or result.get("unit_amount") is not None
     ):
         result["intent"] = "update_share_config"
         return result

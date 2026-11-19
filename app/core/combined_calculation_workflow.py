@@ -28,7 +28,7 @@ def start_combined(tools, ctx, intent, progress_callback=None):
     tools.update_share_request_from_intent(ctx, intent)
     ctx.share_request.force = False
     if intent.get("product_share_amounts") or any(
-        intent.get(key) is not None for key in ("share_mode", "calculation_scope", "amount")
+        intent.get(key) is not None for key in ("share_mode", "calculation_scope", "amount", "unit_amount", "clear_unit_amount")
     ):
         reply = tools.handle_update_share_config(ctx, intent)
         if not intent.get("config_saved"):

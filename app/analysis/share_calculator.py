@@ -76,6 +76,7 @@ def calculate_share(
     product_configs: list[dict[str, Any]] | None = None,
     group_name: str = "",
     excluded_order_nos: set[str] | None = None,
+    unit_amount: str | None = None,
 ) -> dict[str, Any]:
     """
     均摊计算主函数。
@@ -184,6 +185,10 @@ def calculate_share(
     # 个数摊时，用于保存“单个商品均摊金额”
     # 其他均摊模式下保持为 None。
     unit_share_cents: int | None = None
+    if total_amount is None:
+        return {"ok": False, "need_user_input": True, "message": "请补充总均摊金额。"}
+    if unit_amount is not None and calculation_scope != "flat":
+        return {"ok": False, "message": "指定单份金额仅支持拉通模式。"}
     if calculation_scope == "flat":
         if total_amount is None:
             return {
@@ -203,7 +208,10 @@ def calculate_share(
             order_rows=order_rows,
             configs=active_configs,
             participant_results=participant_results,
-            total_amount=total_amount_decimal,
+            total_amount=(optional_money_to_decimal_allow_zero(unit_amount) * Decimal(sum(
+                (1 if share_mode == "head" else sum(row.quantities.get(cfg.product_name, 0) for cfg in active_configs))
+                for row in order_rows if any(row.quantities.get(cfg.product_name, 0) > 0 for cfg in active_configs)
+            )) if unit_amount is not None else total_amount_decimal),
             share_mode=share_mode,
         )
 
@@ -295,6 +303,7 @@ def calculate_share(
             if unit_share_cents is not None
             else None
         ),
+        "unit_amount": unit_amount,
         "total_collected": cents_to_yuan_text(total_collected_cents),
         "over_collected": cents_to_yuan_text(over_collected_cents),
         "participant_count": len(participant_nos),

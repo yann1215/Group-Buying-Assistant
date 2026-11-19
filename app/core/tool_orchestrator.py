@@ -244,6 +244,7 @@ class ShareRequestState:
     share_mode: str | None = None
     calculation_scope: str | None = None
     amount: str | None = None
+    unit_amount: str | None = None
     force: bool = False
 
     pending_config_confirmation: bool = False
@@ -256,6 +257,7 @@ class ShareRequestState:
             "share_mode": self.share_mode,
             "calculation_scope": self.calculation_scope,
             "amount": self.amount,
+            "unit_amount": self.unit_amount,
             "force": self.force,
             "pending_config_confirmation": self.pending_config_confirmation,
             "config_confirmed": self.config_confirmed,
@@ -274,6 +276,7 @@ class ShareRequestState:
                 data.get("calculation_scope")
             ),
             amount=_optional_string(data.get("amount")),
+            unit_amount=_optional_string(data.get("unit_amount")),
             force=data.get("force") is True,
             pending_config_confirmation=(
                 data.get("pending_config_confirmation") is True
@@ -607,13 +610,6 @@ class ToolOrchestrator:
         new_mode = intent.get("share_mode") or req.share_mode
         new_scope = intent.get("calculation_scope") or req.calculation_scope or "flat"
         changed = new_mode != req.share_mode or new_scope != (req.calculation_scope or "flat")
-        # 独立模式未显式输入总额时，完整的商品金额合计也是当前总均摊。
-        if changed and req.calculation_scope == "independent" and req.amount is None:
-            if ctx.share_config_file and owns_product_config(ctx.share_config_file, ctx.config_owner_id):
-                configs = load_product_share_config_file(ctx.share_config_file)
-                active = [c for c in configs if c.get("计入均摊")]
-                if active and all(c.get("商品均摊") not in (None, "") for c in active):
-                    req.amount = f"{sum((Decimal(c['商品均摊']) for c in active), Decimal(0)):.2f}"
         if changed:
             req.reset_product_amounts = True
             invalidate_share_confirmation(ctx)
@@ -621,6 +617,11 @@ class ToolOrchestrator:
         intent["share_parameters_changed"] = changed or (new_amount is not None and new_amount != req.amount)
         if new_amount is not None and new_amount != req.amount:
             invalidate_share_confirmation(ctx)
+        new_unit = None if intent.get("clear_unit_amount") else intent.get("unit_amount", req.unit_amount)
+        if new_unit != req.unit_amount:
+            invalidate_share_confirmation(ctx)
+            intent["share_parameters_changed"] = True
+        req.unit_amount = new_unit
         req.share_mode = new_mode
         req.calculation_scope = new_scope
         if new_amount is not None:
@@ -770,7 +771,7 @@ class ToolOrchestrator:
         if intent["intent"] == "calculate_share":
             self.update_share_request_from_intent(ctx, intent)
             if intent.get("product_share_amounts") or any(
-                intent.get(key) is not None for key in ("share_mode", "calculation_scope", "amount")
+                intent.get(key) is not None for key in ("share_mode", "calculation_scope", "amount", "unit_amount", "clear_unit_amount")
             ):
                 reply = self.handle_update_share_config(ctx, intent)
                 if not intent.get("config_saved"):
@@ -791,7 +792,7 @@ class ToolOrchestrator:
             return self.handle_update_share_config(ctx, intent)
 
         if intent["intent"] == "confirm_share_config":
-            if any(intent.get(key) is not None for key in ("share_mode", "calculation_scope", "amount")) or intent.get("product_share_amounts"):
+            if any(intent.get(key) is not None for key in ("share_mode", "calculation_scope", "amount", "unit_amount", "clear_unit_amount")) or intent.get("product_share_amounts"):
                 self.update_share_request_from_intent(ctx, intent)
                 reply = self.handle_update_share_config(ctx, intent)
                 if not intent.get("config_saved"):
@@ -1288,6 +1289,10 @@ class ToolOrchestrator:
         active = [c for c in ctx.product_configs or [] if c.get("计入均摊")]
         if not active:
             errors.append("没有可参摊商品，请检查商品配置。")
+        if req.amount is None:
+            errors.append("请补充总均摊金额，例如：总均摊800。")
+        if req.unit_amount is not None and req.calculation_scope == "independent":
+            errors.append("指定单份金额仅支持拉通模式，请先切换为拉通。")
         if req.calculation_scope == "independent":
             missing = [c["商品名称"] for c in active if c.get("商品均摊") in (None, "")]
             if missing:
@@ -1413,6 +1418,7 @@ class ToolOrchestrator:
         emit_progress(progress_callback, "正在计算均摊……")
         result = calculate_share(
             parsed_order_file=ctx.parsed_order_file, total_amount=req.amount,
+            unit_amount=req.unit_amount,
             share_mode=req.share_mode, calculation_scope=req.calculation_scope or "flat",
             product_configs=ctx.product_configs, group_name=ctx.group_name,
             excluded_order_nos=get_non_share_order_nos(ctx.special_members),
@@ -1486,6 +1492,7 @@ def share_signature(ctx: SessionToolContext, *, include_members: bool = False) -
             "mode": ctx.share_request.share_mode,
             "scope": ctx.share_request.calculation_scope,
             "amount": ctx.share_request.amount,
+            "unit_amount": ctx.share_request.unit_amount,
             "reset_pending": ctx.share_request.reset_product_amounts,
         }
         if include_members:
@@ -1555,36 +1562,43 @@ def format_share_summary(result: dict[str, Any], special_members: list[dict[str,
     """查询和计算完成共享同一摘要，统计由计算器提供。"""
     mode = result.get("share_mode")
     scope = result.get("calculation_scope")
-    lines = [f"均摊类型：{'人头摊' if mode == 'head' else '个数摊'}",
-             f"计算方式：{'独立' if scope == 'independent' else '拉通'}",
-             f"总均摊：{result['total_amount']}"]
-    products = result.get("product_statistics") or []
-    if scope == "independent":
-        for c in products:
-            if c["included"]:
-                lines.append(f"- {c['product_name']}独立均摊：{c['amount']}")
+    products = [c for c in result.get("product_statistics", []) if c["included"]]
+    lines = [f"均摊类型：{'人头摊' if mode == 'head' else '个数摊'}"]
     if mode == "head":
         lines.append(f"参摊人数：{result['participant_count']} 人")
-        if scope == "independent":
-            lines.extend(f"- {c['product_name']}：{c['participant_count']} 人" for c in products if c["included"])
     else:
         lines.append(f"参摊个数：{result['total_share_quantity']} 个")
-        for c in products:
-            if c["included"]:
-                lines.append(f"- {c['product_name']}：{c['quantity']} 个")
     if special_members is not None:
         lines.append("不参摊说明：" + format_non_share_special_member_note(special_members))
-        lines.append("")
+    lines.extend(["", f"总均摊：{result['total_amount']}"])
     if scope == "independent":
         lines.append("各商品单人均摊：" if mode == "head" else "各商品单个均摊：")
         for c in products:
-            if c["included"]:
-                value = c['unit_amount']
-                lines.append(f"- {c['product_name']}：{value}" if value is not None else f"- {c['product_name']}：无参摊订单")
+            value = c['unit_amount']
+            lines.append(f"- {c['product_name']}：{value}" if value is not None else f"- {c['product_name']}：无参摊订单")
     else:
-        label = "单人均摊" if mode == "head" else "单个商品均摊"
-        lines.append(f"{label}：{result['unit_share_amount']}")
+        lines.append(f"单份均摊：{result['unit_share_amount']}")
+    if "total_collected" in result:
+        lines.append(f"实收金额：{result['total_collected']}")
+        difference = Decimal(result['over_collected'])
+        if difference > 0:
+            lines.append(f"小金库收入：{difference:.2f}")
+        elif difference < 0:
+            lines.append(f"小金库补贴：{-difference:.2f}")
+    lines.extend(["", "明细补充说明：",
+                  f"计算方式：{'独立' if scope == 'independent' else '拉通'}",
+                  "收取方式：" + ("指定单份金额" if result.get("unit_amount") is not None else "自动计算")])
+    if mode == "quantity":
+        lines.append("参摊个数明细：")
+        lines.extend(f"  - {c['product_name']}：{c['quantity']} 个" for c in products)
+    elif scope == "independent":
+        lines.append("参摊人数明细：")
+        lines.extend(f"  - {c['product_name']}：{c['participant_count']} 人" for c in products)
+    if scope == "independent":
+        lines.append("商品独立均摊明细：")
+        lines.extend(f"  - {c['product_name']}：{c['amount']}" for c in products)
     return "\n".join(lines)
+
 
 
 def format_pending_share_summary(ctx: SessionToolContext, configs: list[dict[str, Any]] | None = None,
@@ -1608,22 +1622,26 @@ def format_pending_share_summary(ctx: SessionToolContext, configs: list[dict[str
     mode = {"head": "人头摊", "quantity": "个数摊"}.get(share_mode, "未设置")
     scope = "独立" if calculation_scope == "independent" else "拉通"
     total = req.amount
-    if scope == "独立" and total is None and active and all(c.get("商品均摊") not in (None, "") for c in active):
-        total = f"{sum((Decimal(str(c['商品均摊'])) for c in active), Decimal(0)):.2f}"
     if scope == "拉通" and total is None and active:
         amounts = {c.get("商品均摊") for c in active}
         if len(amounts) == 1 and next(iter(amounts)) not in (None, ""):
             total = next(iter(amounts))
     lines = [f"均摊类型：{mode}", f"计算方式：{scope}",
              f"总均摊：{format_share_money(total)}"]
+    collection_lines = [
+        "收取方式：" + ("指定单份金额" if req.unit_amount is not None else "自动计算"),
+        ("单人均摊：" if share_mode == "head" else "单个商品均摊：")
+        + (format_share_money(req.unit_amount) if req.unit_amount is not None else "待计算"),
+    ]
     if not include_details:
+        lines[2:2] = collection_lines
         return "\n".join(lines)
     if scope == "独立":
         lines.extend(f"- {c['商品名称']}独立均摊：{c.get('商品均摊') or '未填写'}" for c in active)
     lines.append("参摊人数：待计算" if share_mode == "head" else "参摊个数：待计算")
     if share_mode == "quantity":
         lines.extend(f"- {c['商品名称']}：{'待计算' if c.get('计入均摊') else '0 个（不参摊）'}" for c in configs)
-    lines.append("单人均摊：待计算" if share_mode == "head" else "单个商品均摊：待计算")
+    lines.extend(collection_lines)
     return "\n".join(lines)
 
 
@@ -1978,8 +1996,7 @@ def format_share_result(
 
     lines.append(format_share_summary(result, special_members or []))
 
-    lines.append(f"实际总收款：{result['total_collected']}")
-    lines.append(f"向上取整多收：{result['over_collected']}")
+
 
     warnings = result.get("warnings") or []
     if warnings:
