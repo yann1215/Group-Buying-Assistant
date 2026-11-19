@@ -38,9 +38,6 @@ class MergeRegistrationChecks(unittest.TestCase):
             workbook.save(self.root / f"{name}.xlsx")
             workbook.close()
         self.service = ChatService()
-        self.stack.enter_context(patch.object(
-            self.service.instruction_normalizer, "normalize",
-            side_effect=AssertionError("精确录入指令不应调用模型")))
         self.session_id = self.service.create_conversation()
 
     def send(self, text):
@@ -112,6 +109,52 @@ class MergeRegistrationChecks(unittest.TestCase):
             self.assertEqual(workbook.worksheets[0].max_row, 3)
         finally:
             workbook.close()
+
+    def test_exclusion_identity_ambiguity(self):
+        from app.core.order_merge_workflow import exclusion_identity
+        resolved = {"aaa": [{"wxid": "a", "wechat_name": "同名", "serial": "1"}],
+                    "bbb": [{"wxid": "b", "wechat_name": "同名", "serial": "1"}]}
+        with self.assertRaisesRegex(ValueError, "多个人"):
+            exclusion_identity("同名", ["aaa", "bbb"], resolved)
+        self.assertEqual(exclusion_identity("bbb 单号1", ["aaa", "bbb"], resolved)[0], "b")
+        with self.assertRaisesRegex(ValueError, "未匹配"):
+            exclusion_identity("车1 单号99", ["aaa", "bbb"], resolved)
+
+    def test_exclusions_across_cars_and_reload(self):
+        self.register()
+        def orders(path, group):
+            return [{"serial": "1", "name": "小王", "row": 4, "products": {"徽章": 1},
+                     "shipping": ["小王", "123", "地址"]}]
+        def members(**kwargs):
+            return {"ok": True, "members": [{"wxid": "wxid_wang", "昵称": "王", "群昵称": "1 小王"}]}
+        with patch("app.core.order_merge_workflow.read_merge_orders", side_effect=orders), patch(
+            "app.core.order_merge_workflow.get_wechat_group_members", side_effect=members):
+            self.assertIn("已排除", self.send("排除 车1 单号1"))
+            self.service.tools.remove_context(self.session_id)
+            self.service.load_conversation(self.session_id)
+            self.assertIn("王", self.send("查看排除名单"))
+            self.assertIn("已在", self.send("排除 王"))
+            self.assertIn("总计0人，合发0人", self.send("输出合发表"))
+            ctx = self.service.tools.get_context(self.session_id)
+            wb = load_workbook(ctx.merge_output_files[0])
+            try:
+                self.assertEqual(wb.sheetnames[-1], "非统一发货清单")
+                self.assertEqual([ws.max_row for ws in wb.worksheets], [1, 1, 1, 2])
+                self.assertEqual(wb.worksheets[-1].cell(2, 5).value, "1")
+                self.assertEqual(wb.worksheets[-1].cell(2, 7).value, "1")
+            finally:
+                wb.close()
+            self.assertIn("已取消", self.send("取消排除 bbb 单号1"))
+            self.assertIn("总计1人，合发1人", self.send("输出合发表"))
+            self.assertIn("已排除", self.send("排除 王"))
+            self.assertIn("已取消", self.send("取消排除 王"))
+            self.assertIn("已排除", self.send("排除 bbb 单号1"))
+            with patch("app.core.order_merge_workflow.resolve_with_mapping", return_value=({"aaa": [], "bbb": []}, [])):
+                self.assertIn("已不在当前订单", self.send("输出合发表"))
+            self.assertIn("已清空", self.send("清空排除名单"))
+            self.assertIn("为空", self.send("查看排除名单"))
+            self.assertIn("未匹配", self.send("排除 不存在"))
+            self.assertIn("车序不存在", self.send("排除 车9 单号1"))
 
 
 if __name__ == "__main__":

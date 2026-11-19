@@ -137,6 +137,12 @@ def parse_common_intent(user_text: str) -> dict[str, Any]:
 def parse_merged_shipping_intent(user_text: str) -> dict[str, Any]:
     text = normalize_text(user_text)
     result: dict[str, Any] = {"intent": "chat"}
+    if text in {"查看排除名单", "清空排除名单"}:
+        return {"intent": "show_merge_exclusions" if text.startswith("查看") else "clear_merge_exclusions"}
+    exclusion = re.fullmatch(r"(取消排除|排除)\s+(.+)", text)
+    if exclusion:
+        return {"intent": "remove_merge_exclusion" if exclusion[1] == "取消排除" else "add_merge_exclusion",
+                "exclusion_target": exclusion[2].strip()}
     if text == "合发":
         return {"intent": "start_merged_shipping"}
     # 合发参数中的所有文字均为车名，必须先于其他参数解析。
@@ -172,7 +178,7 @@ def parse_merge_group_entry(user_text: str) -> dict[str, Any] | None:
 
 
 COMMON_INTENTS = {"chat", "rename_conversation", "unsupported", "show_help"}
-MERGE_INTENTS = {"start_merged_shipping", "add_merge_group", "set_merge_groups", "show_merge_groups", "refresh_merge_mapping", "merge_orders"}
+MERGE_INTENTS = {"show_merge_exclusions", "clear_merge_exclusions", "remove_merge_exclusion", "add_merge_exclusion", "start_merged_shipping", "add_merge_group", "set_merge_groups", "show_merge_groups", "refresh_merge_mapping", "merge_orders"}
 SINGLE_INTENTS = {
     "analyze_transfers", "confirm_transfer_analysis", "cancel_transfer_analysis", "update_transfer_focus",
     "extract_chat_history",

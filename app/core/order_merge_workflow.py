@@ -1,5 +1,6 @@
 """合发车序配置与订单导出；只读取微信身份，不执行完整成员检查。"""
 from datetime import datetime, timezone, timedelta
+import re
 from pathlib import PureWindowsPath
 from zipfile import BadZipFile
 
@@ -62,9 +63,48 @@ def source_order_path(tools, source_id):
     return get_order_versions(source_id)["new_order_file"]
 
 
+def exclusion_identity(target, groups, resolved):
+    match = re.fullmatch(r"(.+?)\s+单号\s*(\d+)", target)
+    if match:
+        group, serial = match.groups()
+        car = re.fullmatch(r"车(\d+)", group)
+        if car:
+            index = int(car[1]) - 1
+            if not 0 <= index < len(groups):
+                raise ValueError("车序不存在，请查看合发车名")
+            group = groups[index]
+        if group not in groups:
+            raise ValueError(f"车群不存在：{group}")
+        candidates = [o for o in resolved[group] if str(o["serial"]) == str(int(serial))]
+    else:
+        candidates = [o for orders in resolved.values() for o in orders
+                      if o.get("wechat_name") == target]
+    identities = {o["wxid"]: o for o in candidates}
+    if len(identities) != 1:
+        raise ValueError("未匹配到人员" if not identities else "昵称对应多个人，请使用车群和单号定位")
+    return next(iter(identities.items()))
+
+
 def handle_order_merge(tools, ctx, intent):
     if ctx.session_type != MERGED_SHIPPING:
         return "当前为单车会话，不支持合发指令。请进入合发会话执行。"
+    if intent["intent"] == "show_merge_exclusions":
+        return ("排除名单：\n" + "\n".join(
+            f"{i}. {record.get('wechat_name') or wxid}（{record.get('target', '')}）"
+            for i, (wxid, record) in enumerate(ctx.merge_exclusions.items(), 1))
+            if ctx.merge_exclusions else "当前排除名单为空。")
+    if intent["intent"] == "clear_merge_exclusions":
+        ctx.merge_exclusions.clear()
+        return "已清空排除名单，下次导出恢复统一发货。"
+    if intent["intent"] == "remove_merge_exclusion":
+        target = intent["exclusion_target"]
+        matches = [wxid for wxid, record in ctx.merge_exclusions.items()
+                   if target in {wxid, record.get("wechat_name")}]
+        if len(matches) == 1:
+            del ctx.merge_exclusions[matches[0]]
+            return "已取消排除，下次导出恢复统一发货。"
+        if len(matches) > 1:
+            return "昵称对应多个人，请使用车群和单号定位。"
     if intent["intent"] == "start_merged_shipping":
         return "当前对话类型已设置为合发对话，请录入车群信息。\n示例：车名 xxx，订单 xxx"
     if intent["intent"] == "add_merge_group":
@@ -150,11 +190,32 @@ def handle_order_merge(tools, ctx, intent):
         orders_by_group = {group: read_merge_orders(path, group) for group, path in sources}
         resolved, entries = resolve_with_mapping(orders_by_group, source_ids, load_mapping(cache_path), fetch_members,
                                                 refresh=intent["intent"] == "refresh_merge_mapping")
-        result = merge_order_files(sources, output, {}, resolved_orders_by_group=resolved)
+        if intent["intent"] in {"add_merge_exclusion", "remove_merge_exclusion"}:
+            target = intent["exclusion_target"]
+            wxid, order = exclusion_identity(target, groups, resolved)
+            if intent["intent"] == "remove_merge_exclusion":
+                if wxid not in ctx.merge_exclusions:
+                    return "该人员不在排除名单中。"
+                del ctx.merge_exclusions[wxid]
+                return "已取消排除，下次导出恢复统一发货。"
+            if wxid in ctx.merge_exclusions:
+                return "该人员已在排除名单中。"
+            ctx.merge_exclusions[wxid] = {"wechat_name": order.get("wechat_name", ""), "target": target}
+            return f"已排除 {order.get('wechat_name') or wxid}，该人在所有车群的订单将在下次导出时移入非统一发货清单。"
+        present = {order["wxid"] for orders in resolved.values() for order in orders}
+        stale = set(ctx.merge_exclusions) - present
+        if stale:
+            raise ValueError("排除名单中的人员已不在当前订单中，请取消排除或清空排除名单：" +
+                             "、".join(ctx.merge_exclusions[w].get("wechat_name") or w for w in stale))
+        result = merge_order_files(sources, output, {}, resolved_orders_by_group=resolved,
+                                   excluded_wxids=ctx.merge_exclusions)
+
         save_mapping(cache_path, entries)
         if str(result.path) not in ctx.merge_output_files:
             ctx.merge_output_files.append(str(result.path))
         reply = [f"合发表已生成：总计{result.total}人，合发{result.combined}人。"]
+        if result.excluded:
+            reply.append(f"非统一发货清单：{result.excluded}人。")
         reply.extend(f"{group}补邮清单：{count}人" for group, count in result.counts.items())
         reply.append(f"[打开合发表]({result.path})")
         if result.warnings:

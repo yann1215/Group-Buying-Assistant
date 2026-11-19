@@ -1,5 +1,6 @@
 """密钥缓存与全局更新指令回归：python -m scripts.verify_key_cache。"""
 from contextlib import ExitStack
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -30,6 +31,55 @@ class KeyCacheChecks(unittest.TestCase):
 
     def unchanged(self):
         self.assertEqual((self.root / "decrypt_cache.json").read_bytes(), self.original_bytes)
+
+    def test_disk_contains_ciphertext_and_reads_without_rewrite(self):
+        self.assertNotIn(b"a" * 64, self.original_bytes)
+        stored = json.loads(self.original_bytes)
+        self.assertNotIn("key", stored)
+        self.assertEqual(stored["protection"], "dpapi")
+        self.assertEqual(runner._load_cache(self.root), self.old)
+        self.unchanged()
+
+    def test_legacy_cache_migrates_once(self):
+        path = self.root / "decrypt_cache.json"
+        path.write_text(json.dumps(self.old), encoding="utf-8")
+        self.assertEqual(runner._load_cache(self.root), self.old)
+        migrated = path.read_bytes()
+        self.assertNotIn(b"a" * 64, migrated)
+        self.assertNotIn("key", json.loads(migrated))
+        self.assertEqual(runner._load_cache(self.root), self.old)
+        self.assertEqual(path.read_bytes(), migrated)
+
+    def test_migration_failures_preserve_legacy_file(self):
+        path = self.root / "decrypt_cache.json"
+        path.write_text(json.dumps(self.old), encoding="utf-8")
+        original = path.read_bytes()
+        for target in ("protect_key", "unprotect_key"):
+            with patch.object(runner, target, side_effect=RuntimeError("unavailable")):
+                with self.assertRaises(RuntimeError):
+                    runner._load_cache(self.root)
+            self.assertEqual(path.read_bytes(), original)
+        with patch.object(runner.os, "replace", side_effect=PermissionError("busy")):
+            with self.assertRaises(PermissionError):
+                runner._load_cache(self.root)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".decrypt_cache-*")), [])
+
+    def test_invalid_formats_are_never_overwritten(self):
+        path = self.root / "decrypt_cache.json"
+        for data in ([], {"key": "invalid"}, {"format_version": 99},
+                     {"format_version": 2, "protection": "dpapi", "key_encrypted": "broken"}):
+            path.write_text(json.dumps(data), encoding="utf-8")
+            original = path.read_bytes()
+            with self.assertRaises((ValueError, RuntimeError)):
+                runner._load_cache(self.root)
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_wrong_account_failure_preserves_ciphertext(self):
+        with patch.object(runner, "unprotect_key", side_effect=RuntimeError("wrong account")):
+            with self.assertRaises(RuntimeError):
+                runner._load_cache(self.root)
+        self.unchanged()
 
     def update(self, key="", provider=None, valid=True):
         with patch.object(runner, "_resolve_v4_account_info", return_value={"wxid": "test", "source_dir": str(self.root)}), \

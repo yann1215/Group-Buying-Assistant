@@ -8,7 +8,7 @@ import re
 from tempfile import TemporaryDirectory, NamedTemporaryFile
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Color, Font, PatternFill
 
 from app.analysis import order_parser as parser
 from app.analysis.order_identity import resolve_order_identities
@@ -25,6 +25,7 @@ class MergeResult:
     combined: int
     counts: dict[str, int]
     warnings: list[str]
+    excluded: int = 0
 
 
 def read_merge_orders(path: str | Path, group: str) -> list[dict]:
@@ -98,7 +99,8 @@ def _append(ws, values):
 
 
 def merge_order_files(sources: list[tuple[str, str | Path]], output: str | Path,
-                      members_by_group: dict[str, list[dict]], *, resolved_orders_by_group=None) -> MergeResult:
+                      members_by_group: dict[str, list[dict]], *, resolved_orders_by_group=None, excluded_wxids=None) -> MergeResult:
+    excluded_wxids = set(excluded_wxids or ())
     groups = [group for group, _ in sources]
     if len(groups) < 2 or len(set(groups)) != len(groups):
         raise ValueError("请提供至少两个不同车名")
@@ -149,14 +151,18 @@ def merge_order_files(sources: list[tuple[str, str | Path]], output: str | Path,
         sheets[group] = wb.create_sheet(_sheet_name(group, used))
 
     def headers(order_groups, total=False):
-        return (["wxid"] if total else []) + ["微信昵称", "订单昵称", "合发"] + [label for group in order_groups for label in
+        return ["微信昵称", "订单昵称", "合发"] + [label for group in order_groups for label in
                 (f"{group}单号", f"{group}订单内容")] + (["全部订单商品"] if total else []) + list(SHIPPING_HEADERS)
 
     _append(total_sheet, headers(groups, True))
     for group, ws in sheets.items():
         _append(ws, headers([group] + [other for other in groups if other != group]))
 
+    excluded_sheet = wb.create_sheet("非统一发货清单") if excluded_wxids & members.keys() else None
+    if excluded_sheet is not None:
+        _append(excluded_sheet, headers(groups, True))
     combined = 0
+    excluded_count = 0
     for wxid, orders in members.items():
         first = next(group for group in groups if group in orders)
         name = orders[first]["name"]
@@ -165,11 +171,11 @@ def merge_order_files(sources: list[tuple[str, str | Path]], output: str | Path,
         if not orders[first]["shipping"][2]:
             shipping_group = next((group for group in groups if group in orders and orders[group]["shipping"][2]), first)
         shipping = orders[shipping_group]["shipping"]
-        person = f"{wechat_name or '微信昵称未提供'}（{name}）"
+        person = ("【非统一发货】" if wxid in excluded_wxids else "") + f"{wechat_name or '微信昵称未提供'}（{name}）"
         source = (f"本群（单号{orders[first]['shipping_serial']}）" if shipping_group == first else
                   f"车群{shipping_group}（单号{orders[shipping_group]['shipping_serial']}）")
         flag = len(orders) > 1
-        combined += flag
+        combined += flag and wxid not in excluded_wxids
         conflicts = [group for group, order in orders.items() if order["shipping"] != shipping]
         if shipping_group != first:
             issues_by_group[first].append(
@@ -191,12 +197,17 @@ def merge_order_files(sources: list[tuple[str, str | Path]], output: str | Path,
                 (orders[group]["serial"] if group in orders else "", _content(orders.get(group)))]
 
         all_products = "；".join(f"{group}-{_content(orders[group])}" for group in groups if group in orders)
-        _append(total_sheet, [wxid] + values(groups) + [all_products] + list(shipping))
+        if wxid in excluded_wxids:
+            _append(excluded_sheet, values(groups) + [all_products] + list(shipping))
+            excluded_count += 1
+            continue
+        _append(total_sheet, values(groups) + [all_products] + list(shipping))
         _append(sheets[first], values([first] + [other for other in groups if other != first]) + list(shipping))
         counts[first] += 1
 
+    serial_fill = PatternFill("solid", fgColor=Color(theme=8, tint=0.8))
     for ws in wb:
-        ws.freeze_panes = "E2" if ws is total_sheet else "D2"
+        ws.freeze_panes = "D2"
         ws.auto_filter.ref = ws.dimensions
         for cell in ws[1]:
             cell.font = Font(bold=True, color="FFFFFF")
@@ -205,9 +216,14 @@ def merge_order_files(sources: list[tuple[str, str | Path]], output: str | Path,
             header = str(column[0].value)
             ws.column_dimensions[column[0].column_letter].width = (
                 48 if header in {"收货人地址", "全部订单商品"} else
-                36 if header.endswith("订单内容") else 24 if header in {"订单昵称", "微信昵称", "wxid"} else 20)
+                36 if header.endswith("订单内容") else 24 if header in {"订单昵称", "微信昵称"} else 20)
             for cell in column:
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
+                # 各车补邮清单的所有单号列：着色5，浅色80%。
+                if (ws in sheets.values() and header.endswith("单号")
+                        and cell.row > 1 and cell.value is not None
+                        and str(cell.value).strip()):
+                    cell.fill = serial_fill
 
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -225,4 +241,4 @@ def merge_order_files(sources: list[tuple[str, str | Path]], output: str | Path,
     warnings = [f"车群{group}合发清单存在以下问题，请核对：\n" +
                 "\n".join(f"{index}. {issue}" for index, issue in enumerate(issues, 1))
                 for group, issues in issues_by_group.items() if issues]
-    return MergeResult(str(output.resolve()), len(members), combined, counts, warnings)
+    return MergeResult(str(output.resolve()), len(members) - excluded_count, combined, counts, warnings, excluded_count)
