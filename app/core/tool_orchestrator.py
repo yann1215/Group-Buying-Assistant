@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from app.analysis.receivable_notice import format_receivable_notice
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -1209,10 +1211,11 @@ class ToolOrchestrator:
             f"订单数量：{result.get('order_count')}",
             f"结果文件：{result.get('result_file')}",
             "",
-            "其中原订单的“总金额”已作为“大货应收金额”，"
+            "其中原订单的“总金额”已作为“大货金额”，"
             "代码没有重新计算或修改该金额。",
         ]
 
+        lines.append(format_receivable_notice(result, ctx.special_members, "大货金额", "大货金额"))
         return "\n".join(lines)
 
     def ensure_share_config_loaded(
@@ -1398,8 +1401,6 @@ class ToolOrchestrator:
             return format_member_check_result(check_result)
         if req.confirmation_signature != share_signature(ctx):
             return "成员核对期间商品配置或订单发生变化，暂不计算。\n\n" + self.handle_calculate_share(ctx, {})
-        if check_result.get("all_orders_zero"):
-            return "停止均摊计算：所有订单的商品数量均为 0，排除后没有可计算的订单。\n\n" + format_member_check_result(check_result)
         if get_blocking_member_issues(check_result) and not force:
             return ("计算均摊前发现名单核对问题，暂不计算。\n\n"
                     + format_member_check_result(check_result)
@@ -1804,8 +1805,6 @@ def get_blocking_member_issues(result: dict[str, Any]) -> list[str]:
         issues.append("订单里有、但是群昵称没有的序号")
 
     only_non_share_orders = (result.get("only_non_share_orders") or [])
-    if only_non_share_orders:
-        issues.append("存在只购买不参摊商品的订单")
 
     return issues
 
@@ -1949,7 +1948,7 @@ def format_member_check_result(
         for item in zero_orders:
             lines.append(f"- 单号 {item['单号']}｜{item['昵称']}")
     if result.get("all_orders_zero"):
-        lines.append("整个订单文件的商品数量全部为 0，停止均摊计算；排除全零订单后没有可计算的订单。")
+        lines.append("整个订单文件的商品数量全部为 0；均摊结果将仅含表头。")
     lines.append("")
     lines.append(f"简化后的订单文件：{result.get('parsed_order_file')}")
     share_config_file = result.get("share_config_file")
@@ -2002,12 +2001,13 @@ def format_share_result(
     for item in result.get("items", [])[:10]:
         lines.append(
             f"- {item['单号']}｜{item['昵称']}｜"
-            f"商品总数 {item['商品总数']}｜应收 {item['应收金额']}"
+            f"商品总数 {item['商品总数']}｜应收 {item['均摊金额']}"
         )
 
     if len(result.get("items", [])) > 10:
         lines.append(f"... 共 {len(result['items'])} 条，完整结果见结果文件。")
 
+    lines.append(format_receivable_notice(result, special_members, "均摊金额", "均摊应收金额"))
     return "\n".join(lines)
 
 

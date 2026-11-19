@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import csv
+from app.utils.receivable_xlsx import write_receivable_xlsx
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ NON_PRODUCT_FIELDS = {
     "单号",
     "昵称",
     "总金额",
-    "大货应收金额",
+    "大货金额",
 }
 
 
@@ -30,7 +31,7 @@ def create_bulk_receivable_orders(
     根据大货订单的 parsed orders 生成大货应收文件。
 
     原来的“总金额”不进行重新计算，只将其解释为并重命名为：
-    “大货应收金额”。
+    “大货金额”。
     """
     parsed_order_file = Path(parsed_order_file)
 
@@ -66,14 +67,14 @@ def create_bulk_receivable_orders(
             "单号",
             "昵称",
             "总金额",
-            "大货应收金额",
+            "大货金额",
         }
     ]
 
     output_fields = [
         "单号",
         "昵称",
-        "大货应收金额",
+        "大货金额",
         *product_fields,
     ]
 
@@ -94,7 +95,7 @@ def create_bulk_receivable_orders(
 
             # 原值直接复制，
             # 不在这里重新计算或取整
-            "大货应收金额": row.get(
+            "大货金额": row.get(
                 "总金额",
                 "",
             ),
@@ -110,21 +111,15 @@ def create_bulk_receivable_orders(
 
         rows.append(output_row)
 
-    with output_path.open(
-        "w",
-        encoding="utf-8-sig",
-        newline="",
-    ) as dst:
-        writer = csv.DictWriter(
-            dst,
-            fieldnames=output_fields,
-        )
-        writer.writeheader()
-        writer.writerows(rows)
+    all_items = rows
+    rows = [row for row in all_items if Decimal(str(row["大货金额"])) > 0]
+
+    write_receivable_xlsx(output_path, output_fields, rows, "大货金额")
 
     return {
         "ok": True,
         "result_file": str(output_path.resolve()),
         "order_count": len(rows),
         "items": rows,
+        "all_items": all_items,
     }

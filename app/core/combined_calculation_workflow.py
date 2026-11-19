@@ -1,4 +1,6 @@
 """先分别确认配置，再统一核对成员、计算及导出总金额。"""
+from app.analysis.receivable_notice import format_receivable_notice
+
 import hashlib
 import json
 
@@ -81,4 +83,5 @@ def confirm_combined_bulk(tools, ctx, progress_callback=None):
     for row in result["items"]:
         values = [str(row[key]).replace("|", "\\|").replace("\n", " ").replace("\r", " ") for key in COMBINED_FIELDS]
         lines.append("| " + " | ".join(values) + " |")
+    lines.append(format_receivable_notice(result, ctx.special_members, "总金额", "合计应收金额"))
     return "\n".join(lines)

@@ -191,7 +191,7 @@ class CalculationStateChecks(unittest.TestCase):
         reply = self.tools.handle(1, "是")
         self.assertIn("均摊和大货总金额表已生成", reply)
         self.assertEqual(self.ctx.last_share_result["unit_share_amount"], "10.00")
-        self.assertEqual(self.ctx.last_bulk_result["items"][0]["大货应收金额"], "60.00")
+        self.assertEqual(self.ctx.last_bulk_result["items"][0]["大货金额"], "60.00")
         self.assertTrue(self.ctx.bulk_request.confirmed)
 
     def test_failed_combined_share_does_not_combine_old_share_with_new_bulk(self):

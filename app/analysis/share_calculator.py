@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import csv
+from app.utils.receivable_xlsx import write_receivable_xlsx
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from pathlib import Path
@@ -116,6 +116,8 @@ def calculate_share(
 
     order_rows, product_names = read_order_rows(parsed_order_file)
 
+    all_order_rows = list(order_rows)
+
     product_total_map = {
         product_name: sum(
             row.quantities.get(product_name, 0)
@@ -127,11 +129,6 @@ def calculate_share(
     total_product_quantity = sum(
         product_total_map.values()
     )
-
-    if total_product_quantity <= 0:
-        raise ShareCalculateError(
-            "订单中所有商品数量合计为 0，无法进行均摊计算。"
-        )
 
     zero_quantity_products = [
         product_name
@@ -153,11 +150,6 @@ def calculate_share(
         and any(quantity > 0 for quantity in row.quantities.values())
     ]
 
-    if not order_rows:
-        raise ShareCalculateError(
-            "排除全零订单和不参摊特殊成员后，没有可参与均摊的订单。"
-        )
-
     configs = build_product_configs(
         product_names=product_names,
         order_rows=order_rows,
@@ -171,8 +163,6 @@ def calculate_share(
         if cfg.product_name and cfg.include_share
     ]
 
-    if not active_configs:
-        raise ShareCalculateError("没有可参摊商品。")
 
     participant_results = {
         row.order_no: ParticipantResult(
@@ -242,7 +232,7 @@ def calculate_share(
         empty_products = [cfg.product_name for cfg in active_configs
                           if cfg.product_share_amount > 0 and not any(
                               row.quantities.get(cfg.product_name, 0) > 0 for row in order_rows)]
-        if empty_products:
+        if empty_products and order_rows:
             return {"ok": False, "message": "以下商品有独立均摊金额但没有参摊订单：" + "、".join(empty_products)}
 
         total_original_cents = sum(
@@ -268,7 +258,7 @@ def calculate_share(
     total_collected_cents = sum(item.share_cents for item in charged_results)
     over_collected_cents = total_collected_cents - total_original_cents
 
-    write_share_result_csv(
+    write_share_result_xlsx(
         output_path=output_path,
         results=charged_results,
         configs=active_configs,
@@ -311,12 +301,18 @@ def calculate_share(
         "product_statistics": product_statistics,
         "result_file": str(output_path.resolve()),
         "product_configs": product_configs_to_dicts(configs),
+        "all_items": [
+            {"单号": row.order_no, "昵称": row.nickname,
+             "均摊金额": cents_to_yuan_text(participant_results[row.order_no].share_cents)
+             if row.order_no in participant_results else "0.00"}
+            for row in all_order_rows
+        ],
         "items": [
             {
                 "单号": item.order_no,
                 "昵称": item.nickname,
                 "商品总数": item.total_quantity,
-                "应收金额": cents_to_yuan_text(item.share_cents),
+                "均摊金额": cents_to_yuan_text(item.share_cents),
                 "明细": {
                     product_name: cents_to_yuan_text(cents)
                     for product_name, cents in item.details.items()
@@ -587,9 +583,7 @@ def calculate_flat_share(
             )
 
     if not weights:
-        raise ShareCalculateError(
-            "没有可参与拉通均摊的订单。"
-        )
+        return None, None
 
     total_weight = sum(weights.values())
 
@@ -803,17 +797,17 @@ def calculate_total_share_quantity_for_summary(
     return total_quantity
 
 
-def write_share_result_csv(
+def write_share_result_xlsx(
     output_path: Path,
     results: list[ParticipantResult],
     configs: list[ProductShareConfig],
     calculation_scope: str,
 ) -> None:
     """
-    输出均摊结果 CSV。
+    输出均摊结果 XLSX。
 
     拉通均摊：
-        只输出单号、昵称、商品总数、应收金额。
+        输出单号、昵称、商品总数、均摊金额（商品总数默认隐藏）。
         因为拉通均摊只计算每个订单的总应收金额，
         不会计算每个商品分别承担了多少钱。
 
@@ -825,7 +819,7 @@ def write_share_result_csv(
         "单号",
         "昵称",
         "商品总数",
-        "应收金额",
+        "均摊金额",
     ]
 
     if calculation_scope == "independent":
@@ -839,38 +833,29 @@ def write_share_result_csv(
 
     fieldnames = base_fieldnames + product_detail_columns
 
-    with output_path.open(
-        "w",
-        encoding="utf-8-sig",
-        newline="",
-    ) as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=fieldnames,
-        )
-        writer.writeheader()
+    rows = []
+    for item in results:
+        row_data: dict[str, Any] = {
+            "单号": item.order_no,
+            "昵称": item.nickname,
+            "商品总数": item.total_quantity,
+            "均摊金额": cents_to_yuan_text(
+                item.share_cents,
+            ),
+        }
 
-        for item in results:
-            row_data: dict[str, Any] = {
-                "单号": item.order_no,
-                "昵称": item.nickname,
-                "商品总数": item.total_quantity,
-                "应收金额": cents_to_yuan_text(
-                    item.share_cents,
-                ),
-            }
+        if calculation_scope == "independent":
+            for product_name in product_detail_columns:
+                cents = item.details.get(product_name)
 
-            if calculation_scope == "independent":
-                for product_name in product_detail_columns:
-                    cents = item.details.get(product_name)
+                row_data[product_name] = (
+                    ""
+                    if cents is None
+                    else cents_to_yuan_text(cents)
+                )
 
-                    row_data[product_name] = (
-                        ""
-                        if cents is None
-                        else cents_to_yuan_text(cents)
-                    )
-
-            writer.writerow(row_data)
+        rows.append(row_data)
+    write_receivable_xlsx(output_path, fieldnames, rows, "均摊金额")
 
 
 def product_configs_to_dicts(configs: list[ProductShareConfig]) -> list[dict[str, Any]]:

@@ -97,15 +97,15 @@ def get_product_config_path(group_name: str) -> Path:
     return _group_file(ORDER_CONFIG_DIR, group_name, PRODUCT_CONFIG_SUFFIX)
 
 
-def get_share_output_path(group_name: str, extension: str = ".csv") -> Path:
+def get_share_output_path(group_name: str, extension: str = ".xlsx") -> Path:
     return _group_file(ORDER_OUTPUT_DIR, group_name, SHARE_RESULT_SUFFIX, extension)
 
 
 def get_combined_output_path(group_name: str) -> Path:
-    return _group_file(ORDER_OUTPUT_DIR, group_name, COMBINED_RESULT_SUFFIX)
+    return _group_file(ORDER_OUTPUT_DIR, group_name, COMBINED_RESULT_SUFFIX, ".xlsx")
 
 
-def get_bulk_output_path(group_name: str, extension: str = ".csv") -> Path:
+def get_bulk_output_path(group_name: str, extension: str = ".xlsx") -> Path:
     return _group_file(ORDER_OUTPUT_DIR, group_name, BULK_RESULT_SUFFIX, extension)
 
 

@@ -253,8 +253,6 @@ def parse_group_member_orders(
         only_non_share_orders=only_non_share_orders,
     )
 
-    if quantity_report.get("zero_quantity_orders"):
-        blocking_issues.append("存在商品数量全部为 0 的订单，继续计算将排除这些订单")
 
     return {
         **quantity_report,
@@ -311,8 +309,6 @@ def build_member_order_blocking_issues(
     if serials_in_orders_not_in_group:
         issues.append("订单里有、但是群昵称没有的序号")
 
-    if only_non_share_orders:
-        issues.append("存在只购买不参摊商品的订单")
 
     return issues
 
