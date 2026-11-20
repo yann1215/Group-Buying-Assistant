@@ -1,6 +1,7 @@
 """从原始订单读取身份和收货信息，生成互不重复的跨车合发清单。"""
 from __future__ import annotations
 
+from app.utils.xlsx_export import save_xlsx
 from dataclasses import dataclass
 from pathlib import Path
 import os
@@ -233,7 +234,7 @@ def merge_order_files(sources: list[tuple[str, str | Path]], output: str | Path,
     try:
         with NamedTemporaryFile(dir=output.parent, suffix=".xlsx", delete=False) as handle:
             temporary = Path(handle.name)
-        wb.save(temporary)
+        save_xlsx(wb, temporary)
         os.replace(temporary, output)
     finally:
         wb.close()

@@ -9,7 +9,8 @@ import gc
 import unittest
 from unittest.mock import patch
 
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
+from openpyxl import load_workbook
 
 from app.core.chat_service import ChatService
 from app.core.intent_parser import parse_user_intent
